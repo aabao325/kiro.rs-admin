@@ -255,6 +255,12 @@ async fn main() {
     )));
     cache_meter.clone().spawn_background();
 
+    // CacheForceStore：管理面板可调的缓存强制覆盖设置（关闭/智能模拟/比例强制），
+    // 持久化到 cache_dir/cache_force.json，默认 Auto 模式（行为与现状一致）。
+    let cache_force_store = anthropic::cache_force::CacheForceStore::load(Some(
+        cache_dir.join("cache_force.json"),
+    ));
+
     let anthropic_app = anthropic::create_router(
         Some(kiro_provider),
         config.extract_thinking,
@@ -264,6 +270,7 @@ async fn main() {
         Some(usage_aggregator.clone()),
         Some(cache_meter.clone()),
         trace_store.clone(),
+        Some(cache_force_store.clone()),
     );
 
     // 构建 Admin API 路由（配置了非空 adminApiKey 时启用）
@@ -293,6 +300,7 @@ async fn main() {
                 usage_aggregator.clone(),
                 admin_trace_store,
                 group_manager.clone(),
+                cache_force_store.clone(),
             );
 
             // 启动余额后台刷新调度器（每 5 分钟一次，与缓存 TTL 对齐）

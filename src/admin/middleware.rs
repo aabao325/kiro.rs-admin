@@ -18,6 +18,7 @@ use super::service::AdminService;
 use super::types::AdminErrorResponse;
 use super::usage_stats::SharedAggregator;
 use super::trace_db::SharedTraceStore;
+use crate::anthropic::cache_force::SharedCacheForceStore;
 use crate::common::auth;
 
 /// Admin API 共享状态
@@ -35,9 +36,12 @@ pub struct AdminState {
     pub trace_store: SharedTraceStore,
     /// 账号分组注册表（持久化到 groups.json）
     pub groups: SharedGroupManager,
+    /// 缓存强制覆盖设置存储（与 anthropic 路由共享）
+    pub cache_force: SharedCacheForceStore,
 }
 
 impl AdminState {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         admin_api_key: impl Into<String>,
         service: AdminService,
@@ -45,6 +49,7 @@ impl AdminState {
         usage_aggregator: SharedAggregator,
         trace_store: SharedTraceStore,
         groups: SharedGroupManager,
+        cache_force: SharedCacheForceStore,
     ) -> Self {
         Self {
             admin_api_key: Arc::new(RwLock::new(admin_api_key.into())),
@@ -53,6 +58,7 @@ impl AdminState {
             usage_aggregator,
             trace_store,
             groups,
+            cache_force,
         }
     }
 }

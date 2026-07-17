@@ -759,13 +759,25 @@ pub async fn post_messages(
     let tool_name_map = conversion_result.tool_name_map;
     let known_tool_names = conversion_result.known_tool_names;
 
-    // CacheMeter：根据 cache_control 断点查 / 写中转层提示词缓存。
+    // CacheMeter：根据 cache_control 断点查 / 写中转层提示词缓存（Auto 模式使用）。
     // 返回 estimate 口径的覆盖量；真实 input/cache 互斥分摊在拿到 total 真值时进行。
-    let cache_usage = state
-        .cache_meter
+    // 三档模式（关闭/智能模拟/比例强制）由 cache_force::resolve 统一处理，
+    // Force/Off 模式下不需要哈希链查/写，跳过该 O(会话长度) 的同步工作。
+    let cache_force_settings = state
+        .cache_force
         .as_ref()
-        .map(|cache| super::cache_metering::compute_cache_usage(cache, &payload, key_ctx.key_id))
+        .map(|s| s.snapshot())
         .unwrap_or_default();
+    let cache_ttl_secs = super::cache_metering::detect_max_ttl(&payload);
+    let cache_usage = if cache_force_settings.mode == super::cache_force::CacheMode::Auto {
+        state
+            .cache_meter
+            .as_ref()
+            .map(|cache| super::cache_metering::compute_cache_usage(cache, &payload, key_ctx.key_id))
+            .unwrap_or_default()
+    } else {
+        super::cache_metering::CacheUsage::default()
+    };
 
     if payload.stream {
         // 流式响应
@@ -787,6 +799,8 @@ pub async fn post_messages(
             known_tool_names,
             hook,
             cache_usage,
+            cache_force_settings,
+            cache_ttl_secs,
             tracer,
             key_ctx.group.clone(),
         )
@@ -812,6 +826,8 @@ pub async fn post_messages(
             known_tool_names,
             hook,
             cache_usage,
+            cache_force_settings,
+            cache_ttl_secs,
             tracer,
             key_ctx.group.clone(),
         )
@@ -830,6 +846,8 @@ async fn handle_stream_request(
     known_tool_names: std::collections::HashSet<String>,
     hook: UsageRecordHook,
     cache_usage: super::cache_metering::CacheUsage,
+    cache_force_settings: super::cache_force::CacheForceSettings,
+    cache_ttl_secs: i64,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
 ) -> Response {
@@ -849,6 +867,8 @@ async fn handle_stream_request(
     // 创建流处理上下文
     let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map, known_tool_names);
     ctx.cache_usage = cache_usage;
+    ctx.cache_force_settings = cache_force_settings;
+    ctx.cache_ttl_secs = cache_ttl_secs;
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -1049,6 +1069,8 @@ async fn handle_non_stream_request(
     _known_tool_names: std::collections::HashSet<String>,
     hook: UsageRecordHook,
     cache_usage: super::cache_metering::CacheUsage,
+    cache_force_settings: super::cache_force::CacheForceSettings,
+    cache_ttl_secs: i64,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
 ) -> Response {
@@ -1223,6 +1245,20 @@ async fn handle_non_stream_request(
     // 剥离混入文本的字面 <tool_use> XML 泄漏（非流式：整段文本已就绪，一次性剥离）。
     let text_content = crate::kiro::model::events::strip_tool_use_xml_leaks(&text_content);
 
+    // 思考文本用于 thinking_tokens 估算：优先原生 reasoningContent，否则退回文本 tag 提取路径。
+    let thinking_text_for_tokens = if !native_thinking.is_empty() {
+        native_thinking.clone()
+    } else {
+        super::stream::extract_thinking_from_complete_text(&text_content)
+            .0
+            .unwrap_or_default()
+    };
+    let thinking_tokens = if thinking_text_for_tokens.is_empty() {
+        0
+    } else {
+        super::stream::estimate_tokens(&thinking_text_for_tokens)
+    };
+
     // 构建响应内容
     let mut content = build_non_stream_content(
         thinking_enabled,
@@ -1230,6 +1266,7 @@ async fn handle_non_stream_request(
         native_thinking,
         native_thinking_signature,
         native_redacted_thinking,
+        model,
     );
     content.extend(tool_uses);
 
@@ -1238,24 +1275,44 @@ async fn handle_non_stream_request(
 
     // 输入 tokens：contextUsage 真实值优先，否则用客户端估算
     let total_input_tokens = resolve_usage_input_tokens(input_tokens, context_input_tokens);
-    // 互斥分摊：input + cache_creation + cache_read == total
-    let (final_input_tokens, cache_creation_tokens, cache_read_tokens) =
-        cache_usage.split_against_total(total_input_tokens);
+    // 互斥分摊：三档模式统一走 cache_force::resolve（Off/Auto/Force）
+    let resolved = super::cache_force::resolve(
+        &cache_force_settings,
+        &cache_usage,
+        total_input_tokens,
+        cache_ttl_secs,
+    );
+    let final_input_tokens = resolved.input_tokens;
+    let cache_creation_tokens = resolved.cache_creation_input_tokens;
+    let cache_read_tokens = resolved.cache_read_input_tokens;
 
     // 构建 Anthropic 响应
     let response_body = json!({
-        "id": format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
+        "id": super::signature_sim::generate_message_id(),
         "type": "message",
         "role": "assistant",
         "content": content,
         "model": model,
         "stop_reason": stop_reason,
         "stop_sequence": null,
+        "stop_details": null,
+        "context_management": {
+            "applied_edits": []
+        },
         "usage": {
             "input_tokens": final_input_tokens,
             "output_tokens": output_tokens,
             "cache_creation_input_tokens": cache_creation_tokens,
-            "cache_read_input_tokens": cache_read_tokens
+            "cache_read_input_tokens": cache_read_tokens,
+            "cache_creation": {
+                "ephemeral_5m_input_tokens": resolved.ephemeral_5m_input_tokens,
+                "ephemeral_1h_input_tokens": resolved.ephemeral_1h_input_tokens
+            },
+            "output_tokens_details": {
+                "thinking_tokens": thinking_tokens
+            },
+            "service_tier": "standard",
+            "inference_geo": "not_available"
         }
     });
 
@@ -1290,6 +1347,7 @@ fn build_non_stream_content(
     native_thinking: String,
     native_thinking_signature: Option<String>,
     native_redacted_thinking: Vec<String>,
+    model: &str,
 ) -> Vec<serde_json::Value> {
     let mut content = Vec::new();
     let has_native_thinking = !native_thinking.is_empty();
@@ -1300,7 +1358,7 @@ fn build_non_stream_content(
                 "type": "thinking",
                 "thinking": native_thinking.clone(),
                 "signature": native_thinking_signature
-                    .unwrap_or_else(|| super::stream::THINKING_SIGNATURE_PLACEHOLDER.to_string()),
+                    .unwrap_or_else(|| super::signature_sim::generate_thinking_signature(model)),
             }));
         } else {
             // 从完整文本中提取 thinking 块，兼容旧的 <thinking> 文本路径。
@@ -1311,7 +1369,7 @@ fn build_non_stream_content(
                 content.push(json!({
                     "type": "thinking",
                     "thinking": thinking_text,
-                    "signature": super::stream::THINKING_SIGNATURE_PLACEHOLDER,
+                    "signature": super::signature_sim::generate_thinking_signature(model),
                 }));
             }
 
@@ -1550,12 +1608,22 @@ pub async fn post_messages_cc(
     let tool_name_map = conversion_result.tool_name_map;
     let known_tool_names = conversion_result.known_tool_names;
 
-    // CacheMeter：根据 cache_control 断点查 / 写中转层提示词缓存（estimate 口径）。
-    let cache_usage = state
-        .cache_meter
+    // CacheMeter：根据 cache_control 断点查 / 写中转层提示词缓存（Auto 模式使用，estimate 口径）。
+    let cache_force_settings = state
+        .cache_force
         .as_ref()
-        .map(|cache| super::cache_metering::compute_cache_usage(cache, &payload, key_ctx.key_id))
+        .map(|s| s.snapshot())
         .unwrap_or_default();
+    let cache_ttl_secs = super::cache_metering::detect_max_ttl(&payload);
+    let cache_usage = if cache_force_settings.mode == super::cache_force::CacheMode::Auto {
+        state
+            .cache_meter
+            .as_ref()
+            .map(|cache| super::cache_metering::compute_cache_usage(cache, &payload, key_ctx.key_id))
+            .unwrap_or_default()
+    } else {
+        super::cache_metering::CacheUsage::default()
+    };
 
     if payload.stream {
         // 流式响应（缓冲模式）
@@ -1577,6 +1645,8 @@ pub async fn post_messages_cc(
             hook,
             total_input_tokens,
             cache_usage,
+            cache_force_settings,
+            cache_ttl_secs,
             tracer,
             key_ctx.group.clone(),
         )
@@ -1602,6 +1672,8 @@ pub async fn post_messages_cc(
             known_tool_names,
             hook,
             cache_usage,
+            cache_force_settings,
+            cache_ttl_secs,
             tracer,
             key_ctx.group.clone(),
         )
@@ -1623,6 +1695,8 @@ async fn handle_stream_request_buffered(
     hook: UsageRecordHook,
     fallback_input_tokens: i32,
     cache_usage: super::cache_metering::CacheUsage,
+    cache_force_settings: super::cache_force::CacheForceSettings,
+    cache_ttl_secs: i64,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
 ) -> Response {
@@ -1647,6 +1721,7 @@ async fn handle_stream_request_buffered(
         known_tool_names,
     );
     ctx.set_cache_usage(cache_usage);
+    ctx.set_cache_force(cache_force_settings, cache_ttl_secs);
 
     // 创建缓冲 SSE 流
     let stream = create_buffered_sse_stream(response, ctx, hook, credential_id, tracer);
@@ -1881,6 +1956,7 @@ mod tests {
             "native thinking".to_string(),
             Some("real-signature".to_string()),
             vec!["encrypted-thinking".to_string()],
+            "claude-opus-4-7",
         );
 
         assert_eq!(content.len(), 3);
@@ -1901,14 +1977,15 @@ mod tests {
             String::new(),
             None,
             Vec::new(),
+            "claude-opus-4-7",
         );
 
         assert_eq!(content.len(), 2);
         assert_eq!(content[0]["type"], "thinking");
         assert_eq!(content[0]["thinking"], "legacy thinking");
-        assert_eq!(
-            content[0]["signature"],
-            crate::anthropic::stream::THINKING_SIGNATURE_PLACEHOLDER
+        let signature = content[0]["signature"].as_str().unwrap();
+        assert!(
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, signature).is_ok()
         );
         assert_eq!(content[1]["type"], "text");
         assert_eq!(content[1]["text"], "final answer");
@@ -1922,6 +1999,7 @@ mod tests {
             "native thinking fallback".to_string(),
             Some("ignored-signature".to_string()),
             vec!["ignored-redacted".to_string()],
+            "claude-opus-4-7",
         );
 
         assert_eq!(content.len(), 1);

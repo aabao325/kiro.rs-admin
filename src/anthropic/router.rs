@@ -18,6 +18,7 @@ use super::{
     middleware::{AppState, auth_middleware, cors_layer},
     openai::post_chat_completions,
     responses::post_responses,
+    cache_force::SharedCacheForceStore,
     cache_metering::SharedCacheMeter,
 };
 
@@ -42,6 +43,7 @@ pub fn create_router_with_provider(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -56,6 +58,7 @@ pub fn create_router(
     usage_aggregator: Option<SharedAggregator>,
     cache_meter: Option<SharedCacheMeter>,
     trace_store: Option<SharedTraceStore>,
+    cache_force: Option<SharedCacheForceStore>,
 ) -> Router {
     let mut state = AppState::new(extract_thinking, tool_compatibility_mode);
     if let Some(provider) = kiro_provider {
@@ -63,6 +66,7 @@ pub fn create_router(
     }
     state = state.with_usage(client_keys, usage_recorder, usage_aggregator);
     state = state.with_cache_meter(cache_meter);
+    state = state.with_cache_force(cache_force);
     state = state.with_trace_store(trace_store);
 
     // 需要认证的 /v1 路由

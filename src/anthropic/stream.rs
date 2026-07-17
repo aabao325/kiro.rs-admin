@@ -9,19 +9,6 @@ use uuid::Uuid;
 
 use crate::kiro::model::events::Event;
 
-/// thinking 块的 signature 占位字符串
-///
-/// Anthropic Messages API 协议规定 thinking 模式下，assistant 消息的
-/// `{type:"thinking", ...}` 块必须带 `signature` 字段并在下一轮原样回传，
-/// 否则 SDK / 服务端会拒绝请求并报：
-/// `The content[].thinking in the thinking mode must be passed back to the API`。
-///
-/// 上游 Kiro 不下发真实签名（它本身不是 Anthropic 服务端），因此 kiro.rs 在
-/// thinking 块结束时插入一个非空占位字符串以满足客户端本地校验。
-/// converter 在解析 assistant 消息回传 Kiro 时只读 `block.thinking`，不读
-/// signature，因此该占位字符串只在客户端 ↔ kiro.rs 之间存在，不会影响转发。
-pub(super) const THINKING_SIGNATURE_PLACEHOLDER: &str = "kiro-rs-thinking-signature";
-
 const TOOL_USE_XML_PREFIX: &str = "<tool_use";
 const TOOL_USE_XML_CLOSE: &str = "</tool_use>";
 
@@ -1267,12 +1254,16 @@ impl SseStateManager {
     }
 
     /// 生成最终事件序列
+    #[allow(clippy::too_many_arguments)]
     pub fn generate_final_events(
         &mut self,
         input_tokens: i32,
         output_tokens: i32,
         cache_creation_input_tokens: i32,
         cache_read_input_tokens: i32,
+        ephemeral_5m_input_tokens: i32,
+        ephemeral_1h_input_tokens: i32,
+        thinking_tokens: i32,
     ) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
@@ -1305,7 +1296,16 @@ impl SseStateManager {
                         "input_tokens": input_tokens,
                         "output_tokens": output_tokens,
                         "cache_creation_input_tokens": cache_creation_input_tokens,
-                        "cache_read_input_tokens": cache_read_input_tokens
+                        "cache_read_input_tokens": cache_read_input_tokens,
+                        "cache_creation": {
+                            "ephemeral_5m_input_tokens": ephemeral_5m_input_tokens,
+                            "ephemeral_1h_input_tokens": ephemeral_1h_input_tokens
+                        },
+                        "output_tokens_details": {
+                            "thinking_tokens": thinking_tokens
+                        },
+                        "service_tier": "standard",
+                        "inference_geo": "not_available"
                     }
                 }),
             ));
@@ -1340,6 +1340,9 @@ pub struct StreamContext {
     pub context_input_tokens: Option<i32>,
     /// 输出 tokens 累计
     pub output_tokens: i32,
+    /// thinking 文本部分的输出 tokens 累计（`output_tokens` 的子集），
+    /// 用于上报 `usage.output_tokens_details.thinking_tokens`。
+    pub thinking_output_tokens: i32,
     /// 工具块索引映射 (tool_id -> block_index)
     pub tool_block_indices: HashMap<String, i32>,
     /// 工具名称反向映射（短名称 → 原始名称），用于响应时还原
@@ -1377,6 +1380,11 @@ pub struct StreamContext {
     /// 做互斥分摊：`input + cache_creation + cache_read == total`，避免把被缓存
     /// 覆盖的前缀重复计进 input_tokens。
     pub cache_usage: super::cache_metering::CacheUsage,
+    /// 缓存三档模式（关闭/智能模拟/比例强制）的当前生效设置快照。
+    pub cache_force_settings: super::cache_force::CacheForceSettings,
+    /// 本次请求探测到的最大 cache_control TTL（秒），用于把 cache_creation
+    /// 分进 `ephemeral_5m_input_tokens` / `ephemeral_1h_input_tokens` 桶。
+    pub cache_ttl_secs: i64,
     /// meteringEvent 上报的 credit 计费量（上游真实下发）
     pub credits: f64,
     /// 复读熔断：最近一次作为文本吐出的「尾行」内容（去空白）。
@@ -1398,13 +1406,29 @@ pub struct StreamContext {
 }
 
 impl StreamContext {
+    /// 解析最终上报口径的完整缓存拆分（含 5m/1h 分桶），三档模式统一走
+    /// `cache_force::resolve`。
+    pub fn resolved_cache_usage_full(&self) -> super::cache_force::ResolvedCacheUsage {
+        let total_real = self.context_input_tokens.unwrap_or(self.input_tokens);
+        super::cache_force::resolve(
+            &self.cache_force_settings,
+            &self.cache_usage,
+            total_real,
+            self.cache_ttl_secs,
+        )
+    }
+
     /// 解析最终上报口径的 `(input_tokens, cache_creation, cache_read)`。
     ///
     /// total 真值优先取 contextUsage（上游真实百分比×窗口），否则用客户端估算的
-    /// `input_tokens`；再由 [`CacheUsage::split_against_total`] 做互斥分摊。
+    /// `input_tokens`；再由三档模式统一分摊（见 [`Self::resolved_cache_usage_full`]）。
     pub fn resolved_usage(&self) -> (i32, i32, i32) {
-        let total_real = self.context_input_tokens.unwrap_or(self.input_tokens);
-        self.cache_usage.split_against_total(total_real)
+        let r = self.resolved_cache_usage_full();
+        (
+            r.input_tokens,
+            r.cache_creation_input_tokens,
+            r.cache_read_input_tokens,
+        )
     }
 
     /// 工具调用 JSON 错误信息（非法 / 半截）。上层据此把本次请求记为 error、
@@ -1421,13 +1445,15 @@ impl StreamContext {
         tool_name_map: HashMap<String, String>,
         known_tool_names: std::collections::HashSet<String>,
     ) -> Self {
+        let model = model.into();
         Self {
             state_manager: SseStateManager::new(),
-            model: model.into(),
-            message_id: format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
+            message_id: super::signature_sim::generate_message_id(),
+            model,
             input_tokens,
             context_input_tokens: None,
             output_tokens: 0,
+            thinking_output_tokens: 0,
             tool_block_indices: HashMap::new(),
             tool_name_map,
             known_tool_names,
@@ -1443,6 +1469,8 @@ impl StreamContext {
             text_block_index: None,
             strip_thinking_leading_newline: false,
             cache_usage: super::cache_metering::CacheUsage::default(),
+            cache_force_settings: super::cache_force::CacheForceSettings::default(),
+            cache_ttl_secs: 300,
             credits: 0.0,
             repeat_guard_last_line: String::new(),
             repeat_guard_run: 0,
@@ -1465,11 +1493,21 @@ impl StreamContext {
                 "model": self.model,
                 "stop_reason": null,
                 "stop_sequence": null,
+                "stop_details": null,
+                "context_management": {
+                    "applied_edits": []
+                },
                 "usage": {
                     "input_tokens": self.input_tokens,
                     "output_tokens": 1,
                     "cache_creation_input_tokens": 0,
-                    "cache_read_input_tokens": 0
+                    "cache_read_input_tokens": 0,
+                    "cache_creation": {
+                        "ephemeral_5m_input_tokens": 0,
+                        "ephemeral_1h_input_tokens": 0
+                    },
+                    "service_tier": "standard",
+                    "inference_geo": "not_available"
                 }
             }
         })
@@ -1678,6 +1716,7 @@ impl StreamContext {
                     // 提取 thinking 内容
                     let thinking_content = self.thinking_buffer[..end_pos].to_string();
                     if !thinking_content.is_empty() {
+                        self.thinking_output_tokens += estimate_tokens(&thinking_content);
                         if let Some(thinking_index) = self.thinking_block_index {
                             events.push(
                                 self.create_thinking_delta_event(thinking_index, &thinking_content),
@@ -1721,6 +1760,7 @@ impl StreamContext {
                     if safe_len > 0 {
                         let safe_content = self.thinking_buffer[..safe_len].to_string();
                         if !safe_content.is_empty() {
+                            self.thinking_output_tokens += estimate_tokens(&safe_content);
                             if let Some(thinking_index) = self.thinking_block_index {
                                 events.push(
                                     self.create_thinking_delta_event(thinking_index, &safe_content),
@@ -2079,7 +2119,7 @@ impl StreamContext {
         let signature = self
             .pending_thinking_signature
             .take()
-            .unwrap_or_else(|| THINKING_SIGNATURE_PLACEHOLDER.to_string());
+            .unwrap_or_else(|| super::signature_sim::generate_thinking_signature(&self.model));
         let mut events = vec![
             self.create_thinking_delta_event(idx, ""),
             self.create_signature_delta_event_with(idx, &signature),
@@ -2116,6 +2156,7 @@ impl StreamContext {
             && !text.is_empty()
         {
             self.output_tokens += estimate_tokens(text);
+            self.thinking_output_tokens += estimate_tokens(text);
             events.extend(self.ensure_thinking_block());
             if let Some(idx) = self.thinking_block_index {
                 events.push(self.create_thinking_delta_event(idx, text));
@@ -2177,11 +2218,13 @@ impl StreamContext {
     /// assistant 消息回传时本地校验 thinking 块必须带非空 signature，否则抛出
     /// `The content[].thinking in the thinking mode must be passed back to the API`。
     ///
-    /// 上游 Kiro 不是 Anthropic 服务端，不会下发真实签名，因此这里发一个非空
-    /// 占位字符串以满足客户端本地校验。该字段不参与转发回 Kiro 的逻辑
-    /// （converter 只读 `block.thinking`，不读 signature）。
+    /// 上游 Kiro 不是 Anthropic 服务端，不会下发真实签名，因此这里生成一个
+    /// 模拟签名（protobuf 字段位置对齐真实样例，见 `signature_sim`）以满足客户端
+    /// 本地校验。该字段不参与转发回 Kiro 的逻辑（converter 只读
+    /// `block.thinking`，不读 signature）。
     fn create_signature_delta_event(&self, index: i32) -> SseEvent {
-        self.create_signature_delta_event_with(index, THINKING_SIGNATURE_PLACEHOLDER)
+        let signature = super::signature_sim::generate_thinking_signature(&self.model);
+        self.create_signature_delta_event_with(index, &signature)
     }
 
     fn create_signature_delta_event_with(&self, index: i32, signature: &str) -> SseEvent {
@@ -2273,6 +2316,7 @@ impl StreamContext {
             if let Some(end_pos) = find_real_thinking_end_tag_at_buffer_end(&self.thinking_buffer) {
                 let thinking_content = self.thinking_buffer[..end_pos].to_string();
                 if !thinking_content.is_empty() {
+                    self.thinking_output_tokens += estimate_tokens(&thinking_content);
                     if let Some(thinking_index) = self.thinking_block_index {
                         events.push(
                             self.create_thinking_delta_event(thinking_index, &thinking_content),
@@ -2366,6 +2410,7 @@ impl StreamContext {
                 {
                     let thinking_content = self.thinking_buffer[..end_pos].to_string();
                     if !thinking_content.is_empty() {
+                        self.thinking_output_tokens += estimate_tokens(&thinking_content);
                         if let Some(thinking_index) = self.thinking_block_index {
                             events.push(
                                 self.create_thinking_delta_event(thinking_index, &thinking_content),
@@ -2397,6 +2442,7 @@ impl StreamContext {
                 } else {
                     // 如果还在 thinking 块内，发送剩余内容作为 thinking_delta
                     if let Some(thinking_index) = self.thinking_block_index {
+                        self.thinking_output_tokens += estimate_tokens(&self.thinking_buffer);
                         events.push(
                             self.create_thinking_delta_event(thinking_index, &self.thinking_buffer),
                         );
@@ -2451,14 +2497,17 @@ impl StreamContext {
         }
 
         // 互斥口径：total 真值（contextUsage 优先）− 缓存覆盖 = 未缓存的 input。
-        let (final_input_tokens, cache_creation, cache_read) = self.resolved_usage();
+        let resolved = self.resolved_cache_usage_full();
 
         // 生成最终事件（message_delta + message_stop）
         events.extend(self.state_manager.generate_final_events(
-            final_input_tokens,
+            resolved.input_tokens,
             self.output_tokens,
-            cache_creation,
-            cache_read,
+            resolved.cache_creation_input_tokens,
+            resolved.cache_read_input_tokens,
+            resolved.ephemeral_5m_input_tokens,
+            resolved.ephemeral_1h_input_tokens,
+            self.thinking_output_tokens,
         ));
 
         // 工具调用 JSON 错误：在最终事件之后补一个 Anthropic `error` 事件，明确告知
@@ -2527,6 +2576,16 @@ impl BufferedStreamContext {
         self.inner.cache_usage = cache_usage;
     }
 
+    /// 注入缓存三档模式设置与本次请求探测到的 TTL，供最终上报时统一分摊。
+    pub fn set_cache_force(
+        &mut self,
+        settings: super::cache_force::CacheForceSettings,
+        ttl_secs: i64,
+    ) {
+        self.inner.cache_force_settings = settings;
+        self.inner.cache_ttl_secs = ttl_secs;
+    }
+
     /// 处理 Kiro 事件并缓冲结果
     ///
     /// 复用 StreamContext 的事件处理逻辑，但把结果缓存而不是立即发送。
@@ -2558,7 +2617,7 @@ impl BufferedStreamContext {
         }
 
         // 互斥口径分摊：total 真值 − 缓存覆盖 = 未缓存 input（与 inner 收尾一致）。
-        let (final_input_tokens, cache_creation, cache_read) = self.inner.resolved_usage();
+        let resolved = self.inner.resolved_cache_usage_full();
 
         // 生成最终事件（StreamContext 内部会用同样的优先级与分摊）
         let final_events = self.inner.generate_final_events();
@@ -2569,9 +2628,15 @@ impl BufferedStreamContext {
             if event.event == "message_start" {
                 if let Some(message) = event.data.get_mut("message") {
                     if let Some(usage) = message.get_mut("usage") {
-                        usage["input_tokens"] = serde_json::json!(final_input_tokens);
-                        usage["cache_creation_input_tokens"] = serde_json::json!(cache_creation);
-                        usage["cache_read_input_tokens"] = serde_json::json!(cache_read);
+                        usage["input_tokens"] = serde_json::json!(resolved.input_tokens);
+                        usage["cache_creation_input_tokens"] =
+                            serde_json::json!(resolved.cache_creation_input_tokens);
+                        usage["cache_read_input_tokens"] =
+                            serde_json::json!(resolved.cache_read_input_tokens);
+                        usage["cache_creation"] = serde_json::json!({
+                            "ephemeral_5m_input_tokens": resolved.ephemeral_5m_input_tokens,
+                            "ephemeral_1h_input_tokens": resolved.ephemeral_1h_input_tokens
+                        });
                     }
                 }
             }

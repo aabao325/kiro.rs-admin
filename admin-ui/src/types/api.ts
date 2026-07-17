@@ -576,3 +576,17 @@ export interface UpdateGroupRequest {
   /** 新备注；空字符串清除；undefined 保留原值 */
   description?: string
 }
+
+// ============ 缓存强制覆盖（三档模式：关闭/智能模拟/比例强制） ============
+
+export type CacheMode = 'off' | 'auto' | 'force'
+
+export interface CacheForceSettings {
+  mode: CacheMode
+  /** cache_creation 占「可缓存基数」的比例 [0,1] */
+  creationRatio: number
+  /** cache_read 占「可缓存基数」的比例 [0,1] */
+  hitRatio: number
+  /** prompt 中算作「可缓存基数」的比例 [0,1] */
+  cacheableRatio: number
+}

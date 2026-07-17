@@ -1585,3 +1585,18 @@ pub async fn delete_group(
     )))
     .into_response()
 }
+
+/// GET /api/admin/cache-force
+/// 获取缓存强制覆盖设置（关闭 / 智能模拟 / 比例强制三档模式 + 比例参数）
+pub async fn get_cache_force_config(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.cache_force.snapshot())
+}
+
+/// PUT /api/admin/cache-force
+/// 更新缓存强制覆盖设置（clamp 比例到 [0,1] 后持久化，返回生效后的值）
+pub async fn set_cache_force_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<crate::anthropic::cache_force::CacheForceSettings>,
+) -> impl IntoResponse {
+    Json(state.cache_force.update(payload))
+}

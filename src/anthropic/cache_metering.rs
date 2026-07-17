@@ -567,7 +567,10 @@ fn extract_session_id(user_id: &str) -> Option<String> {
 
 /// 探测请求里出现过的最大 cache_control.ttl（"1h" 优先于 "5m"）；
 /// 无任何 cache_control 时返回默认 5m。决定写入缓存段的存活时长。
-fn detect_max_ttl(req: &MessagesRequest) -> i64 {
+///
+/// `pub(crate)`：也被 `cache_force.rs`（强制比例模式）和 handlers/stream 的
+/// `usage.cache_creation` 分桶逻辑复用，避免重复实现同一套探测规则。
+pub(crate) fn detect_max_ttl(req: &MessagesRequest) -> i64 {
     let mut ttl = DEFAULT_TTL_SECS;
     let mut bump = |cc: Option<&CacheControl>| {
         if let Some(cc) = cc {

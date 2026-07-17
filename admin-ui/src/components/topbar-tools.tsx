@@ -1,7 +1,7 @@
 import { forwardRef, useEffect, useState, type ComponentPropsWithoutRef } from 'react'
 import {
   Activity, RefreshCw, UploadCloud, Settings, Key, Wand2, Eye, EyeOff, Copy,
-  MoreHorizontal, ShieldAlert, ShieldCheck,
+  MoreHorizontal, ShieldAlert, ShieldCheck, Database,
 } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
@@ -24,6 +24,7 @@ import { useUpdateCheck } from '@/hooks/use-update-check'
 import { updateAdminKey } from '@/api/credentials'
 import { extractErrorMessage, generateApiKey } from '@/lib/utils'
 import { ImageUpdateDialog } from '@/components/image-update-dialog'
+import { CacheForceDialog } from '@/components/cache-force-card'
 
 /**
  * 顶栏右侧通用工具栏：负载均衡切换、刷新、在线更新、设置（Key 管理）。
@@ -45,6 +46,7 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
 
   const [imageUpdateOpen, setImageUpdateOpen] = useState(false)
   const [keyDialogOpen, setKeyDialogOpen] = useState(false)
+  const [cacheForceOpen, setCacheForceOpen] = useState(false)
   const [newKey, setNewKey] = useState('')
   const [showPlain, setShowPlain] = useState(false)
   const [updating, setUpdating] = useState(false)
@@ -112,6 +114,7 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
     loadBalancingMode: loadBalancingData?.mode,
     openImageUpdate: () => setImageUpdateOpen(true),
     openKeyDialog,
+    openCacheForce: () => setCacheForceOpen(true),
     throttleConfig,
     updateCheck,
     updateCooldown: (secs: number) =>
@@ -126,6 +129,7 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
     <>
       {compact ? <CompactTools controls={controls} /> : <FullTools controls={controls} />}
       <ImageUpdateDialog open={imageUpdateOpen} onOpenChange={setImageUpdateOpen} />
+      <CacheForceDialog open={cacheForceOpen} onOpenChange={setCacheForceOpen} />
 
       <Dialog
         open={keyDialogOpen}
@@ -232,6 +236,7 @@ interface ToolControls {
   loadBalancingMode?: 'priority' | 'balanced'
   openImageUpdate: () => void
   openKeyDialog: () => void
+  openCacheForce: () => void
   throttleConfig?: { failover: boolean; cooldownSecs: number }
   updateCheck?: { hasUpdate: boolean; latestVersion: string; currentVersion: string }
   updateCooldown: (secs: number) => void
@@ -250,7 +255,10 @@ function FullTools({ controls }: { controls: ToolControls }) {
       />
       <RefreshButton onRefresh={controls.handleRefresh} />
       <ImageUpdateButton controls={controls} />
-      <KeySettingsMenu onOpenKeyDialog={controls.openKeyDialog} />
+      <KeySettingsMenu
+        onOpenKeyDialog={controls.openKeyDialog}
+        onOpenCacheForce={controls.openCacheForce}
+      />
     </>
   )
 }
@@ -294,6 +302,10 @@ function CompactTools({ controls }: { controls: ToolControls }) {
         <DropdownMenuLabel>密钥管理</DropdownMenuLabel>
         <DropdownMenuItem onSelect={controls.openKeyDialog}>
           <Key />修改登录API密钥（管理面板登录）
+        </DropdownMenuItem>
+        <DropdownMenuLabel>缓存</DropdownMenuLabel>
+        <DropdownMenuItem onSelect={controls.openCacheForce}>
+          <Database />缓存强制覆盖（关闭/智能模拟/比例强制）
         </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>
@@ -344,7 +356,12 @@ function ImageUpdateButton({ controls }: { controls: ToolControls }) {
   )
 }
 
-function KeySettingsMenu({ onOpenKeyDialog }: { onOpenKeyDialog: () => void }) {
+function KeySettingsMenu({
+  onOpenKeyDialog, onOpenCacheForce,
+}: {
+  onOpenKeyDialog: () => void
+  onOpenCacheForce: () => void
+}) {
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
@@ -356,6 +373,10 @@ function KeySettingsMenu({ onOpenKeyDialog }: { onOpenKeyDialog: () => void }) {
         <DropdownMenuLabel>密钥管理</DropdownMenuLabel>
         <DropdownMenuItem onSelect={onOpenKeyDialog}>
           <Key />修改登录API密钥（管理面板登录）
+        </DropdownMenuItem>
+        <DropdownMenuLabel>缓存</DropdownMenuLabel>
+        <DropdownMenuItem onSelect={onOpenCacheForce}>
+          <Database />缓存强制覆盖（关闭/智能模拟/比例强制）
         </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>

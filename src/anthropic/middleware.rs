@@ -16,6 +16,7 @@ use crate::admin::usage_stats::{SharedAggregator, SharedRecorder};
 use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
 
+use super::cache_force::SharedCacheForceStore;
 use super::cache_metering::SharedCacheMeter;
 use super::types::ErrorResponse;
 
@@ -48,6 +49,8 @@ pub struct AppState {
     pub usage_aggregator: Option<SharedAggregator>,
     /// 中转层缓存计量（基于 cache_control 断点的内存缓存）
     pub cache_meter: Option<SharedCacheMeter>,
+    /// 缓存强制覆盖设置（管理面板可调的三档模式：关闭/智能模拟/比例强制）
+    pub cache_force: Option<SharedCacheForceStore>,
     /// 请求链路追踪存储（SQLite，可选）
     pub trace_store: Option<SharedTraceStore>,
 }
@@ -67,6 +70,7 @@ impl AppState {
             usage_recorder: None,
             usage_aggregator: None,
             cache_meter: None,
+            cache_force: None,
             trace_store: None,
         }
     }
@@ -93,6 +97,12 @@ impl AppState {
     /// 注入缓存计量器
     pub fn with_cache_meter(mut self, cache: Option<SharedCacheMeter>) -> Self {
         self.cache_meter = cache;
+        self
+    }
+
+    /// 注入缓存强制覆盖设置存储
+    pub fn with_cache_force(mut self, store: Option<SharedCacheForceStore>) -> Self {
+        self.cache_force = store;
         self
     }
 
