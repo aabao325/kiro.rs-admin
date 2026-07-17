@@ -1294,13 +1294,13 @@ impl SseStateManager {
                     },
                     "usage": {
                         "input_tokens": input_tokens,
-                        "output_tokens": output_tokens,
                         "cache_creation_input_tokens": cache_creation_input_tokens,
                         "cache_read_input_tokens": cache_read_input_tokens,
                         "cache_creation": {
                             "ephemeral_5m_input_tokens": ephemeral_5m_input_tokens,
                             "ephemeral_1h_input_tokens": ephemeral_1h_input_tokens
                         },
+                        "output_tokens": output_tokens,
                         "output_tokens_details": {
                             "thinking_tokens": thinking_tokens
                         },
@@ -1385,6 +1385,10 @@ pub struct StreamContext {
     /// 本次请求探测到的最大 cache_control TTL（秒），用于把 cache_creation
     /// 分进 `ephemeral_5m_input_tokens` / `ephemeral_1h_input_tokens` 桶。
     pub cache_ttl_secs: i64,
+    /// 请求是否带 `anthropic-beta: context-management-2025-06-27`。
+    /// 官方仅在该 beta 开启时才在响应里返回 `context_management` 字段
+    /// （不是给 null，而是完全不出现该 key），未开启时不插入。
+    pub context_management_enabled: bool,
     /// meteringEvent 上报的 credit 计费量（上游真实下发）
     pub credits: f64,
     /// 复读熔断：最近一次作为文本吐出的「尾行」内容（去空白）。
@@ -1471,6 +1475,7 @@ impl StreamContext {
             cache_usage: super::cache_metering::CacheUsage::default(),
             cache_force_settings: super::cache_force::CacheForceSettings::default(),
             cache_ttl_secs: 300,
+            context_management_enabled: false,
             credits: 0.0,
             repeat_guard_last_line: String::new(),
             repeat_guard_run: 0,
@@ -1483,33 +1488,36 @@ impl StreamContext {
 
     /// 生成 message_start 事件
     pub fn create_message_start_event(&self) -> serde_json::Value {
+        let mut message = json!({
+            "model": self.model,
+            "id": self.message_id,
+            "type": "message",
+            "role": "assistant",
+            "content": [],
+            "stop_reason": null,
+            "stop_sequence": null,
+            "stop_details": null,
+            "usage": {
+                "input_tokens": self.input_tokens,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "cache_creation": {
+                    "ephemeral_5m_input_tokens": 0,
+                    "ephemeral_1h_input_tokens": 0
+                },
+                "output_tokens": 1,
+                "service_tier": "standard",
+                "inference_geo": "not_available"
+            }
+        });
+        // 官方仅在请求带 anthropic-beta: context-management-2025-06-27 时才
+        // 返回该字段（不是给 null，而是完全不出现），未开启该 beta 时不插入。
+        if self.context_management_enabled {
+            message["context_management"] = json!({ "applied_edits": [] });
+        }
         json!({
             "type": "message_start",
-            "message": {
-                "id": self.message_id,
-                "type": "message",
-                "role": "assistant",
-                "content": [],
-                "model": self.model,
-                "stop_reason": null,
-                "stop_sequence": null,
-                "stop_details": null,
-                "context_management": {
-                    "applied_edits": []
-                },
-                "usage": {
-                    "input_tokens": self.input_tokens,
-                    "output_tokens": 1,
-                    "cache_creation_input_tokens": 0,
-                    "cache_read_input_tokens": 0,
-                    "cache_creation": {
-                        "ephemeral_5m_input_tokens": 0,
-                        "ephemeral_1h_input_tokens": 0
-                    },
-                    "service_tier": "standard",
-                    "inference_geo": "not_available"
-                }
-            }
+            "message": message
         })
     }
 
@@ -2584,6 +2592,12 @@ impl BufferedStreamContext {
     ) {
         self.inner.cache_force_settings = settings;
         self.inner.cache_ttl_secs = ttl_secs;
+    }
+
+    /// 注入本次请求是否带 context-management beta header，决定响应里是否
+    /// 出现 `context_management` 字段。
+    pub fn set_context_management_enabled(&mut self, enabled: bool) {
+        self.inner.context_management_enabled = enabled;
     }
 
     /// 处理 Kiro 事件并缓冲结果

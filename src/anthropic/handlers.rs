@@ -17,7 +17,7 @@ use axum::{
     Json as JsonExtractor,
     body::Body,
     extract::{Extension, State},
-    http::{StatusCode, header},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Json, Response},
 };
 use bytes::Bytes;
@@ -256,6 +256,21 @@ struct ImageBudget {
     count: usize,
     total_b64_bytes: usize,
     largest_b64_bytes: usize,
+}
+
+/// 响应体 `context_management` 字段的开关：官方仅在请求带
+/// `anthropic-beta: context-management-2025-06-27`（或包含该值的逗号分隔列表）
+/// 时才会返回该字段，未开启该 beta 时响应里完全不出现此字段（不是给 null）。
+///
+/// 客户端可能发送多个同名 header，也可能在单个 header 里用逗号分隔多个 beta
+/// 值，这里对所有 `anthropic-beta` header 值统一按逗号切分后精确匹配。
+fn context_management_requested(headers: &HeaderMap) -> bool {
+    const BETA_FLAG: &str = "context-management-2025-06-27";
+    headers
+        .get_all("anthropic-beta")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .any(|v| v.split(',').any(|part| part.trim() == BETA_FLAG))
 }
 
 /// Counts the total number of images in the payload and their base64 byte size.
@@ -614,8 +629,10 @@ pub async fn get_models() -> impl IntoResponse {
 pub async fn post_messages(
     State(state): State<AppState>,
     Extension(key_ctx): Extension<KeyContext>,
+    headers: HeaderMap,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
+    let context_management_enabled = context_management_requested(&headers);
     // Count the image budget on inbound to provide precise diagnostics for later context-window-full errors
     let img_stats = count_image_budget(&payload);
     tracing::info!(
@@ -801,6 +818,7 @@ pub async fn post_messages(
             cache_usage,
             cache_force_settings,
             cache_ttl_secs,
+            context_management_enabled,
             tracer,
             key_ctx.group.clone(),
         )
@@ -828,6 +846,7 @@ pub async fn post_messages(
             cache_usage,
             cache_force_settings,
             cache_ttl_secs,
+            context_management_enabled,
             tracer,
             key_ctx.group.clone(),
         )
@@ -848,6 +867,7 @@ async fn handle_stream_request(
     cache_usage: super::cache_metering::CacheUsage,
     cache_force_settings: super::cache_force::CacheForceSettings,
     cache_ttl_secs: i64,
+    context_management_enabled: bool,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
 ) -> Response {
@@ -869,6 +889,7 @@ async fn handle_stream_request(
     ctx.cache_usage = cache_usage;
     ctx.cache_force_settings = cache_force_settings;
     ctx.cache_ttl_secs = cache_ttl_secs;
+    ctx.context_management_enabled = context_management_enabled;
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -1071,6 +1092,7 @@ async fn handle_non_stream_request(
     cache_usage: super::cache_metering::CacheUsage,
     cache_force_settings: super::cache_force::CacheForceSettings,
     cache_ttl_secs: i64,
+    context_management_enabled: bool,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
 ) -> Response {
@@ -1286,28 +1308,26 @@ async fn handle_non_stream_request(
     let cache_creation_tokens = resolved.cache_creation_input_tokens;
     let cache_read_tokens = resolved.cache_read_input_tokens;
 
-    // 构建 Anthropic 响应
-    let response_body = json!({
+    // 构建 Anthropic 响应（字段顺序对齐官方真实样例；serde_json 开启
+    // preserve_order 后 json! 字面量顺序即为序列化顺序）
+    let mut response_body = json!({
+        "model": model,
         "id": super::signature_sim::generate_message_id(),
         "type": "message",
         "role": "assistant",
         "content": content,
-        "model": model,
         "stop_reason": stop_reason,
         "stop_sequence": null,
         "stop_details": null,
-        "context_management": {
-            "applied_edits": []
-        },
         "usage": {
             "input_tokens": final_input_tokens,
-            "output_tokens": output_tokens,
             "cache_creation_input_tokens": cache_creation_tokens,
             "cache_read_input_tokens": cache_read_tokens,
             "cache_creation": {
                 "ephemeral_5m_input_tokens": resolved.ephemeral_5m_input_tokens,
                 "ephemeral_1h_input_tokens": resolved.ephemeral_1h_input_tokens
             },
+            "output_tokens": output_tokens,
             "output_tokens_details": {
                 "thinking_tokens": thinking_tokens
             },
@@ -1315,6 +1335,11 @@ async fn handle_non_stream_request(
             "inference_geo": "not_available"
         }
     });
+    // 官方仅在请求带 anthropic-beta: context-management-2025-06-27 时才返回
+    // 该字段（不是给 null，而是完全不出现），未开启该 beta 时不插入。
+    if context_management_enabled {
+        response_body["context_management"] = json!({ "applied_edits": [] });
+    }
 
     hook.record(
         credential_id,
@@ -1475,8 +1500,10 @@ pub async fn count_tokens(
 pub async fn post_messages_cc(
     State(state): State<AppState>,
     Extension(key_ctx): Extension<KeyContext>,
+    headers: HeaderMap,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
+    let context_management_enabled = context_management_requested(&headers);
     tracing::info!(
         model = %payload.model,
         max_tokens = %payload.max_tokens,
@@ -1647,6 +1674,7 @@ pub async fn post_messages_cc(
             cache_usage,
             cache_force_settings,
             cache_ttl_secs,
+            context_management_enabled,
             tracer,
             key_ctx.group.clone(),
         )
@@ -1674,6 +1702,7 @@ pub async fn post_messages_cc(
             cache_usage,
             cache_force_settings,
             cache_ttl_secs,
+            context_management_enabled,
             tracer,
             key_ctx.group.clone(),
         )
@@ -1697,6 +1726,7 @@ async fn handle_stream_request_buffered(
     cache_usage: super::cache_metering::CacheUsage,
     cache_force_settings: super::cache_force::CacheForceSettings,
     cache_ttl_secs: i64,
+    context_management_enabled: bool,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
 ) -> Response {
@@ -1722,6 +1752,7 @@ async fn handle_stream_request_buffered(
     );
     ctx.set_cache_usage(cache_usage);
     ctx.set_cache_force(cache_force_settings, cache_ttl_secs);
+    ctx.set_context_management_enabled(context_management_enabled);
 
     // 创建缓冲 SSE 流
     let stream = create_buffered_sse_stream(response, ctx, hook, credential_id, tracer);
