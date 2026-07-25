@@ -18,7 +18,7 @@ use axum::{
     Json,
     body::{Body, to_bytes},
     extract::{Extension, State},
-    http::{StatusCode, header},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use serde::Deserialize;
@@ -82,8 +82,9 @@ pub async fn post_chat_completions(
         }
     };
 
-    // 2. 复用 Anthropic 全链路（内部强制非流式）
-    let inner = post_messages(State(state), Extension(key_ctx), Json(anthropic_req)).await;
+    // 2. 复用 Anthropic 全链路（内部强制非流式）；这是内部合成请求，不携带客户端
+    // 原始 header，anthropic-beta 相关字段（如 context_management）不适用，传空 HeaderMap。
+    let inner = post_messages(State(state), Extension(key_ctx), HeaderMap::new(), Json(anthropic_req)).await;
 
     let status = inner.status();
     let body_bytes = match to_bytes(inner.into_body(), MAX_INNER_BODY).await {

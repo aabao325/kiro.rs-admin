@@ -390,11 +390,13 @@ pub(super) fn map_provider_error(err: Error) -> Response {
 }
 
 /// 计算 Anthropic usage 口径的 input_tokens
-fn resolve_usage_input_tokens(
-    fallback_total_input_tokens: i32,
-    context_total_input_tokens: Option<i32>,
-) -> i32 {
-    context_total_input_tokens.unwrap_or(fallback_total_input_tokens)
+///
+/// 不用 contextUsageEvent 反推的「百分比 × 上下文窗口」总量：大窗口模型
+/// （1M）上这个值会把 Kiro 上游隐藏的 agent 上下文和本项目注入的系统策略
+/// 一并放大计入，跟真实官方口径能差出几十甚至上百倍。固定用不含注入内容的
+/// 客户端估算值。
+fn resolve_usage_input_tokens(fallback_total_input_tokens: i32) -> i32 {
+    fallback_total_input_tokens
 }
 
 fn available_models() -> Vec<Model> {
@@ -1075,8 +1077,6 @@ fn stream_trace_usage(ctx: &StreamContext) -> TraceUsage {
     }
 }
 
-use super::converter::get_context_window_size;
-
 /// 处理非流式请求
 async fn handle_non_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
@@ -1145,8 +1145,6 @@ async fn handle_non_stream_request(
     let mut tool_uses: Vec<serde_json::Value> = Vec::new();
     let mut has_tool_use = false;
     let mut stop_reason = "end_turn".to_string();
-    // 从 contextUsageEvent 计算的实际输入 tokens
-    let mut context_input_tokens: Option<i32> = None;
     // meteringEvent 上报的 credit 计费量（上游真实下发）；
     // input/cache_* 的互斥分摊在拿到 total 真值后由 cache_usage 完成。
     let mut credits: f64 = 0.0;
@@ -1195,20 +1193,14 @@ async fn handle_non_stream_request(
                             }
                         }
                         Event::ContextUsage(context_usage) => {
-                            // 从上下文使用百分比计算实际的 input_tokens
-                            let window_size = get_context_window_size(model);
-                            let actual_input_tokens =
-                                (context_usage.context_usage_percentage * (window_size as f64)
-                                    / 100.0) as i32;
-                            context_input_tokens = Some(actual_input_tokens);
-                            // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
+                            // 仅用于检测上下文窗口占满；不再据此计算 input_tokens 上报值
+                            // （理由见 resolve_usage_input_tokens 的注释）。
                             if context_usage.context_usage_percentage >= 100.0 {
                                 stop_reason = "model_context_window_exceeded".to_string();
                             }
                             tracing::debug!(
-                                "收到 contextUsageEvent: {}%, 计算 input_tokens: {}",
-                                context_usage.context_usage_percentage,
-                                actual_input_tokens
+                                "收到 contextUsageEvent: {}%",
+                                context_usage.context_usage_percentage
                             );
                         }
                         Event::Metering(metering) => {
@@ -1295,8 +1287,8 @@ async fn handle_non_stream_request(
     // 估算输出 tokens（上游不下发 token，全部走估算）
     let output_tokens = token::estimate_output_tokens(&content);
 
-    // 输入 tokens：contextUsage 真实值优先，否则用客户端估算
-    let total_input_tokens = resolve_usage_input_tokens(input_tokens, context_input_tokens);
+    // 输入 tokens：固定用客户端估算（不含内置提示词，见 resolve_usage_input_tokens 说明）
+    let total_input_tokens = resolve_usage_input_tokens(input_tokens);
     // 互斥分摊：三档模式统一走 cache_force::resolve（Off/Auto/Force）
     let resolved = super::cache_force::resolve(
         &cache_force_settings,

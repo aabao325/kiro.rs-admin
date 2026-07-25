@@ -1413,7 +1413,14 @@ impl StreamContext {
     /// 解析最终上报口径的完整缓存拆分（含 5m/1h 分桶），三档模式统一走
     /// `cache_force::resolve`。
     pub fn resolved_cache_usage_full(&self) -> super::cache_force::ResolvedCacheUsage {
-        let total_real = self.context_input_tokens.unwrap_or(self.input_tokens);
+        // total 真值固定用客户端估算的 input_tokens（不含内置提示词），不用
+        // contextUsageEvent 反推的「百分比 × 上下文窗口」总量：那个值会把 Kiro
+        // 上游自身的隐藏 agent 上下文、以及本项目注入的 SYSTEM_CHUNKED_POLICY /
+        // 工具描述后缀一并计入；窗口越大（1M 模型）百分比的量化误差放大得越
+        // 离谱——实测过一个几乎不含内容的请求被放大成 6000+ token。
+        // cache_metering 的 prompt_total_est / cache_covered_est 本来就用同一套
+        // 本地估算口径，对齐后比例分摊也自洽，不会因为两套口径混用而错位。
+        let total_real = self.input_tokens;
         super::cache_force::resolve(
             &self.cache_force_settings,
             &self.cache_usage,
@@ -1424,8 +1431,8 @@ impl StreamContext {
 
     /// 解析最终上报口径的 `(input_tokens, cache_creation, cache_read)`。
     ///
-    /// total 真值优先取 contextUsage（上游真实百分比×窗口），否则用客户端估算的
-    /// `input_tokens`；再由三档模式统一分摊（见 [`Self::resolved_cache_usage_full`]）。
+    /// total 真值固定用客户端估算的 `input_tokens`（见
+    /// [`Self::resolved_cache_usage_full`] 的取舍说明），再由三档模式统一分摊。
     pub fn resolved_usage(&self) -> (i32, i32, i32) {
         let r = self.resolved_cache_usage_full();
         (

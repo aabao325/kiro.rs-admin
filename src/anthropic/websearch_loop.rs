@@ -26,7 +26,7 @@ use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::provider::KiroProvider;
 use crate::token;
 
-use super::converter::{ConversionError, convert_request_with_mode, get_context_window_size};
+use super::converter::{ConversionError, convert_request_with_mode};
 use crate::model::config::ToolCompatibilityMode;
 use super::handlers::{UsageRecordHook, map_provider_error};
 use super::stream::{CompletedToolUse, SseEvent};
@@ -59,8 +59,6 @@ struct RoundOutcome {
     thinking: String,
     /// The complete tool_use for this round (name already restored via tool_name_map)
     tool_uses: Vec<CompletedToolUse>,
-    /// Actual input tokens computed from contextUsageEvent
-    context_input_tokens: Option<i32>,
     /// Cumulative credits from meteringEvent
     credits: f64,
     /// stop_reason override (max_tokens / model_context_window_exceeded)
@@ -137,7 +135,6 @@ fn empty_tool_result_disposition(
 /// Buffer-decode one round of the upstream streaming response
 async fn decode_round(
     response: reqwest::Response,
-    model: &str,
     tool_name_map: &std::collections::HashMap<String, String>,
 ) -> RoundOutcome {
     let mut body_stream = response.bytes_stream();
@@ -150,7 +147,6 @@ async fn decode_round(
         std::collections::HashMap::new();
     let mut order: Vec<String> = Vec::new();
     let mut tool_uses: Vec<CompletedToolUse> = Vec::new();
-    let mut context_input_tokens: Option<i32> = None;
     let mut credits = 0.0;
     let mut stop_reason_override: Option<String> = None;
     let mut stream_error = false;
@@ -197,9 +193,9 @@ async fn decode_round(
                     entry.1.push_str(&tu.input);
                 }
                 Event::ContextUsage(cu) => {
-                    let window = get_context_window_size(model);
-                    let actual = (cu.context_usage_percentage * (window as f64) / 100.0) as i32;
-                    context_input_tokens = Some(actual);
+                    // 仅用于检测上下文窗口占满；不再据此计算 input_tokens 上报值——
+                    // 「百分比 × 窗口」在大窗口模型上会把 Kiro 隐藏的 agent 上下文和
+                    // 本项目注入的系统策略一并放大计入，量级能差出几十上百倍。
                     if cu.context_usage_percentage >= 100.0 {
                         stop_reason_override = Some("model_context_window_exceeded".to_string());
                     }
@@ -238,7 +234,6 @@ async fn decode_round(
         text,
         thinking,
         tool_uses,
-        context_input_tokens,
         credits,
         stop_reason_override,
         stream_error,
@@ -306,7 +301,7 @@ async fn run_round(
     };
     let credential_id = call_result.credential_id;
     let mut outcome =
-        decode_round(call_result.response, &payload.model, &conversion.tool_name_map).await;
+        decode_round(call_result.response, &conversion.tool_name_map).await;
     // Carry the declared tool names (original + shortened) so the flush step can run the
     // shared `<invoke>` text-leak fault tolerance with a correct tool-table guard.
     outcome.known_tool_names = conversion.known_tool_names;
@@ -587,9 +582,23 @@ pub(super) async fn run_web_search_loop(
         payload.tools.clone(),
     ) as i32;
 
+    // Re-estimate from the current (possibly tool-result-extended) payload rather than
+    // trusting contextUsageEvent's percentage×window figure: on huge-window models that
+    // figure bakes in Kiro's own hidden agent context plus this project's injected system
+    // policy, and can overstate a request's real size by orders of magnitude. This keeps
+    // multi-round growth (tool results appended via `append_search_round`) visible while
+    // staying free of that inflation.
+    let current_input_tokens = |p: &MessagesRequest| {
+        token::count_all_tokens(
+            p.model.clone(),
+            p.system.clone(),
+            p.messages.clone(),
+            p.tools.clone(),
+        ) as i32
+    };
+
     let mut presentation: Vec<Value> = Vec::new();
     let mut last_credential_id: u64 = 0;
-    let mut last_context_input: Option<i32> = None;
     let mut total_credits = 0.0;
     let mut all_thinking = String::new();
 
@@ -611,7 +620,6 @@ pub(super) async fn run_web_search_loop(
                     Err(resp) => return resp,
                 };
             last_credential_id = credential_id;
-            last_context_input = round.context_input_tokens.or(last_context_input);
             total_credits += round.credits;
 
             match empty_tool_result_disposition(&payload, &round, empty_retries) {
@@ -626,7 +634,7 @@ pub(super) async fn run_web_search_loop(
                     continue;
                 }
                 EmptyToolResultDisposition::Fail => {
-                    let final_input = last_context_input.unwrap_or(fallback_input_tokens);
+                    let final_input = current_input_tokens(&payload);
                     hook.record(
                         last_credential_id,
                         final_input,
@@ -697,7 +705,7 @@ pub(super) async fn run_web_search_loop(
         // web_search must end as "end_turn", not "tool_use" (otherwise the host would
         // wait for a client tool call that is never emitted).
         let (_web_uses, client_uses) = partition_tool_uses(&round.tool_uses);
-        let final_input = last_context_input.unwrap_or(fallback_input_tokens);
+        let final_input = current_input_tokens(&payload);
         // INVARIANT: web_search is ALWAYS executed internally and is NEVER flushed
         // as a raw tool_use (the Codex host has no executor for it and rejects it
         // with "unsupported call: web_search"). This covers the mixed-round case
@@ -991,7 +999,6 @@ mod tests {
             text: text.to_string(),
             thinking: String::new(),
             tool_uses,
-            context_input_tokens: None,
             credits: 0.0,
             stop_reason_override: None,
             stream_error: false,
