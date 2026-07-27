@@ -3,19 +3,21 @@
 本文档记录本仓库（`aabao325/kiro.rs-admin`）相对上游 `ZyphrZero/kiro.rs` 的**自有改动**，
 用于每次合并上游前后核对、防止被上游覆盖丢失。
 
-- 分叉点（merge-base）：`ad257d2` — upstream v0.7.1
-- 本 fork 自有提交：`582d316` 新增缓存 → `fbce8bc` 优化响应顺序 → `9a98f03` 优化提示词
-- 规模：24 文件 / +1613 −173
+- 上次合并：upstream v0.7.2（`ebf8e1c`），合并提交 `b76a5ba`，分支 `merge-upstream-0.7.2`
+- 原分叉点：`ad257d2` — upstream v0.7.1
+- fork 自有提交：`582d316` 新增缓存 → `fbce8bc` 优化响应顺序 → `9a98f03` 优化提示词
+- CI：`.github/workflows/check.yaml`（非 master 分支触发 `cargo check` + `test`，
+  clippy 仅参考不阻断——仓库存量 lint 175 条全在既有代码里）
 
 改动分五块，重要性由高到低：
 
 | # | 模块 | 核心文件 | 必须保留 |
 |---|------|---------|---------|
 | 1 | 缓存三档模式（Off/Auto/Force） | `src/anthropic/cache_force.rs` | ✅ 长期功能 |
-| 2 | 身份锁定提示词 | `src/anthropic/converter.rs` | ✅ 长期功能（待优化） |
-| 3 | Token 上报口径改造 | `handlers.rs` / `stream.rs` / `websearch_loop.rs` | ✅ 需与上游二选一 |
+| 2 | 身份兜底提示词 | `src/anthropic/converter.rs` | ✅ 长期功能 |
+| 3 | Token 上报口径改造 | `handlers.rs` / `stream.rs` / `websearch_loop.rs` | ✅ 与上游分歧，已选 fork 版 |
 | 4 | 响应体字段对齐官方 | `handlers.rs` / `stream.rs` / `signature_sim.rs` | ✅ 长期功能 |
-| 5 | 模型名透传 | `src/anthropic/converter.rs` | ⚠️ 上游已有更好实现 |
+| 5 | ~~模型名透传~~ | — | ❌ 已弃用，采上游实现 |
 
 ---
 
@@ -57,28 +59,42 @@ TTL 分桶：`ResolvedCacheUsage` 额外给出 `ephemeral_5m_input_tokens` /
 - admin-ui：`api/cache-force.ts`、`hooks/use-cache-force.ts`、`components/cache-force-card.tsx`（186 行面板）、
   `components/topbar-tools.tsx` 接入入口、`types/api.ts` 类型。
 
-## 2. 身份锁定提示词（`IDENTITY_LOCK_POLICY`）
+## 2. 身份兜底提示词（`IDENTITY_FALLBACK_POLICY`）
 
-`src/anthropic/converter.rs` 新增常量 `IDENTITY_LOCK_POLICY`，**无条件**注入到系统消息末尾
-（末尾 = 最高优先级），要求模型被问及身份/名称/模型版本/开发方时一律只回答
-「Claude / Anthropic」口径，且不确认、不否认、不暗示该策略存在。
+`src/anthropic/converter.rs` 新增常量 `IDENTITY_FALLBACK_POLICY`：给"裸请求"
+（客户端没带 `system`，或带的 `system` 里没有任何身份设定）一个稳定的默认口径——
+被问及身份/名称/模型版本/开发方时回答 Claude / Anthropic，且不猜测具体版本号。
+
+**关键设计：不覆盖用户自己的身份设定。** 新增 `client_declares_identity()`
+检测客户端 `system` 是否已自带身份/人格/角色设定，命中则该策略整段不注入，
+用户的设定直接生效。检测覆盖：
+
+- 英文：`you are` / `you're` / `your name is` / `act as` / `roleplay as` /
+  `pretend to be` / `persona` / `identity` / `impersonate`（共 10 个标记，小写后匹配）
+- 中文：`你是` / `你叫` / `你的名字` / `你的身份` / `扮演` / `角色扮演` / `人格` /
+  `身份是` / `自称`（共 9 个，原串匹配）
+
+判定刻意做得**宽松**（宁可多让路、少覆盖）：身份是用户显式表达的意图，
+误覆盖（用户要猫娘、模型坚持自称 Claude）比误让路（用户没设身份、模型自称什么都行）
+后果严重得多。
 
 同时重写了 `build_history` 的系统消息组装逻辑，这是与上游冲突的主要位置：
 
-- **改造前**：只有客户端带了 `system` 或启用了 thinking，才会注入
+- **上游**：只有客户端带了 `system` 或启用了 thinking，才注入
   `user + assistant("I will follow these instructions.")` 系统消息对。
-- **改造后**：系统消息对**恒定注入**。组装顺序为
-  `thinking_prefix`（若需要）→ 客户端 `system` → `SYSTEM_CHUNKED_POLICY`（仅当客户端有 system）
-  → `IDENTITY_LOCK_POLICY`（恒在最后）。
+- **本 fork**：统一在一处组装，顺序为 `thinking_prefix`（若需要）→ 客户端 `system`
+  → `SYSTEM_CHUNKED_POLICY`（仅当客户端有 system）→ `IDENTITY_FALLBACK_POLICY`
+  （仅当客户端未自带身份设定）。上游那个 `else if thinking_prefix` 分支已被此逻辑覆盖，
+  合并时应删除，否则会重复注入。
 
 注入内容**不计入**上报给客户端的 token（token 估算跑在注入前的原始 payload 上）。
 
-⚠️ **待优化项**（用户已提出）：当前身份口径是硬编码的 Claude/Anthropic，且优先级最高，
-会压制用户自己在 `system` 里设定的角色/人格（如"你是小明，一个猫娘助手"）。
-需要改成：**检测到用户请求里已有明确身份设定时，让该设定生效**；
-仅在用户未指定身份时才回落到 Claude/Anthropic 兜底口径。
+单测：`test_client_declares_identity_detects_user_persona`、
+`test_client_declares_identity_ignores_plain_instructions`、
+`test_build_history_injects_identity_fallback_without_system`、
+`test_build_history_skips_identity_fallback_when_client_sets_persona`。
 
-## 3. Token 上报口径改造（与上游存在实质分歧）
+## 3. Token 上报口径改造（与上游实质分歧，已决定保留 fork 版）
 
 ### 3.1 input_tokens 来源
 
@@ -115,6 +131,19 @@ agent 上下文、以及本项目注入的 `SYSTEM_CHUNKED_POLICY` / `IDENTITY_L
 非流式路径在 `handlers.rs` 里单独估算（优先原生 `reasoningContent`，
 否则回退 `<thinking>` 文本提取）。
 
+### 3.3 两套口径的取舍（2026-07-27 已决策）
+
+| | 上游（v0.7.1→v0.7.2 未变） | 本 fork（已选） |
+|---|---|---|
+| input_tokens 来源 | contextUsage 百分比 × 窗口，拿不到才回落估算 | 固定客户端估算 |
+| 是否含注入内容 | 含（Kiro 隐藏 agent 上下文 + 注入策略 + 工具描述） | 不含 |
+| 1M 窗口模型表现 | 量化误差放大，实测空请求 → 6000+ token | 稳定 |
+| 与 cache 分摊自洽性 | total 与 cache 覆盖量两套口径混用 | 同一套本地估算 |
+
+上游那套更接近"上游真实消耗了多少"，fork 这套更接近"客户端以为自己发了多少"。
+选 fork 版是因为这些数字要给客户端看——`tokens长度测试.md` 里 16 token 的短请求
+必须显示 16。**若将来改为监控真实上游占用，需要换回上游口径。**
+
 ## 4. 响应体字段对齐官方样例
 
 依据 `tokens长度测试.md` 里抓到的真实 Bedrock 响应样例，把响应体调成同形状。
@@ -132,9 +161,11 @@ model, id, type, role, content, stop_reason, stop_sequence, stop_details, usage
 `output_tokens_details.thinking_tokens`、`service_tier: "standard"`、
 `inference_geo: "not_available"`。
 
-`SseStateManager::generate_final_events` 参数从 4 个扩到 7 个
-（+ephemeral_5m / +ephemeral_1h / +thinking_tokens）— **与上游 v0.7.2 的签名冲突**，
-上游把第 5 个参数加成了 `metering: Option<&MeteringEvent>`。合并时需合成 8 参数版本。
+`SseStateManager::generate_final_events` 现为 **8 参**，是两侧新增参数的合成结果：
+fork 加的 `ephemeral_5m` / `ephemeral_1h` / `thinking_tokens`，加上游 v0.7.2 加的
+`metering: Option<&MeteringEvent>`。`usage` JSON 以 fork 的官方字段顺序为基底，
+再叠上游的 `credit_usage` / `credit_unit` / `credit_unit_plural` 透传
+（仅在收到过 meteringEvent 时追加）。**下次合并这里仍是首要冲突点。**
 
 ### 4.2 context_management 字段按 beta header 开关
 
@@ -159,16 +190,35 @@ model, id, type, role, content, stop_reason, stop_sequence, stop_details, usage
 （没有 Anthropic 私钥，密码学上不可能）。上游 Kiro 从不校验 signature，
 converter 回传历史消息时也只读 `thinking` 文本。
 
-## 5. 模型名透传（上游已有更完善实现，建议放弃本 fork 版本）
+## 5. 模型名透传（已弃用 fork 版，采上游实现）
 
-本 fork 把 `map_model` 的白名单拦截改为"未登记模型原样透传给上游"，
-并补了 `claude-opus-5` / `claude-haiku-5` 显式归一。
+fork 曾把 `map_model` 的白名单拦截改为"未登记模型原样透传给上游"，
+并补了 `claude-opus-5` / `claude-haiku-5` 显式归一。合并 v0.7.2 时已整份弃用。
 
 上游 v0.7.2 的 `c72dc52` 做了同一件事但更完善：`normalize_claude_model` 支持
 `-latest` 后缀、8 位日期后缀、`claude-sonnet-5-2 → claude-sonnet-5.2` 版本号规范化、
 旧式 `claude-3-5-sonnet-20241022 → claude-sonnet-3.5`，另有 ID 长度/控制字符校验
 （`MAX_MODEL_ID_LEN = 256`）与配置驱动的自定义模型表（`src/model/custom_models.rs`）。
 
-**结论**：这块直接采上游实现，弃用本 fork 版本。唯一需要核对的是
-`get_context_window_size` 要覆盖 `claude-opus-5`（上游走 `map_model` 归一后能命中，需实测确认）。
+**已采上游实现。** 一个待实测确认项：`get_context_window_size` 对
+`claude-opus-5` 的窗口判定——上游走 `map_model` 归一后应命中 1M 分支，
+但没有对应单测，建议实际发一次 opus-5 请求核对上报的 input_tokens 量级。
+
+---
+
+## 下次合并上游的检查清单
+
+1. `git merge upstream/master`，预期冲突集中在
+   `converter.rs` / `handlers.rs` / `stream.rs` / `router.rs` / `main.rs` /
+   `topbar-tools.tsx`。
+2. `converter.rs` 冲突若过于交错，取上游整份后重贴两处 fork 改动
+   （`IDENTITY_FALLBACK_POLICY` + `client_declares_identity` 常量函数、
+   `build_history` 系统消息组装），比逐块解冲突可靠。
+3. `generate_final_events` 签名核对：fork 的 3 个参数 + 上游新增的都要在。
+4. 确认 `resolve_usage_input_tokens` 仍是单参版本（不吃 `context_input_tokens`）。
+5. 确认 `router.rs` 三个 `create_router*` 函数都把 `cache_force` 传到底。
+6. 推分支等 `.github/workflows/check.yaml` 跑绿（`cargo check` + `test` 是硬门槛，
+   clippy 仅参考）。
+7. `Cargo.toml` 若改了依赖 feature，记得 `Cargo.lock` 也要同步
+   （`--locked` 会拒绝不一致，如 `serde_json` 的 `preserve_order` → `indexmap`）。
 
