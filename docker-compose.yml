@@ -1,11 +1,21 @@
 services:
   kiro-rs:
-    image: ${KIRO_RS_IMAGE:-zyphrzero/kiro-rs:latest}
-    container_name: kiro-rs
+    image: aabao325/kiro-rs-admin:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: kiro-rs-admin
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
-      - "8990:8990"
+      - "38990:8990"
     volumes:
       - ./data/:/app/config/
+    environment:
+      # 空回现场取样：上游偶发「HTTP 200 但零产出」（实测 0.03%，换凭据无效，
+      # 触发条件在请求内容里）。开启后仅在判定为空回/流内错误时把发给上游的
+      # 请求体落到 KIRO_DUMP_EMPTY_DIR，正常请求不写任何东西。
+      # 排查完成后改回 0（或删掉这两行）即可关闭。
+      KIRO_DUMP_EMPTY: "1"
+      KIRO_DUMP_EMPTY_DIR: /app/config/dump
     restart: unless-stopped

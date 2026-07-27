@@ -31,3 +31,8 @@
 .ace-tool/
 .codegraph/
 .claude/
+
+# 空回现场取样（KIRO_DUMP_EMPTY）——含对话内容，不入版本库
+dump/
+# 本地打包产物
+*.rar

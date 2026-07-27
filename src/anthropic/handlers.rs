@@ -177,6 +177,16 @@ impl RequestTracer {
         }
     }
 
+    /// 本次链路 id（与 trace 记录对齐；空回取样的文件名用它）
+    pub fn trace_id(&self) -> &str {
+        &self.trace_id
+    }
+
+    /// 本次请求的模型名
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
     /// 标记首个上游 chunk 到达（幂等，仅记录第一次）
     pub fn mark_first_token(&self) {
         let mut slot = self.first_token_at.lock();
@@ -887,8 +897,20 @@ async fn handle_stream_request(
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
 
+    // 空回取样：只在 KIRO_DUMP_EMPTY 打开时克隆请求体（可能有几十 MB，
+    // 关闭时一个字节都不拷）。流结束判定为失败时落盘，见 empty_dump 模块。
+    let dump_body = super::empty_dump::is_enabled().then(|| request_body.to_string());
+
     // 创建 SSE 流
-    let stream = create_sse_stream(response, ctx, initial_events, hook, credential_id, tracer);
+    let stream = create_sse_stream(
+        response,
+        ctx,
+        initial_events,
+        hook,
+        credential_id,
+        tracer,
+        dump_body,
+    );
 
     // 返回 SSE 响应
     Response::builder()
@@ -916,6 +938,7 @@ fn create_sse_stream(
     hook: UsageRecordHook,
     credential_id: u64,
     tracer: std::sync::Arc<RequestTracer>,
+    dump_body: Option<String>,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     // 先发送初始事件
     let initial_stream = stream::iter(
@@ -923,6 +946,10 @@ fn create_sse_stream(
             .into_iter()
             .map(|e| Ok(Bytes::from(e.to_sse_string()))),
     );
+
+    // 空回取样用的请求体（仅 KIRO_DUMP_EMPTY 开启时为 Some）。全程不变，
+    // 用 Arc 让闭包每轮迭代廉价克隆，不占 unfold 状态元组的位置。
+    let dump_body = dump_body.map(std::sync::Arc::new);
 
     // 然后处理 Kiro 响应流，同时每25秒发送 ping 保活
     let body_stream = response.bytes_stream();
@@ -1016,6 +1043,16 @@ fn create_sse_stream(
                                     "本次流式请求记为失败: {}",
                                     message
                                 );
+                                // 空回现场取样（仅 KIRO_DUMP_EMPTY 开启时有 body）。
+                                // 实测换凭据无效，触发条件在请求内容里，只能靠对比样本定位。
+                                if let Some(body) = &dump_body {
+                                    super::empty_dump::record(
+                                        tracer.trace_id(),
+                                        reason.error_type(),
+                                        tracer.model(),
+                                        body,
+                                    );
+                                }
                                 record_stream_usage(&hook, &ctx, credential_id, "error");
                                 tracer.finalize(
                                     "error",
@@ -1335,6 +1372,16 @@ async fn handle_non_stream_request(
             "非流式请求失败，返回 502: {}",
             detail
         );
+        // 空回取样（见 empty_dump 模块）。非流式这里 request_body 仍在作用域内，
+        // 不需要预先克隆。
+        if super::empty_dump::is_enabled() {
+            super::empty_dump::record(
+                tracer.trace_id(),
+                reason.error_type(),
+                tracer.model(),
+                request_body,
+            );
+        }
         hook.record(credential_id, input_tokens, 0, 0, 0, 0.0, "error");
         tracer.finalize(
             "error",
@@ -1886,8 +1933,12 @@ async fn handle_stream_request_buffered(
     ctx.set_cache_force(cache_force_settings, cache_ttl_secs);
     ctx.set_context_management_enabled(context_management_enabled);
 
+    // 空回取样：仅 KIRO_DUMP_EMPTY 开启时克隆请求体（见 empty_dump 模块）
+    let dump_body = super::empty_dump::is_enabled().then(|| request_body.to_string());
+
     // 创建缓冲 SSE 流
-    let stream = create_buffered_sse_stream(response, ctx, hook, credential_id, tracer);
+    let stream =
+        create_buffered_sse_stream(response, ctx, hook, credential_id, tracer, dump_body);
 
     // 返回 SSE 响应
     Response::builder()
@@ -1912,7 +1963,10 @@ fn create_buffered_sse_stream(
     hook: UsageRecordHook,
     credential_id: u64,
     tracer: std::sync::Arc<RequestTracer>,
+    dump_body: Option<String>,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
+    // 空回取样用的请求体（见实时流路径的说明）
+    let dump_body = dump_body.map(std::sync::Arc::new);
     let body_stream = response.bytes_stream();
 
     stream::unfold(
@@ -2028,6 +2082,14 @@ fn create_buffered_sse_stream(
                                         "本次流式请求记为失败: {}",
                                         message
                                     );
+                                    if let Some(body) = &dump_body {
+                                        super::empty_dump::record(
+                                            tracer.trace_id(),
+                                            reason.error_type(),
+                                            tracer.model(),
+                                            body,
+                                        );
+                                    }
                                     hook.record(credential_id, i, o, cc, cr, credits, "error");
                                     tracer.finalize(
                                         "error",
