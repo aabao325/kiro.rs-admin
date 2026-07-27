@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use serde_json::json;
 use uuid::Uuid;
 
-use crate::kiro::model::events::Event;
+use crate::kiro::model::events::{Event, MeteringEvent};
 
 const TOOL_USE_XML_PREFIX: &str = "<tool_use";
 const TOOL_USE_XML_CLOSE: &str = "</tool_use>";
@@ -1264,6 +1264,7 @@ impl SseStateManager {
         ephemeral_5m_input_tokens: i32,
         ephemeral_1h_input_tokens: i32,
         thinking_tokens: i32,
+        metering: Option<&MeteringEvent>,
     ) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
@@ -1284,6 +1285,29 @@ impl SseStateManager {
         // 发送 message_delta
         if !self.message_delta_sent {
             self.message_delta_sent = true;
+            // 字段顺序对齐官方真实样例（serde_json preserve_order）。
+            let mut usage_json = json!({
+                "input_tokens": input_tokens,
+                "cache_creation_input_tokens": cache_creation_input_tokens,
+                "cache_read_input_tokens": cache_read_input_tokens,
+                "cache_creation": {
+                    "ephemeral_5m_input_tokens": ephemeral_5m_input_tokens,
+                    "ephemeral_1h_input_tokens": ephemeral_1h_input_tokens
+                },
+                "output_tokens": output_tokens,
+                "output_tokens_details": {
+                    "thinking_tokens": thinking_tokens
+                },
+                "service_tier": "standard",
+                "inference_geo": "not_available"
+            });
+            // 透传上游 meteringEvent 的 credit_* 字段，让客户端拿到与 Kiro
+            // 后端口径一致的计费元数据；只在收到过 meteringEvent 时才追加。
+            if let Some(m) = metering {
+                usage_json["credit_usage"] = json!(m.usage);
+                usage_json["credit_unit"] = json!(m.unit);
+                usage_json["credit_unit_plural"] = json!(m.unit_plural);
+            }
             events.push(SseEvent::new(
                 "message_delta",
                 json!({
@@ -1292,21 +1316,7 @@ impl SseStateManager {
                         "stop_reason": self.get_stop_reason(),
                         "stop_sequence": null
                     },
-                    "usage": {
-                        "input_tokens": input_tokens,
-                        "cache_creation_input_tokens": cache_creation_input_tokens,
-                        "cache_read_input_tokens": cache_read_input_tokens,
-                        "cache_creation": {
-                            "ephemeral_5m_input_tokens": ephemeral_5m_input_tokens,
-                            "ephemeral_1h_input_tokens": ephemeral_1h_input_tokens
-                        },
-                        "output_tokens": output_tokens,
-                        "output_tokens_details": {
-                            "thinking_tokens": thinking_tokens
-                        },
-                        "service_tier": "standard",
-                        "inference_geo": "not_available"
-                    }
+                    "usage": usage_json
                 }),
             ));
         }
@@ -1389,8 +1399,12 @@ pub struct StreamContext {
     /// 官方仅在该 beta 开启时才在响应里返回 `context_management` 字段
     /// （不是给 null，而是完全不出现该 key），未开启时不插入。
     pub context_management_enabled: bool,
-    /// meteringEvent 上报的 credit 计费量（上游真实下发）
+    /// meteringEvent 上报的 credit 计费量（上游真实下发，多次事件累加得到本次总量）
     pub credits: f64,
+    /// 最近一次 meteringEvent 完整 payload（含 unit / unit_plural / usage）。
+    /// 透传到 message_delta.usage 的 `credit_usage` / `credit_unit` / `credit_unit_plural`
+    /// 字段，与 kiro-rs /v1/messages 行为对齐；上游只下发一次则取该次。
+    pub metering: Option<MeteringEvent>,
     /// 复读熔断：最近一次作为文本吐出的「尾行」内容（去空白）。
     /// Opus 长上下文退化时会把同一个 stray token（call/count/card）一行一行无限复读，
     /// 我们在文本出口处统计「同一短行连续重复了多少次」。
@@ -1484,6 +1498,7 @@ impl StreamContext {
             cache_ttl_secs: 300,
             context_management_enabled: false,
             credits: 0.0,
+            metering: None,
             repeat_guard_last_line: String::new(),
             repeat_guard_run: 0,
             repeat_guard_tripped: false,
@@ -1594,7 +1609,15 @@ impl StreamContext {
             Event::Metering(metering) => {
                 // 上游 meteringEvent 只下发 credit；token / cache 字段不存在。
                 self.credits += metering.usage;
-                tracing::debug!("metering credits +{:.6}", metering.usage);
+                tracing::debug!(
+                    usage = metering.usage,
+                    unit = %metering.unit,
+                    unit_plural = %metering.unit_plural,
+                    "metering credits +{:.6}", metering.usage
+                );
+                // 保留最近一次完整 payload，用于在 message_delta 里透传 credit_*
+                // 字段；如果上游真的多次下发，则以最后一次为准（与 kiro-rs 一致）。
+                self.metering = Some(metering.clone());
                 Vec::new()
             }
             Event::Error {
@@ -2523,6 +2546,7 @@ impl StreamContext {
             resolved.ephemeral_5m_input_tokens,
             resolved.ephemeral_1h_input_tokens,
             self.thinking_output_tokens,
+            self.metering.as_ref(),
         ));
 
         // 工具调用 JSON 错误：在最终事件之后补一个 Anthropic `error` 事件，明确告知
@@ -4773,5 +4797,106 @@ mod tests {
                 && e.data["content_block"]["type"] == "redacted_thinking"
                 && e.data["content_block"]["data"] == "encrypted-thinking"
         }));
+    }
+
+    // ---- credit_usage 透传 ----
+
+    fn parse_metering(payload: &str) -> MeteringEvent {
+        serde_json::from_str(payload).unwrap()
+    }
+
+    #[test]
+    fn test_generate_final_events_omits_credit_fields_without_metering() {
+        // 没有 meteringEvent 时不应在 usage 里写 credit_* 字段。
+        let mut manager = SseStateManager::new();
+        let events = manager.generate_final_events(10, 5, 0, 0, 0, 0, 0, None);
+        let delta = events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("must have message_delta");
+        let usage = &delta.data["usage"];
+        assert!(usage.get("credit_usage").is_none());
+        assert!(usage.get("credit_unit").is_none());
+        assert!(usage.get("credit_unit_plural").is_none());
+    }
+
+    #[test]
+    fn test_generate_final_events_carries_credit_fields_when_metering_present() {
+        let mut manager = SseStateManager::new();
+        let metering = parse_metering(
+            r#"{"unit":"credit","unitPlural":"credits","usage":0.75}"#,
+        );
+        let events = manager.generate_final_events(10, 5, 0, 0, 0, 0, 0, Some(&metering));
+        let delta = events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("must have message_delta");
+        let usage = &delta.data["usage"];
+        assert_eq!(usage["credit_usage"], json!(0.75));
+        assert_eq!(usage["credit_unit"], json!("credit"));
+        assert_eq!(usage["credit_unit_plural"], json!("credits"));
+        // 既有字段保持原样
+        assert_eq!(usage["input_tokens"], json!(10));
+        assert_eq!(usage["output_tokens"], json!(5));
+    }
+
+    #[test]
+    fn test_stream_context_keeps_latest_metering_in_message_delta() {
+        use crate::kiro::model::events::MeteringEvent;
+
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-4-7",
+            100,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+
+        // 第一次下发（异常：上游几乎只会下发一次）
+        ctx.process_kiro_event(&Event::Metering(MeteringEvent {
+            unit: "credit".into(),
+            unit_plural: "credits".into(),
+            usage: 0.10,
+        }));
+        // 第二次下发（应覆盖）
+        ctx.process_kiro_event(&Event::Metering(MeteringEvent {
+            unit: "credit".into(),
+            unit_plural: "credits".into(),
+            usage: 0.42,
+        }));
+
+        let final_events = ctx.generate_final_events();
+        let delta = final_events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("must have message_delta");
+        let usage = &delta.data["usage"];
+        assert_eq!(usage["credit_usage"], json!(0.42));
+        assert_eq!(usage["credit_unit"], json!("credit"));
+        assert_eq!(usage["credit_unit_plural"], json!("credits"));
+        // 累计 credit 仍然是两次之和
+        assert!((ctx.credits - 0.52).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_stream_context_omits_credit_fields_without_metering() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-4-7",
+            100,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+        let final_events = ctx.generate_final_events();
+        let delta = final_events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("must have message_delta");
+        let usage = &delta.data["usage"];
+        assert!(usage.get("credit_usage").is_none());
+        assert!(usage.get("credit_unit").is_none());
+        assert!(usage.get("credit_unit_plural").is_none());
     }
 }
