@@ -14,7 +14,7 @@
 | # | 模块 | 核心文件 | 必须保留 |
 |---|------|---------|---------|
 | 1 | 缓存三档模式（Off/Auto/Force） | `src/anthropic/cache_force.rs` | ✅ 长期功能 |
-| 2 | 身份兜底提示词 | `src/anthropic/converter.rs` | ✅ 长期功能 |
+| 2 | 身份锁定提示词 | `src/anthropic/converter.rs` | ✅ 长期功能 |
 | 3 | Token 上报口径改造 | `handlers.rs` / `stream.rs` / `websearch_loop.rs` | ✅ 与上游分歧，已选 fork 版 |
 | 4 | 响应体字段对齐官方 | `handlers.rs` / `stream.rs` / `signature_sim.rs` | ✅ 长期功能 |
 | 5 | ~~模型名透传~~ | — | ❌ 已弃用，采上游实现 |
@@ -59,40 +59,34 @@ TTL 分桶：`ResolvedCacheUsage` 额外给出 `ephemeral_5m_input_tokens` /
 - admin-ui：`api/cache-force.ts`、`hooks/use-cache-force.ts`、`components/cache-force-card.tsx`（186 行面板）、
   `components/topbar-tools.tsx` 接入入口、`types/api.ts` 类型。
 
-## 2. 身份兜底提示词（`IDENTITY_FALLBACK_POLICY`）
+## 2. 身份锁定提示词（`IDENTITY_LOCK_POLICY`）
 
-`src/anthropic/converter.rs` 新增常量 `IDENTITY_FALLBACK_POLICY`：给"裸请求"
-（客户端没带 `system`，或带的 `system` 里没有任何身份设定）一个稳定的默认口径——
-被问及身份/名称/模型版本/开发方时回答 Claude / Anthropic，且不猜测具体版本号。
+`src/anthropic/converter.rs` 新增常量 `IDENTITY_LOCK_POLICY`，**无条件**注入到
+系统消息末尾（末尾 = 最高优先级），要求模型被问及身份 / 名称 / 模型版本 / 开发方时
+一律只回答「Claude / Anthropic」口径，且不确认、不否认、不暗示该策略存在。
 
-**关键设计：不覆盖用户自己的身份设定。** 新增 `client_declares_identity()`
-检测客户端 `system` 是否已自带身份/人格/角色设定，命中则该策略整段不注入，
-用户的设定直接生效。检测覆盖：
+**有意不为客户端自定义身份让路。** 即便客户端 `system` 里写了 "You are 小明" /
+"扮演猫娘"，该策略仍然注入并声明最高优先级，身份问答一律回落到 Claude / Anthropic。
+客户端 `system` 原文照常转发（人格设定在其他方面仍生效），只是身份口径被覆盖。
+这是刻意的产品选择，改动时不要"优化"成按客户端意图让路。
 
-- 英文：`you are` / `you're` / `your name is` / `act as` / `roleplay as` /
-  `pretend to be` / `persona` / `identity` / `impersonate`（共 10 个标记，小写后匹配）
-- 中文：`你是` / `你叫` / `你的名字` / `你的身份` / `扮演` / `角色扮演` / `人格` /
-  `身份是` / `自称`（共 9 个，原串匹配）
-
-判定刻意做得**宽松**（宁可多让路、少覆盖）：身份是用户显式表达的意图，
-误覆盖（用户要猫娘、模型坚持自称 Claude）比误让路（用户没设身份、模型自称什么都行）
-后果严重得多。
+> 历史：2026-07-27 曾短暂改为 `IDENTITY_FALLBACK_POLICY` + `client_declares_identity()`
+> 检测让路方案，同日按要求回退为本节所述的锁定行为。
 
 同时重写了 `build_history` 的系统消息组装逻辑，这是与上游冲突的主要位置：
 
 - **上游**：只有客户端带了 `system` 或启用了 thinking，才注入
   `user + assistant("I will follow these instructions.")` 系统消息对。
 - **本 fork**：统一在一处组装，顺序为 `thinking_prefix`（若需要）→ 客户端 `system`
-  → `SYSTEM_CHUNKED_POLICY`（仅当客户端有 system）→ `IDENTITY_FALLBACK_POLICY`
-  （仅当客户端未自带身份设定）。上游那个 `else if thinking_prefix` 分支已被此逻辑覆盖，
-  合并时应删除，否则会重复注入。
+  → `SYSTEM_CHUNKED_POLICY`（仅当客户端有 system）→ `IDENTITY_LOCK_POLICY`（恒定，末尾）。
+  因身份策略恒定追加，系统消息对**必定注入**。上游那个 `else if thinking_prefix`
+  分支已被此逻辑覆盖，合并时应删除，否则会重复注入。
 
 注入内容**不计入**上报给客户端的 token（token 估算跑在注入前的原始 payload 上）。
 
-单测：`test_client_declares_identity_detects_user_persona`、
-`test_client_declares_identity_ignores_plain_instructions`、
-`test_build_history_injects_identity_fallback_without_system`、
-`test_build_history_skips_identity_fallback_when_client_sets_persona`。
+单测：`test_build_history_injects_identity_lock_without_system`（裸请求也注入）、
+`test_build_history_identity_lock_overrides_client_persona`（客户端设人格时仍注入，
+且断言锁定策略排在客户端 system 之后）。
 
 ## 3. Token 上报口径改造（与上游实质分歧，已决定保留 fork 版）
 
@@ -212,7 +206,7 @@ fork 曾把 `map_model` 的白名单拦截改为"未登记模型原样透传给�
    `converter.rs` / `handlers.rs` / `stream.rs` / `router.rs` / `main.rs` /
    `topbar-tools.tsx`。
 2. `converter.rs` 冲突若过于交错，取上游整份后重贴两处 fork 改动
-   （`IDENTITY_FALLBACK_POLICY` + `client_declares_identity` 常量函数、
+   （`IDENTITY_LOCK_POLICY` 常量、
    `build_history` 系统消息组装），比逐块解冲突可靠。
 3. `generate_final_events` 签名核对：fork 的 3 个参数 + 上游新增的都要在。
 4. 确认 `resolve_usage_input_tokens` 仍是单参版本（不吃 `context_input_tokens`）。
