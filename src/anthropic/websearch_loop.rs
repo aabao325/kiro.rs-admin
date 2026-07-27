@@ -209,10 +209,14 @@ async fn decode_round(
                     credits += m.usage;
                     last_metering = Some(m.clone());
                 }
-                Event::Exception { exception_type, .. } => {
+                Event::Exception { exception_type, message } => {
+                    tracing::warn!("收到异常事件: {} - {}", exception_type, message);
                     if exception_type == "ContentLengthExceededException" {
                         stop_reason_override = Some("max_tokens".to_string());
                     }
+                }
+                Event::Error { error_code, error_message } => {
+                    tracing::error!("收到错误事件: {} - {}", error_code, error_message);
                 }
                 _ => {}
             }

@@ -1419,6 +1419,20 @@ pub struct StreamContext {
     /// 工具调用 JSON 错误（非法 / 半截）。一旦置位，收尾时补发 `error` 事件，
     /// 上层据此把本次请求记为 error 而非 success。
     tool_json_error: Option<ToolJsonAccumulatorError>,
+    /// 上游在流内下发的错误 / 异常帧（`(kind, message)`）。
+    ///
+    /// AWS Event Stream 的机制决定了：HTTP 响应头一旦发出，状态码就锁定了，
+    /// 此后上游要报错只能把错误塞成帧（`:message-type` = `error` / `exception`）。
+    /// 实测见过上游对同一次「模型暂时不可用」用两种方式表达——先发头再放弃时
+    /// 就是 200 + 一个只装着 `MODEL_TEMPORARILY_UNAVAILABLE` 的 exception 帧。
+    ///
+    /// 这类帧过去只打日志、不改状态，导致「上游明确报错」在 trace 里长得和真正
+    /// 的成功一模一样，客户端则收到一个结构完整但没有内容的空消息。一旦置位，
+    /// 收尾时把本次请求记为 error 并把帧原文带进 trace。
+    ///
+    /// 注意 `ContentLengthExceededException` **不**计入：它是「输出被 max_tokens
+    /// 截断」的正常语义，已由 `stop_reason = max_tokens` 表达。
+    upstream_error: Option<(String, String)>,
     /// 跨 chunk 过滤混入 assistant 文本的字面 `<tool_use>` XML 泄漏。
     tool_use_xml_filter: ToolUseXmlLeakFilter,
 }
@@ -1460,6 +1474,33 @@ impl StreamContext {
     /// 或在非流式路径返回 502。无错误时返回 `None`。
     pub fn tool_json_error_message(&self) -> Option<String> {
         self.tool_json_error.as_ref().map(|err| err.message())
+    }
+
+    /// 记录上游流内错误 / 异常帧。只保留**第一条**——上游可能在放弃时连发多帧，
+    /// 首条最接近根因，后续往往是它的衍生描述。
+    fn record_upstream_error(&mut self, kind: &str, message: &str) {
+        if self.upstream_error.is_none() {
+            self.upstream_error = Some((kind.to_string(), message.trim().to_string()));
+        }
+    }
+
+    /// 上游流内错误的 `(kind, message)`。上层据此把本次请求记为 error 而非
+    /// success，并把原文写进 trace 的 `error_message`。
+    pub fn upstream_error(&self) -> Option<(&str, &str)> {
+        self.upstream_error
+            .as_ref()
+            .map(|(k, m)| (k.as_str(), m.as_str()))
+    }
+
+    /// 给 trace / 日志用的单行摘要（`kind: message`；message 为空时只给 kind）。
+    pub fn upstream_error_message(&self) -> Option<String> {
+        self.upstream_error.as_ref().map(|(kind, msg)| {
+            if msg.is_empty() {
+                kind.clone()
+            } else {
+                format!("{}: {}", kind, msg)
+            }
+        })
     }
 
     /// 创建 StreamContext
@@ -1504,6 +1545,7 @@ impl StreamContext {
             repeat_guard_tripped: false,
             tool_json_accumulator: ToolJsonAccumulator::new(),
             tool_json_error: None,
+            upstream_error: None,
             tool_use_xml_filter: ToolUseXmlLeakFilter::default(),
         }
     }
@@ -1625,20 +1667,29 @@ impl StreamContext {
                 error_message,
             } => {
                 tracing::error!("收到错误事件: {} - {}", error_code, error_message);
+                self.record_upstream_error(error_code, error_message);
                 Vec::new()
             }
             Event::Exception {
                 exception_type,
                 message,
             } => {
-                // 处理 ContentLengthExceededException
+                tracing::warn!("收到异常事件: {} - {}", exception_type, message);
+                // ContentLengthExceededException 是「输出被 max_tokens 截断」的
+                // 正常语义，用 stop_reason 表达即可，不算上游错误。
                 if exception_type == "ContentLengthExceededException" {
                     self.state_manager.set_stop_reason("max_tokens");
+                } else {
+                    self.record_upstream_error(exception_type, message);
                 }
-                tracing::warn!("收到异常事件: {} - {}", exception_type, message);
                 Vec::new()
             }
-            _ => Vec::new(),
+            // Unknown 帧过去连日志都没有，是全链路唯一的完全静默点：上游一旦
+            // 引入新事件类型，表现就是「流跑完了但什么都没发生」，无从排查。
+            Event::Unknown {} => {
+                tracing::warn!("收到未识别的上游事件类型（已忽略）");
+                Vec::new()
+            }
         }
     }
 
@@ -2707,6 +2758,11 @@ impl BufferedStreamContext {
     /// 工具调用 JSON 错误信息（转发内部 StreamContext）。缓冲流据此记 error。
     pub fn tool_json_error_message(&self) -> Option<String> {
         self.inner.tool_json_error_message()
+    }
+
+    /// 上游流内错误摘要（见 [`StreamContext::upstream_error_message`]）。
+    pub fn upstream_error_message(&self) -> Option<String> {
+        self.inner.upstream_error_message()
     }
 }
 
@@ -4898,5 +4954,107 @@ mod tests {
         assert!(usage.get("credit_usage").is_none());
         assert!(usage.get("credit_unit").is_none());
         assert!(usage.get("credit_unit_plural").is_none());
+    }
+
+    // ---- 上游流内错误帧（HTTP 200 + exception/error 帧）----
+
+    fn ctx_for_upstream_error() -> StreamContext {
+        StreamContext::new_with_thinking(
+            "claude-opus-5",
+            100,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        )
+    }
+
+    /// 实测案例：上游先回 200 和响应头，之后才判定模型不可用，只能把错误塞成
+    /// exception 帧。过去这类请求被记成 success，客户端收到空消息。
+    #[test]
+    fn test_upstream_exception_frame_is_recorded_as_error() {
+        let mut ctx = ctx_for_upstream_error();
+        let _ = ctx.generate_initial_events();
+        ctx.process_kiro_event(&Event::Exception {
+            exception_type: "ModelTemporarilyUnavailableException".to_string(),
+            message: "{\"message\":\"Encountered unexpectedly high load when processing the \
+                      request, please try again.\",\"reason\":\"MODEL_TEMPORARILY_UNAVAILABLE\"}"
+                .to_string(),
+        });
+
+        let (kind, msg) = ctx.upstream_error().expect("异常帧必须被记录");
+        assert_eq!(kind, "ModelTemporarilyUnavailableException");
+        assert!(msg.contains("MODEL_TEMPORARILY_UNAVAILABLE"));
+        let summary = ctx.upstream_error_message().unwrap();
+        assert!(summary.starts_with("ModelTemporarilyUnavailableException: "));
+        // 没有任何内容产出——正是过去被误判成成功的形态
+        assert_eq!(ctx.output_tokens, 0);
+    }
+
+    #[test]
+    fn test_upstream_error_frame_is_recorded_as_error() {
+        let mut ctx = ctx_for_upstream_error();
+        let _ = ctx.generate_initial_events();
+        ctx.process_kiro_event(&Event::Error {
+            error_code: "InternalServerError".to_string(),
+            error_message: "  backend exploded  ".to_string(),
+        });
+
+        let (kind, msg) = ctx.upstream_error().expect("错误帧必须被记录");
+        assert_eq!(kind, "InternalServerError");
+        assert_eq!(msg, "backend exploded", "message 应 trim");
+    }
+
+    /// ContentLengthExceededException 是「输出被 max_tokens 截断」的正常语义，
+    /// 不该被当成上游错误——否则正常的长输出会被记成失败。
+    #[test]
+    fn test_content_length_exceeded_is_not_upstream_error() {
+        let mut ctx = ctx_for_upstream_error();
+        let _ = ctx.generate_initial_events();
+        ctx.process_kiro_event(&Event::Exception {
+            exception_type: "ContentLengthExceededException".to_string(),
+            message: String::new(),
+        });
+
+        assert!(ctx.upstream_error().is_none());
+        assert!(ctx.upstream_error_message().is_none());
+        let final_events = ctx.generate_final_events();
+        let delta = final_events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("must have message_delta");
+        assert_eq!(delta.data["delta"]["stop_reason"], json!("max_tokens"));
+    }
+
+    /// 上游放弃时可能连发多帧，只留首条（最接近根因）。
+    #[test]
+    fn test_upstream_error_keeps_first_frame_only() {
+        let mut ctx = ctx_for_upstream_error();
+        let _ = ctx.generate_initial_events();
+        ctx.process_kiro_event(&Event::Exception {
+            exception_type: "FirstException".to_string(),
+            message: "root cause".to_string(),
+        });
+        ctx.process_kiro_event(&Event::Error {
+            error_code: "SecondError".to_string(),
+            error_message: "derived noise".to_string(),
+        });
+
+        let (kind, msg) = ctx.upstream_error().unwrap();
+        assert_eq!(kind, "FirstException");
+        assert_eq!(msg, "root cause");
+    }
+
+    /// 正常成功的流不该被误判——没有错误帧时取值器必须为 None。
+    #[test]
+    fn test_normal_stream_has_no_upstream_error() {
+        let mut ctx = ctx_for_upstream_error();
+        let _ = ctx.generate_initial_events();
+        // AssistantResponseEvent 有私有的 flatten 字段，跨模块只能从 JSON 反序列化
+        let resp: crate::kiro::model::events::AssistantResponseEvent =
+            serde_json::from_str(r#"{"content":"hello"}"#).unwrap();
+        ctx.process_kiro_event(&Event::AssistantResponse(resp));
+
+        assert!(ctx.upstream_error().is_none());
+        assert!(ctx.output_tokens > 0);
     }
 }

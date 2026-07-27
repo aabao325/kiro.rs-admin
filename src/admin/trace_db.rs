@@ -141,6 +141,11 @@ pub mod outcome {
     pub const UNKNOWN: &str = "unknown";
     /// 仅用作 record.error_type：流式响应已开始但上游中途断开
     pub const STREAM_INTERRUPTED: &str = "stream_interrupted";
+    /// 仅用作 record.error_type：上游回了 HTTP 200，但在流内下发 error /
+    /// exception 帧（AWS Event Stream 在响应头发出后只能这样报错）。
+    /// 典型是 `MODEL_TEMPORARILY_UNAVAILABLE`——过去这类请求会被记成 success，
+    /// 客户端收到一个结构完整但没有内容的空消息。
+    pub const UPSTREAM_STREAM_ERROR: &str = "upstream_stream_error";
 }
 
 /// 把上游错误体截断到安全长度（按字符边界，避免切碎 UTF-8）

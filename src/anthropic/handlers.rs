@@ -1004,6 +1004,23 @@ fn create_sse_stream(
                                     None,
                                     stream_trace_usage(&ctx),
                                 );
+                            } else if let Some(message) = ctx.upstream_error_message() {
+                                // 上游在 200 流里下发了 error / exception 帧（模型暂时不可用等）。
+                                // 实时流已回 200 且初始事件早已发出，改不了状态码，但至少要
+                                // 把它记成 error 并把帧原文带进 trace，不再伪装成成功。
+                                tracing::warn!(
+                                    credential_id,
+                                    "上游流内错误，本次请求记为失败: {}",
+                                    message
+                                );
+                                record_stream_usage(&hook, &ctx, credential_id, "error");
+                                tracer.finalize(
+                                    "error",
+                                    Some(outcome::UPSTREAM_STREAM_ERROR),
+                                    Some(&message),
+                                    None,
+                                    stream_trace_usage(&ctx),
+                                );
                             } else {
                                 record_stream_usage(&hook, &ctx, credential_id, "success");
                                 tracer.finalize(
@@ -1161,6 +1178,10 @@ async fn handle_non_stream_request(
     // 半截 / 非法 JSON 显式暴露为错误（返回 502），不再静默回退 {} 或丢弃。
     let mut tool_accumulator = super::stream::ToolJsonAccumulator::new();
     let mut tool_json_error: Option<super::stream::ToolJsonAccumulatorError> = None;
+    // 上游在流内下发的 error / exception 帧 `(kind, message)`，只留第一条。
+    // 非流式路径尚未向客户端发送任何字节，因此可以直接回 502 真错误，
+    // 而不像流式路径那样只能事后记账。
+    let mut upstream_error: Option<(String, String)> = None;
 
     for result in decoder.decode_iter() {
         match result {
@@ -1222,12 +1243,28 @@ async fn handle_non_stream_request(
                             );
                             metering = Some(event_metering);
                         }
-                        Event::Exception { exception_type, .. } => {
+                        Event::Exception { exception_type, message } => {
+                            tracing::warn!("收到异常事件: {} - {}", exception_type, message);
+                            // ContentLengthExceededException 是「输出被 max_tokens
+                            // 截断」的正常语义，不算上游错误。
                             if exception_type == "ContentLengthExceededException" {
                                 stop_reason = "max_tokens".to_string();
+                            } else if upstream_error.is_none() {
+                                upstream_error =
+                                    Some((exception_type, message.trim().to_string()));
                             }
                         }
-                        _ => {}
+                        Event::Error { error_code, error_message } => {
+                            tracing::error!("收到错误事件: {} - {}", error_code, error_message);
+                            if upstream_error.is_none() {
+                                upstream_error =
+                                    Some((error_code, error_message.trim().to_string()));
+                            }
+                        }
+                        // 过去连日志都没有，上游一旦引入新事件类型无从排查。
+                        Event::Unknown {} => {
+                            tracing::warn!("收到未识别的上游事件类型（已忽略）");
+                        }
                     }
                 }
             }
@@ -1261,6 +1298,32 @@ async fn handle_non_stream_request(
         return (
             StatusCode::BAD_GATEWAY,
             Json(ErrorResponse::new("upstream_tool_json_error", message)),
+        )
+            .into_response();
+    }
+
+    // 上游在 200 流里下发了 error / exception 帧（如 MODEL_TEMPORARILY_UNAVAILABLE）。
+    // AWS Event Stream 在响应头发出后只能这样报错，HTTP 状态码骗人。非流式路径
+    // 还没发出任何字节，所以这里能把它还原成一个真正的错误响应——客户端会看到
+    // 报错并可自行重试，而不是收到一个内容为空的「成功」消息。
+    if let Some((kind, message)) = upstream_error {
+        let detail = if message.is_empty() {
+            kind.clone()
+        } else {
+            format!("{}: {}", kind, message)
+        };
+        tracing::warn!(credential_id, "上游流内错误，返回 502: {}", detail);
+        hook.record(credential_id, input_tokens, 0, 0, 0, 0.0, "error");
+        tracer.finalize(
+            "error",
+            Some(outcome::UPSTREAM_STREAM_ERROR),
+            Some(&detail),
+            None,
+            TraceUsage::zero(),
+        );
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(ErrorResponse::new("upstream_stream_error", detail)),
         )
             .into_response();
     }
@@ -1930,6 +1993,21 @@ fn create_buffered_sse_stream(
                                     tracer.finalize(
                                         "error",
                                         Some(outcome::BAD_REQUEST),
+                                        Some(&message),
+                                        None,
+                                        trace_usage,
+                                    );
+                                } else if let Some(message) = ctx.upstream_error_message() {
+                                    // 上游在 200 流里下发 error / exception 帧（见实时流路径的说明）。
+                                    tracing::warn!(
+                                        credential_id,
+                                        "上游流内错误，本次请求记为失败: {}",
+                                        message
+                                    );
+                                    hook.record(credential_id, i, o, cc, cr, credits, "error");
+                                    tracer.finalize(
+                                        "error",
+                                        Some(outcome::UPSTREAM_STREAM_ERROR),
                                         Some(&message),
                                         None,
                                         trace_usage,
