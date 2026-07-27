@@ -115,6 +115,7 @@ fn write_len_delimited(buf: &mut Vec<u8>, field_number: u32, data: &[u8]) {
 }
 
 /// 从 protobuf varint 里读出值和消费的字节数，供测试解析用。
+#[cfg(test)]
 fn read_varint(data: &[u8]) -> Option<(u64, usize)> {
     let mut value: u64 = 0;
     let mut shift = 0u32;
