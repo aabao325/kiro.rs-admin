@@ -1951,7 +1951,7 @@ mod tests {
     fn test_client_declares_identity_detects_user_persona() {
         // 英文身份句式
         assert!(client_declares_identity("You are Ming, a helpful cat girl."));
-        assert!(client_declares_identity("你're a pirate captain"));
+        assert!(client_declares_identity("You're a pirate captain"));
         assert!(client_declares_identity("Act as a senior Go reviewer"));
         assert!(client_declares_identity("Your name is Aria."));
         // 中文身份句式
