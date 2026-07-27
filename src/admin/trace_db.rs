@@ -146,6 +146,10 @@ pub mod outcome {
     /// 典型是 `MODEL_TEMPORARILY_UNAVAILABLE`——过去这类请求会被记成 success，
     /// 客户端收到一个结构完整但没有内容的空消息。
     pub const UPSTREAM_STREAM_ERROR: &str = "upstream_stream_error";
+    /// 仅用作 record.error_type：上游回了 HTTP 200，流也正常结束，但零产出、
+    /// 零计费，且没有任何错误帧可依据。实测发生在换号重试后——上游接了请求、
+    /// 挂了十几秒、什么都不给就关流。
+    pub const UPSTREAM_EMPTY_RESPONSE: &str = "upstream_empty_response";
 }
 
 /// 把上游错误体截断到安全长度（按字符边界，避免切碎 UTF-8）

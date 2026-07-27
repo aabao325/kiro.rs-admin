@@ -1004,19 +1004,22 @@ fn create_sse_stream(
                                     None,
                                     stream_trace_usage(&ctx),
                                 );
-                            } else if let Some(message) = ctx.upstream_error_message() {
-                                // 上游在 200 流里下发了 error / exception 帧（模型暂时不可用等）。
-                                // 实时流已回 200 且初始事件早已发出，改不了状态码，但至少要
-                                // 把它记成 error 并把帧原文带进 trace，不再伪装成成功。
+                            } else if let Some(reason) = ctx.failure_reason() {
+                                // 上游流内错误帧，或「200 但零产出零计费」。实时流已回 200
+                                // 且初始事件早已发出，改不了状态码，但要记成 error 并把原因
+                                // 带进 trace；generate_final_events 已在末尾补发 `error` 事件
+                                // 告知客户端，不再伪装成成功。
+                                let message = reason.message();
                                 tracing::warn!(
                                     credential_id,
-                                    "上游流内错误，本次请求记为失败: {}",
+                                    error_type = reason.error_type(),
+                                    "本次流式请求记为失败: {}",
                                     message
                                 );
                                 record_stream_usage(&hook, &ctx, credential_id, "error");
                                 tracer.finalize(
                                     "error",
-                                    Some(outcome::UPSTREAM_STREAM_ERROR),
+                                    Some(reason.outcome()),
                                     Some(&message),
                                     None,
                                     stream_trace_usage(&ctx),
@@ -1310,24 +1313,39 @@ async fn handle_non_stream_request(
     // AWS Event Stream 在响应头发出后只能这样报错，HTTP 状态码骗人。非流式路径
     // 还没发出任何字节，所以这里能把它还原成一个真正的错误响应——客户端会看到
     // 报错并可自行重试，而不是收到一个内容为空的「成功」消息。
-    if let Some((kind, message)) = upstream_error {
-        let detail = if message.is_empty() {
-            kind.clone()
-        } else {
-            format!("{}: {}", kind, message)
-        };
-        tracing::warn!(credential_id, "上游流内错误，返回 502: {}", detail);
+    //
+    // 同时覆盖「200 但零产出零计费」：上游接了请求、什么都不给就关流，没留下任何
+    // 错误帧。非流式这条路径同样按失败处理，而不是返回一个 content 为空的消息。
+    let failure = upstream_error
+        .map(|(kind, message)| super::stream::StreamFailure::UpstreamFrame { kind, message })
+        .or_else(|| {
+            let produced_nothing = text_content.is_empty()
+                && native_thinking.is_empty()
+                && tool_uses.is_empty()
+                && !has_tool_use
+                && metering.is_none()
+                && credits == 0.0;
+            produced_nothing.then_some(super::stream::StreamFailure::EmptyResponse)
+        });
+    if let Some(reason) = failure {
+        let detail = reason.message();
+        tracing::warn!(
+            credential_id,
+            error_type = reason.error_type(),
+            "非流式请求失败，返回 502: {}",
+            detail
+        );
         hook.record(credential_id, input_tokens, 0, 0, 0, 0.0, "error");
         tracer.finalize(
             "error",
-            Some(outcome::UPSTREAM_STREAM_ERROR),
+            Some(reason.outcome()),
             Some(&detail),
             None,
             TraceUsage::zero(),
         );
         return (
             StatusCode::BAD_GATEWAY,
-            Json(ErrorResponse::new("upstream_stream_error", detail)),
+            Json(ErrorResponse::new(reason.error_type(), detail)),
         )
             .into_response();
     }
@@ -2001,17 +2019,19 @@ fn create_buffered_sse_stream(
                                         None,
                                         trace_usage,
                                     );
-                                } else if let Some(message) = ctx.upstream_error_message() {
-                                    // 上游在 200 流里下发 error / exception 帧（见实时流路径的说明）。
+                                } else if let Some(reason) = ctx.failure_reason() {
+                                    // 上游流内错误帧，或「200 但零产出零计费」（见实时流路径说明）。
+                                    let message = reason.message();
                                     tracing::warn!(
                                         credential_id,
-                                        "上游流内错误，本次请求记为失败: {}",
+                                        error_type = reason.error_type(),
+                                        "本次流式请求记为失败: {}",
                                         message
                                     );
                                     hook.record(credential_id, i, o, cc, cr, credits, "error");
                                     tracer.finalize(
                                         "error",
-                                        Some(outcome::UPSTREAM_STREAM_ERROR),
+                                        Some(reason.outcome()),
                                         Some(&message),
                                         None,
                                         trace_usage,

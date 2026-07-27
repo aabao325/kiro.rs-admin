@@ -9,6 +9,56 @@ use uuid::Uuid;
 
 use crate::kiro::model::events::{Event, MeteringEvent};
 
+/// 一次流式请求的失败原因。
+///
+/// 两种都表现为「HTTP 200 但客户端拿不到内容」，区别只在上游有没有说明理由。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamFailure {
+    /// 上游在流内下发了 error / exception 帧。
+    ///
+    /// 实测 `kind` 往往就是字面量 `error`、`message` 是通用文案
+    /// （`Encountered an unexpected error...`，`reason` 为 null），
+    /// 没有可用于分类的具名异常类型，所以这里只做原文透传，不做语义映射。
+    UpstreamFrame { kind: String, message: String },
+    /// 流正常结束但零产出、零计费——上游回了 200 却什么都没干，
+    /// 且没留下任何错误帧。
+    EmptyResponse,
+}
+
+impl StreamFailure {
+    /// 给客户端 `error` 事件用的错误类型标识。
+    pub fn error_type(&self) -> &'static str {
+        match self {
+            Self::UpstreamFrame { .. } => "upstream_stream_error",
+            Self::EmptyResponse => "upstream_empty_response",
+        }
+    }
+
+    /// 给客户端与 trace 用的说明文本。
+    pub fn message(&self) -> String {
+        match self {
+            Self::UpstreamFrame { kind, message } => {
+                if message.is_empty() {
+                    format!("上游在流内返回错误：{}", kind)
+                } else {
+                    format!("上游在流内返回错误（{}）：{}", kind, message)
+                }
+            }
+            Self::EmptyResponse => "上游返回 HTTP 200 但未产出任何内容（无文本、\
+                 无工具调用、无计费事件），本次请求按失败处理。"
+                .to_string(),
+        }
+    }
+
+    /// trace 的 error_type 分类。
+    pub fn outcome(&self) -> &'static str {
+        match self {
+            Self::UpstreamFrame { .. } => crate::admin::trace_db::outcome::UPSTREAM_STREAM_ERROR,
+            Self::EmptyResponse => crate::admin::trace_db::outcome::UPSTREAM_EMPTY_RESPONSE,
+        }
+    }
+}
+
 const TOOL_USE_XML_PREFIX: &str = "<tool_use";
 const TOOL_USE_XML_CLOSE: &str = "</tool_use>";
 
@@ -1476,6 +1526,33 @@ impl StreamContext {
         self.tool_json_error.as_ref().map(|err| err.message())
     }
 
+    /// 本次流的失败原因（若失败）。两种来源：
+    ///
+    /// 1. 上游在流内下发了 error / exception 帧（有明确原因）。
+    /// 2. 流正常结束但**一个字都没产出**、且上游连 meteringEvent 都没发
+    ///    （无明确原因）。实测上游会在换号重试后回一个 200 却什么都不干，
+    ///    这种情况没有任何错误帧可依据，只能靠「零产出 + 零计费」判定。
+    ///
+    /// 只把「零产出 **且** 零计费」算失败，不能只看 output_tokens：模型合法地
+    /// 只回一个工具调用（无文本）时 output_tokens 也可能是 0，但那种情况上游
+    /// 会照常下发 meteringEvent，且 `has_tool_use` 为真。
+    pub fn failure_reason(&self) -> Option<StreamFailure> {
+        if let Some((kind, message)) = &self.upstream_error {
+            return Some(StreamFailure::UpstreamFrame {
+                kind: kind.clone(),
+                message: message.clone(),
+            });
+        }
+        let produced_nothing = self.output_tokens == 0
+            && self.tool_block_indices.is_empty()
+            && self.metering.is_none()
+            && self.credits == 0.0;
+        if produced_nothing {
+            return Some(StreamFailure::EmptyResponse);
+        }
+        None
+    }
+
     /// 记录上游流内错误 / 异常帧。只保留**第一条**——上游可能在放弃时连发多帧，
     /// 首条最接近根因，后续往往是它的衍生描述。
     fn record_upstream_error(&mut self, kind: &str, message: &str) {
@@ -1492,7 +1569,9 @@ impl StreamContext {
             .map(|(k, m)| (k.as_str(), m.as_str()))
     }
 
-    /// 给 trace / 日志用的单行摘要（`kind: message`；message 为空时只给 kind）。
+    /// 单行摘要（`kind: message`；message 为空时只给 kind）。
+    /// 生产代码走 [`Self::failure_reason`]，这里仅供测试断言原始记录内容。
+    #[cfg(test)]
     pub fn upstream_error_message(&self) -> Option<String> {
         self.upstream_error.as_ref().map(|(kind, msg)| {
             if msg.is_empty() {
@@ -2621,6 +2700,21 @@ impl StreamContext {
                     }
                 }),
             ));
+        } else if let Some(reason) = self.failure_reason() {
+            // 上游流内错误帧，或「流跑完了但一个字都没产出」。两者实时流都已回 200、
+            // 初始事件也早已发出，改不了状态码，只能在末尾补一个协议内的 `error`
+            // 事件——否则客户端收到的是一个结构完整、内容为空的消息，看起来像模型
+            // 什么都没说，而不是「这次失败了」。
+            events.push(SseEvent::new(
+                "error",
+                json!({
+                    "type": "error",
+                    "error": {
+                        "type": reason.error_type(),
+                        "message": reason.message()
+                    }
+                }),
+            ));
         }
 
         events
@@ -2768,9 +2862,9 @@ impl BufferedStreamContext {
         self.inner.tool_json_error_message()
     }
 
-    /// 上游流内错误摘要（见 [`StreamContext::upstream_error_message`]）。
-    pub fn upstream_error_message(&self) -> Option<String> {
-        self.inner.upstream_error_message()
+    /// 本次流的失败原因（见 [`StreamContext::failure_reason`]）。
+    pub fn failure_reason(&self) -> Option<StreamFailure> {
+        self.inner.failure_reason()
     }
 }
 
@@ -5050,6 +5144,65 @@ mod tests {
         let (kind, msg) = ctx.upstream_error().unwrap();
         assert_eq!(kind, "FirstException");
         assert_eq!(msg, "root cause");
+    }
+
+    /// 「200 但零产出零计费」：上游什么都不给就关流，没留下任何错误帧。
+    /// 这是实测那条 12 秒空回的形态，只能靠这个兜住。
+    #[test]
+    fn test_empty_response_is_a_failure() {
+        let mut ctx = ctx_for_upstream_error();
+        let _ = ctx.generate_initial_events();
+
+        assert_eq!(ctx.failure_reason(), Some(StreamFailure::EmptyResponse));
+        let events = ctx.generate_final_events();
+        let err = events
+            .iter()
+            .find(|e| e.event == "error")
+            .expect("空回必须补发 error 事件");
+        assert_eq!(err.data["error"]["type"], json!("upstream_empty_response"));
+    }
+
+    /// 有 meteringEvent 就说明上游确实干了活——即便文本为空（例如只回工具调用），
+    /// 也不能判成空回失败。
+    #[test]
+    fn test_metering_only_stream_is_not_empty_failure() {
+        let mut ctx = ctx_for_upstream_error();
+        let _ = ctx.generate_initial_events();
+        ctx.process_kiro_event(&Event::Metering(MeteringEvent {
+            unit: "credit".into(),
+            unit_plural: "credits".into(),
+            usage: 0.02,
+        }));
+
+        assert_eq!(ctx.failure_reason(), None);
+        let events = ctx.generate_final_events();
+        assert!(
+            !events.iter().any(|e| e.event == "error"),
+            "有计费的流不该补发 error"
+        );
+    }
+
+    /// 错误帧优先于空回判定，且 error 事件带原文。
+    #[test]
+    fn test_upstream_frame_takes_precedence_over_empty() {
+        let mut ctx = ctx_for_upstream_error();
+        let _ = ctx.generate_initial_events();
+        ctx.process_kiro_event(&Event::Exception {
+            exception_type: "error".to_string(),
+            message: "{\"message\":\"Encountered an unexpected error\"}".to_string(),
+        });
+
+        let reason = ctx.failure_reason().unwrap();
+        assert_eq!(reason.error_type(), "upstream_stream_error");
+        let events = ctx.generate_final_events();
+        let err = events.iter().find(|e| e.event == "error").unwrap();
+        assert!(
+            err.data["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Encountered an unexpected error"),
+            "error 事件必须带上游原文"
+        );
     }
 
     /// 正常成功的流不该被误判——没有错误帧时取值器必须为 None。
