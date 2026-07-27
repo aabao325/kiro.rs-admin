@@ -54,6 +54,23 @@ impl std::fmt::Display for EventType {
     }
 }
 
+/// 未知帧 payload 的日志片段上限（字节）。只为定位新事件类型的形状，
+/// 不需要全文；过长会把日志刷爆。
+const UNKNOWN_PAYLOAD_SNIPPET_MAX: usize = 512;
+
+/// 按字符边界截断 payload，避免切碎 UTF-8。
+fn truncate_snippet(payload: &str) -> String {
+    let trimmed = payload.trim();
+    if trimmed.len() <= UNKNOWN_PAYLOAD_SNIPPET_MAX {
+        return trimmed.to_string();
+    }
+    let mut end = UNKNOWN_PAYLOAD_SNIPPET_MAX;
+    while end > 0 && !trimmed.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…(truncated)", &trimmed[..end])
+}
+
 /// 事件 payload trait
 ///
 /// 所有具体事件类型都需要实现此 trait
@@ -77,8 +94,16 @@ pub enum Event {
     ContextUsage(super::ContextUsageEvent),
     /// 推理内容
     ReasoningContent(super::ReasoningContentEvent),
-    /// 未知事件 (保留原始帧数据)
-    Unknown {},
+    /// 未知事件：保留 `:event-type` 名与 payload 片段。
+    ///
+    /// 这两个字段是排查「流跑完了但什么都没发生」的唯一线索——上游一旦引入新
+    /// 事件类型，没有类型名就只能看到「有个不认识的帧」，无从下手加解析。
+    Unknown {
+        /// 帧头 `:event-type` 的原值
+        event_type: String,
+        /// payload 文本片段（已截断，仅用于日志）
+        payload_snippet: String,
+    },
     /// 服务端错误
     Error {
         /// 错误代码
@@ -134,7 +159,10 @@ impl Event {
                 let payload = super::ReasoningContentEvent::from_frame(&frame)?;
                 Ok(Self::ReasoningContent(payload))
             }
-            EventType::Unknown => Ok(Self::Unknown {}),
+            EventType::Unknown => Ok(Self::Unknown {
+                event_type: event_type_str.to_string(),
+                payload_snippet: truncate_snippet(&frame.payload_as_str()),
+            }),
         }
     }
 
@@ -199,5 +227,46 @@ mod tests {
             "assistantResponseEvent"
         );
         assert_eq!(EventType::ToolUse.as_str(), "toolUseEvent");
+    }
+
+    #[test]
+    fn truncate_snippet_respects_limit_and_trims() {
+        assert_eq!(truncate_snippet("  hi  "), "hi");
+        let long = "x".repeat(UNKNOWN_PAYLOAD_SNIPPET_MAX + 50);
+        let out = truncate_snippet(&long);
+        assert!(out.ends_with("…(truncated)"));
+        assert!(out.len() <= UNKNOWN_PAYLOAD_SNIPPET_MAX + 20);
+    }
+
+    /// 未知帧必须带出 `:event-type` 名与 payload 片段——这是排查上游新增
+    /// 事件类型的唯一线索。
+    #[test]
+    fn unknown_event_carries_type_name_and_payload() {
+        use crate::kiro::parser::header::HeaderValue;
+
+        let mut headers = crate::kiro::parser::header::Headers::new();
+        headers.insert(
+            ":message-type".to_string(),
+            HeaderValue::String("event".to_string()),
+        );
+        headers.insert(
+            ":event-type".to_string(),
+            HeaderValue::String("brandNewEvent".to_string()),
+        );
+        let frame = Frame {
+            headers,
+            payload: br#"{"foo":"bar"}"#.to_vec(),
+        };
+
+        match Event::from_frame(frame).unwrap() {
+            Event::Unknown {
+                event_type,
+                payload_snippet,
+            } => {
+                assert_eq!(event_type, "brandNewEvent");
+                assert_eq!(payload_snippet, r#"{"foo":"bar"}"#);
+            }
+            other => panic!("应解析为 Unknown，实际: {:?}", other),
+        }
     }
 }

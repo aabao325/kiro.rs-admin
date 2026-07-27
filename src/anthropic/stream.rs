@@ -1686,8 +1686,16 @@ impl StreamContext {
             }
             // Unknown 帧过去连日志都没有，是全链路唯一的完全静默点：上游一旦
             // 引入新事件类型，表现就是「流跑完了但什么都没发生」，无从排查。
-            Event::Unknown {} => {
-                tracing::warn!("收到未识别的上游事件类型（已忽略）");
+            // 必须带上类型名与 payload 片段，否则日志只能说「有个不认识的」。
+            Event::Unknown {
+                event_type,
+                payload_snippet,
+            } => {
+                tracing::warn!(
+                    event_type = %event_type,
+                    payload = %payload_snippet,
+                    "收到未识别的上游事件类型（已忽略）"
+                );
                 Vec::new()
             }
         }

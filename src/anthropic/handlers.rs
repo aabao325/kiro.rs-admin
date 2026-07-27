@@ -1262,8 +1262,12 @@ async fn handle_non_stream_request(
                             }
                         }
                         // 过去连日志都没有，上游一旦引入新事件类型无从排查。
-                        Event::Unknown {} => {
-                            tracing::warn!("收到未识别的上游事件类型（已忽略）");
+                        Event::Unknown { event_type, payload_snippet } => {
+                            tracing::warn!(
+                                event_type = %event_type,
+                                payload = %payload_snippet,
+                                "收到未识别的上游事件类型（已忽略）"
+                            );
                         }
                     }
                 }
