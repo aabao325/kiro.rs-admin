@@ -1,19 +1,16 @@
 //! Anthropic API Handler 函数
 
-use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::time::Instant;
 
 use crate::admin::client_keys::SharedClientKeyManager;
+use crate::admin::usage_stats::{SharedAggregator, SharedRecorder, UsageRecord};
 use crate::admin::trace_db::{
     SharedTraceStore, TraceAttempt, TraceKeySource, TraceRecord, TraceSink, outcome,
 };
-use crate::admin::usage_stats::{SharedAggregator, SharedRecorder, UsageRecord};
-use crate::kiro::model::available_models::{TokenLimits, UpstreamModel};
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
-use crate::kiro::token_manager::ModelDiscoveryError;
 use crate::token;
 use anyhow::Error;
 use axum::{
@@ -177,16 +174,6 @@ impl RequestTracer {
         }
     }
 
-    /// 本次链路 id（与 trace 记录对齐；空回取样的文件名用它）
-    pub fn trace_id(&self) -> &str {
-        &self.trace_id
-    }
-
-    /// 本次请求的模型名
-    pub fn model(&self) -> &str {
-        &self.model
-    }
-
     /// 标记首个上游 chunk 到达（幂等，仅记录第一次）
     pub fn mark_first_token(&self) {
         let mut slot = self.first_token_at.lock();
@@ -299,17 +286,11 @@ fn count_image_budget(payload: &super::types::MessagesRequest) -> ImageBudget {
                 if item.get("type").and_then(|v| v.as_str()) != Some("image") {
                     continue;
                 }
-                let Some(src) = item.get("source") else {
-                    continue;
-                };
+                let Some(src) = item.get("source") else { continue };
                 if src.get("type").and_then(|v| v.as_str()) != Some("base64") {
                     continue;
                 }
-                let n = src
-                    .get("data")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.len())
-                    .unwrap_or(0);
+                let n = src.get("data").and_then(|v| v.as_str()).map(|s| s.len()).unwrap_or(0);
                 count += 1;
                 total += n;
                 if n > largest {
@@ -418,179 +399,230 @@ fn resolve_usage_input_tokens(fallback_total_input_tokens: i32) -> i32 {
     fallback_total_input_tokens
 }
 
-fn validate_max_tokens(max_tokens: i32) -> Result<(), ErrorResponse> {
-    if max_tokens <= 0 {
-        Err(ErrorResponse::new(
-            "invalid_request_error",
-            "max_tokens must be greater than 0",
-        ))
-    } else {
-        Ok(())
-    }
-}
-
-fn merge_token_limits(target: &mut Option<TokenLimits>, incoming: Option<TokenLimits>) {
-    let Some(incoming) = incoming else {
-        return;
-    };
-    match target {
-        Some(target) => {
-            target.max_input_tokens = target.max_input_tokens.max(incoming.max_input_tokens);
-            target.max_output_tokens = target.max_output_tokens.max(incoming.max_output_tokens);
-        }
-        None => *target = Some(incoming),
-    }
-}
-
-fn infer_model_owner(model_id: &str) -> &'static str {
-    let id = model_id.to_ascii_lowercase();
-    if id.starts_with("claude-") {
-        "anthropic"
-    } else if id.starts_with("gpt-")
-        || id.starts_with("chatgpt-")
-        || id.starts_with("o1-")
-        || id.starts_with("o3-")
-        || id.starts_with("o4-")
-    {
-        "openai"
-    } else {
-        "kiro"
-    }
-}
-
-fn model_from_upstream(upstream: UpstreamModel) -> Model {
-    let max_tokens = upstream
-        .token_limits
-        .as_ref()
-        .and_then(|limits| limits.max_output_tokens)
-        .and_then(|limit| i32::try_from(limit).ok())
-        .filter(|limit| *limit > 0)
-        .unwrap_or(64_000);
-    Model {
-        display_name: upstream
-            .model_name
-            .clone()
-            .unwrap_or_else(|| upstream.model_id.clone()),
-        owned_by: infer_model_owner(&upstream.model_id).to_string(),
-        id: upstream.model_id,
-        object: "model".to_string(),
-        created: 0,
-        model_type: "chat".to_string(),
-        max_tokens,
-    }
-}
-
-fn aggregate_available_models_with_custom(
-    upstream_models: Vec<UpstreamModel>,
-    custom_models: &[crate::model::config::CustomModel],
-) -> Vec<Model> {
-    let mut merged_upstream: BTreeMap<String, UpstreamModel> = BTreeMap::new();
-    for incoming in upstream_models {
-        match merged_upstream.get_mut(&incoming.model_id) {
-            Some(existing) => {
-                if existing.model_name.is_none() {
-                    existing.model_name = incoming.model_name;
-                }
-                if existing.description.is_none() {
-                    existing.description = incoming.description;
-                }
-                merge_token_limits(&mut existing.token_limits, incoming.token_limits);
-            }
-            None => {
-                merged_upstream.insert(incoming.model_id.clone(), incoming);
-            }
-        }
-    }
-
-    let mut models: BTreeMap<String, Model> = BTreeMap::new();
-    for upstream in merged_upstream.into_values() {
-        let model = model_from_upstream(upstream);
-        models.insert(model.id.clone(), model);
-    }
-
-    // 自定义别名最后写入，同名时其展示元数据优先于动态条目。
-    for custom in custom_models {
-        let model = Model {
-            id: custom.id.clone(),
+fn available_models() -> Vec<Model> {
+    vec![
+        Model {
+            id: "gpt-5.6-sol".to_string(),
             object: "model".to_string(),
-            created: 0,
-            owned_by: custom
-                .owned_by
-                .clone()
-                .unwrap_or_else(|| "custom".to_string()),
-            display_name: custom
-                .display_name
-                .clone()
-                .unwrap_or_else(|| custom.id.clone()),
+            created: 1782000000,
+            owned_by: "openai".to_string(),
+            display_name: "GPT-5.6 Sol".to_string(),
             model_type: "chat".to_string(),
-            max_tokens: custom.max_tokens.unwrap_or(64_000),
-        };
-        models.insert(model.id.clone(), model);
-    }
-
-    models.into_values().collect()
-}
-
-fn aggregate_available_models(upstream_models: Vec<UpstreamModel>) -> Vec<Model> {
-    aggregate_available_models_with_custom(upstream_models, crate::model::custom_models::all())
+            max_tokens: 64000,
+        },
+        Model {
+            id: "gpt-5.6-terra".to_string(),
+            object: "model".to_string(),
+            created: 1782000000,
+            owned_by: "openai".to_string(),
+            display_name: "GPT-5.6 Terra".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "gpt-5.6-luna".to_string(),
+            object: "model".to_string(),
+            created: 1782000000,
+            owned_by: "openai".to_string(),
+            display_name: "GPT-5.6 Luna".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "claude-fable-5".to_string(),
+            object: "model".to_string(),
+            created: 1781481600, // Jun 15, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Fable 5".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "claude-fable-5-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1781481600, // Jun 15, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Fable 5 (Thinking)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "claude-sonnet-5".to_string(),
+            object: "model".to_string(),
+            created: 1781481600, // Jun 15, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Sonnet 5".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "claude-sonnet-5-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1781481600, // Jun 15, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Sonnet 5 (Thinking)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "claude-opus-4-8".to_string(),
+            object: "model".to_string(),
+            created: 1779897600, // May 28, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 4.8".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "claude-opus-4-8-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1779897600, // May 28, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 4.8 (Thinking)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "claude-sonnet-4-8".to_string(),
+            object: "model".to_string(),
+            created: 1779897600, // May 28, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Sonnet 4.8".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "claude-sonnet-4-8-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1779897600, // May 28, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Sonnet 4.8 (Thinking)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "claude-opus-4-7".to_string(),
+            object: "model".to_string(),
+            created: 1776276000, // Apr 16, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 4.7".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "claude-opus-4-7-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1776276000, // Apr 16, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 4.7 (Thinking)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "claude-opus-4-6".to_string(),
+            object: "model".to_string(),
+            created: 1770163200, // Feb 4, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 4.6".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "claude-opus-4-6-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1770163200, // Feb 4, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 4.6 (Thinking)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "claude-sonnet-4-6".to_string(),
+            object: "model".to_string(),
+            created: 1771286400, // Feb 17, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Sonnet 4.6".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "claude-sonnet-4-6-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1771286400, // Feb 17, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Sonnet 4.6 (Thinking)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "claude-opus-4-5-20251101".to_string(),
+            object: "model".to_string(),
+            created: 1763942400, // Nov 24, 2025
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 4.5".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "claude-opus-4-5-20251101-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1763942400, // Nov 24, 2025
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 4.5 (Thinking)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "claude-sonnet-4-5-20250929".to_string(),
+            object: "model".to_string(),
+            created: 1759104000, // Sep 29, 2025
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Sonnet 4.5".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "claude-sonnet-4-5-20250929-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1759104000, // Sep 29, 2025
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Sonnet 4.5 (Thinking)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "claude-haiku-4-5-20251001".to_string(),
+            object: "model".to_string(),
+            created: 1760486400, // Oct 15, 2025
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Haiku 4.5".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "claude-haiku-4-5-20251001-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1760486400, // Oct 15, 2025
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Haiku 4.5 (Thinking)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+    ]
 }
 
 /// GET /v1/models
 ///
 /// 返回可用的模型列表
-pub async fn get_models(
-    State(state): State<AppState>,
-    Extension(key_ctx): Extension<KeyContext>,
-) -> Response {
+pub async fn get_models() -> impl IntoResponse {
     tracing::info!("Received GET /v1/models request");
 
-    let Some(provider) = &state.kiro_provider else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse::new(
-                "service_unavailable",
-                "Kiro API provider not configured",
-            )),
-        )
-            .into_response();
-    };
-
-    let upstream = match provider
-        .token_manager()
-        .discover_models_for_group(key_ctx.group.as_deref())
-        .await
-    {
-        Ok(models) => models,
-        Err(ModelDiscoveryError::NoAvailableCredentials) => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(ErrorResponse::new(
-                    "service_unavailable",
-                    "No available credentials for this API key",
-                )),
-            )
-                .into_response();
-        }
-        Err(error @ ModelDiscoveryError::ColdStartFailed { .. }) => {
-            tracing::warn!("动态模型列表加载失败: {}", error);
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(ErrorResponse::new(
-                    "api_error",
-                    "Unable to load available models from upstream",
-                )),
-            )
-                .into_response();
-        }
-    };
-
-    let models = aggregate_available_models(upstream);
+    let models = available_models();
 
     Json(ModelsResponse {
         object: "list".to_string(),
         data: models,
     })
-    .into_response()
 }
 
 /// POST /v1/messages
@@ -615,9 +647,6 @@ pub async fn post_messages(
         image_largest_b64_kb = %(img_stats.largest_b64_bytes / 1024),
         "Received POST /v1/messages request"
     );
-    if let Err(error) = validate_max_tokens(payload.max_tokens) {
-        return (StatusCode::BAD_REQUEST, Json(error)).into_response();
-    }
     if img_stats.total_b64_bytes > IMAGE_BUDGET_WARN_BYTES {
         tracing::warn!(
             image_count = %img_stats.count,
@@ -666,11 +695,7 @@ pub async fn post_messages(
         )
         .await;
         // WebSearch 路径走 MCP 端点，没有 credential_id 上下文，统一记 0
-        let status = if resp.status().is_success() {
-            "success"
-        } else {
-            "error"
-        };
+        let status = if resp.status().is_success() { "success" } else { "error" };
         hook.record(0, input_tokens, 0, 0, 0, 0.0, status);
         return resp;
     }
@@ -679,36 +704,25 @@ pub async fn post_messages(
     // Mixed-tools (web_search + exec...) case: web_search coexists with other tools and falls onto the normal chat path,
     // where the upstream may return a tool_use with name=web_search. Take the internal agentic loop: search internally and feed the results back.
     if websearch::has_web_search_among_tools(&payload) {
-        tracing::info!(
-            "detected mixed tools containing web_search, entering the web_search agentic loop"
-        );
-        return super::websearch_loop::run_web_search_loop(
-            provider,
-            payload,
-            hook,
-            payload_stream,
-            key_ctx.group.clone(),
-            state.tool_compatibility_mode,
-        )
-        .await;
+        tracing::info!("detected mixed tools containing web_search, entering the web_search agentic loop");
+        return super::websearch_loop::run_web_search_loop(provider, payload, hook, payload_stream, key_ctx.group.clone(), state.tool_compatibility_mode)
+            .await;
     }
 
     // 转换请求
-    let conversion_result = match convert_request_with_mode(&payload, state.tool_compatibility_mode)
-    {
+    let conversion_result = match convert_request_with_mode(&payload, state.tool_compatibility_mode) {
         Ok(result) => result,
         Err(e) => {
             let (error_type, message) = match &e {
-                ConversionError::InvalidModel(reason) => {
-                    ("invalid_request_error", format!("无效模型 ID: {}", reason))
+                ConversionError::UnsupportedModel(model) => {
+                    ("invalid_request_error", format!("模型不支持: {}", model))
                 }
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "消息列表为空".to_string())
                 }
-                ConversionError::UnsupportedToolMapping(reason) => (
-                    "invalid_request_error",
-                    format!("工具映射不支持: {}", reason),
-                ),
+                ConversionError::UnsupportedToolMapping(reason) => {
+                    ("invalid_request_error", format!("工具映射不支持: {}", reason))
+                }
             };
             tracing::warn!("请求转换失败: {}", e);
             hook.record(0, 0, 0, 0, 0, 0.0, "error");
@@ -860,21 +874,12 @@ async fn handle_stream_request(
     group: Option<String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let call_result = match provider
-        .call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref())
-        .await
-    {
+    let call_result = match provider.call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref()).await {
         Ok(resp) => resp,
         Err(e) => {
             hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
             // 重试链路全部失败、未开始返回内容：error_type 取最后一跳分类
-            tracer.finalize(
-                "error",
-                last_attempt_outcome(&tracer),
-                Some(&e.to_string()),
-                None,
-                TraceUsage::zero(),
-            );
+            tracer.finalize("error", last_attempt_outcome(&tracer), Some(&e.to_string()), None, TraceUsage::zero());
             return map_provider_error(e);
         }
     };
@@ -882,13 +887,7 @@ async fn handle_stream_request(
     let credential_id = call_result.credential_id;
 
     // 创建流处理上下文
-    let mut ctx = StreamContext::new_with_thinking(
-        model,
-        input_tokens,
-        thinking_enabled,
-        tool_name_map,
-        known_tool_names,
-    );
+    let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map, known_tool_names);
     ctx.cache_usage = cache_usage;
     ctx.cache_force_settings = cache_force_settings;
     ctx.cache_ttl_secs = cache_ttl_secs;
@@ -897,20 +896,8 @@ async fn handle_stream_request(
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
 
-    // 空回取样：只在 KIRO_DUMP_EMPTY 打开时克隆请求体（可能有几十 MB，
-    // 关闭时一个字节都不拷）。流结束判定为失败时落盘，见 empty_dump 模块。
-    let dump_body = super::empty_dump::is_enabled().then(|| request_body.to_string());
-
     // 创建 SSE 流
-    let stream = create_sse_stream(
-        response,
-        ctx,
-        initial_events,
-        hook,
-        credential_id,
-        tracer,
-        dump_body,
-    );
+    let stream = create_sse_stream(response, ctx, initial_events, hook, credential_id, tracer);
 
     // 返回 SSE 响应
     Response::builder()
@@ -938,7 +925,6 @@ fn create_sse_stream(
     hook: UsageRecordHook,
     credential_id: u64,
     tracer: std::sync::Arc<RequestTracer>,
-    dump_body: Option<String>,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     // 先发送初始事件
     let initial_stream = stream::iter(
@@ -947,19 +933,12 @@ fn create_sse_stream(
             .map(|e| Ok(Bytes::from(e.to_sse_string()))),
     );
 
-    // 空回取样用的请求体（仅 KIRO_DUMP_EMPTY 开启时为 Some）。
-    //
-    // 随 unfold 状态元组传递而非闭包捕获：`async move` 会把捕获的变量整体
-    // move 走，而 unfold 的闭包是 `FnMut`、要被反复调用（每来一个 chunk 一次）。
-    // 包一层 Arc 是为了让它在元组里逐轮流转时只搬指针，不搬几百 KB 的 String。
-    let dump_body = dump_body.map(std::sync::Arc::new);
-
     // 然后处理 Kiro 响应流，同时每25秒发送 ping 保活
     let body_stream = response.bytes_stream();
 
     let processing_stream = stream::unfold(
-        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), hook, credential_id, tracer, 0u64, dump_body),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, hook, credential_id, tracer, mut sent_bytes, dump_body)| async move {
+        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), hook, credential_id, tracer, 0u64),
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, hook, credential_id, tracer, mut sent_bytes)| async move {
             if finished {
                 return None;
             }
@@ -998,7 +977,7 @@ fn create_sse_stream(
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
 
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes, dump_body)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes)))
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
@@ -1017,7 +996,7 @@ fn create_sse_stream(
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, dump_body)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes)))
                         }
                         None => {
                             // 流结束，发送最终事件（generate_final_events 内部会 finish()
@@ -1030,36 +1009,6 @@ fn create_sse_stream(
                                 tracer.finalize(
                                     "error",
                                     Some(outcome::BAD_REQUEST),
-                                    Some(&message),
-                                    None,
-                                    stream_trace_usage(&ctx),
-                                );
-                            } else if let Some(reason) = ctx.failure_reason() {
-                                // 上游流内错误帧，或「200 但零产出零计费」。实时流已回 200
-                                // 且初始事件早已发出，改不了状态码，但要记成 error 并把原因
-                                // 带进 trace；generate_final_events 已在末尾补发 `error` 事件
-                                // 告知客户端，不再伪装成成功。
-                                let message = reason.message();
-                                tracing::warn!(
-                                    credential_id,
-                                    error_type = reason.error_type(),
-                                    "本次流式请求记为失败: {}",
-                                    message
-                                );
-                                // 空回现场取样（仅 KIRO_DUMP_EMPTY 开启时有 body）。
-                                // 实测换凭据无效，触发条件在请求内容里，只能靠对比样本定位。
-                                if let Some(body) = &dump_body {
-                                    super::empty_dump::record(
-                                        tracer.trace_id(),
-                                        reason.error_type(),
-                                        tracer.model(),
-                                        body,
-                                    );
-                                }
-                                record_stream_usage(&hook, &ctx, credential_id, "error");
-                                tracer.finalize(
-                                    "error",
-                                    Some(reason.outcome()),
                                     Some(&message),
                                     None,
                                     stream_trace_usage(&ctx),
@@ -1078,7 +1027,7 @@ fn create_sse_stream(
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, dump_body)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes)))
                         }
                     }
                 }
@@ -1086,7 +1035,7 @@ fn create_sse_stream(
                 _ = ping_interval.tick() => {
                     tracing::trace!("发送 ping 保活事件");
                     let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes, dump_body)))
+                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes)))
                 }
             }
         },
@@ -1124,11 +1073,7 @@ fn stream_trace_usage(ctx: &StreamContext) -> TraceUsage {
         output_tokens: ctx.output_tokens.max(0) as u64,
         cache_creation_tokens: cache_creation.max(0) as u64,
         cache_read_tokens: cache_read.max(0) as u64,
-        credits: if ctx.credits.is_finite() && ctx.credits > 0.0 {
-            ctx.credits
-        } else {
-            0.0
-        },
+        credits: if ctx.credits.is_finite() && ctx.credits > 0.0 { ctx.credits } else { 0.0 },
     }
 }
 
@@ -1152,20 +1097,11 @@ async fn handle_non_stream_request(
     group: Option<String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let call_result = match provider
-        .call_api(request_body, Some(tracer.as_ref()), group.as_deref())
-        .await
-    {
+    let call_result = match provider.call_api(request_body, Some(tracer.as_ref()), group.as_deref()).await {
         Ok(resp) => resp,
         Err(e) => {
             hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
-            tracer.finalize(
-                "error",
-                last_attempt_outcome(&tracer),
-                Some(&e.to_string()),
-                None,
-                TraceUsage::zero(),
-            );
+            tracer.finalize("error", last_attempt_outcome(&tracer), Some(&e.to_string()), None, TraceUsage::zero());
             return map_provider_error(e);
         }
     };
@@ -1212,19 +1148,11 @@ async fn handle_non_stream_request(
     // meteringEvent 上报的 credit 计费量（上游真实下发）；
     // input/cache_* 的互斥分摊在拿到 total 真值后由 cache_usage 完成。
     let mut credits: f64 = 0.0;
-    // 最近一次 meteringEvent 的完整 payload，用于在响应体 usage 中透传
-    // credit_usage / credit_unit / credit_unit_plural 字段，与 /v1/messages
-    // 流式（message_delta）行为一致；如果上游多次下发则取最后一次。
-    let mut metering: Option<crate::kiro::model::events::MeteringEvent> = None;
 
     // 工具调用参数 JSON 累积器：按 tool_use_id 缓冲分片，stop 时整体解析。
     // 半截 / 非法 JSON 显式暴露为错误（返回 502），不再静默回退 {} 或丢弃。
     let mut tool_accumulator = super::stream::ToolJsonAccumulator::new();
     let mut tool_json_error: Option<super::stream::ToolJsonAccumulatorError> = None;
-    // 上游在流内下发的 error / exception 帧 `(kind, message)`，只留第一条。
-    // 非流式路径尚未向客户端发送任何字节，因此可以直接回 502 真错误，
-    // 而不像流式路径那样只能事后记账。
-    let mut upstream_error: Option<(String, String)> = None;
 
     for result in decoder.decode_iter() {
         match result {
@@ -1275,43 +1203,17 @@ async fn handle_non_stream_request(
                                 context_usage.context_usage_percentage
                             );
                         }
-                        Event::Metering(event_metering) => {
+                        Event::Metering(metering) => {
                             // 上游只下发 credit；token / cache 字段不存在
-                            credits += event_metering.usage;
-                            tracing::debug!(
-                                usage = event_metering.usage,
-                                unit = %event_metering.unit,
-                                unit_plural = %event_metering.unit_plural,
-                                "metering credits +{:.6}", event_metering.usage
-                            );
-                            metering = Some(event_metering);
+                            credits += metering.usage;
+                            tracing::debug!("metering credits +{:.6}", metering.usage);
                         }
-                        Event::Exception { exception_type, message } => {
-                            tracing::warn!("收到异常事件: {} - {}", exception_type, message);
-                            // ContentLengthExceededException 是「输出被 max_tokens
-                            // 截断」的正常语义，不算上游错误。
+                        Event::Exception { exception_type, .. } => {
                             if exception_type == "ContentLengthExceededException" {
                                 stop_reason = "max_tokens".to_string();
-                            } else if upstream_error.is_none() {
-                                upstream_error =
-                                    Some((exception_type, message.trim().to_string()));
                             }
                         }
-                        Event::Error { error_code, error_message } => {
-                            tracing::error!("收到错误事件: {} - {}", error_code, error_message);
-                            if upstream_error.is_none() {
-                                upstream_error =
-                                    Some((error_code, error_message.trim().to_string()));
-                            }
-                        }
-                        // 过去连日志都没有，上游一旦引入新事件类型无从排查。
-                        Event::Unknown { event_type, payload_snippet } => {
-                            tracing::warn!(
-                                event_type = %event_type,
-                                payload = %payload_snippet,
-                                "收到未识别的上游事件类型（已忽略）"
-                            );
-                        }
+                        _ => {}
                     }
                 }
             }
@@ -1345,57 +1247,6 @@ async fn handle_non_stream_request(
         return (
             StatusCode::BAD_GATEWAY,
             Json(ErrorResponse::new("upstream_tool_json_error", message)),
-        )
-            .into_response();
-    }
-
-    // 上游在 200 流里下发了 error / exception 帧（如 MODEL_TEMPORARILY_UNAVAILABLE）。
-    // AWS Event Stream 在响应头发出后只能这样报错，HTTP 状态码骗人。非流式路径
-    // 还没发出任何字节，所以这里能把它还原成一个真正的错误响应——客户端会看到
-    // 报错并可自行重试，而不是收到一个内容为空的「成功」消息。
-    //
-    // 同时覆盖「200 但零产出零计费」：上游接了请求、什么都不给就关流，没留下任何
-    // 错误帧。非流式这条路径同样按失败处理，而不是返回一个 content 为空的消息。
-    let failure = upstream_error
-        .map(|(kind, message)| super::stream::StreamFailure::UpstreamFrame { kind, message })
-        .or_else(|| {
-            let produced_nothing = text_content.is_empty()
-                && native_thinking.is_empty()
-                && tool_uses.is_empty()
-                && !has_tool_use
-                && metering.is_none()
-                && credits == 0.0;
-            produced_nothing.then_some(super::stream::StreamFailure::EmptyResponse)
-        });
-    if let Some(reason) = failure {
-        let detail = reason.message();
-        tracing::warn!(
-            credential_id,
-            error_type = reason.error_type(),
-            "非流式请求失败，返回 502: {}",
-            detail
-        );
-        // 空回取样（见 empty_dump 模块）。非流式这里 request_body 仍在作用域内，
-        // 不需要预先克隆。
-        if super::empty_dump::is_enabled() {
-            super::empty_dump::record(
-                tracer.trace_id(),
-                reason.error_type(),
-                tracer.model(),
-                request_body,
-            );
-        }
-        hook.record(credential_id, input_tokens, 0, 0, 0, 0.0, "error");
-        tracer.finalize(
-            "error",
-            Some(reason.outcome()),
-            Some(&detail),
-            None,
-            TraceUsage::zero(),
-        );
-        return (
-            StatusCode::BAD_GATEWAY,
-            Json(ErrorResponse::new(reason.error_type(), detail)),
         )
             .into_response();
     }
@@ -1449,32 +1300,8 @@ async fn handle_non_stream_request(
     let cache_creation_tokens = resolved.cache_creation_input_tokens;
     let cache_read_tokens = resolved.cache_read_input_tokens;
 
-    // usage 字段顺序对齐官方真实样例；serde_json 开启 preserve_order 后
-    // json! 字面量顺序即为序列化顺序。
-    let mut usage_json = json!({
-        "input_tokens": final_input_tokens,
-        "cache_creation_input_tokens": cache_creation_tokens,
-        "cache_read_input_tokens": cache_read_tokens,
-        "cache_creation": {
-            "ephemeral_5m_input_tokens": resolved.ephemeral_5m_input_tokens,
-            "ephemeral_1h_input_tokens": resolved.ephemeral_1h_input_tokens
-        },
-        "output_tokens": output_tokens,
-        "output_tokens_details": {
-            "thinking_tokens": thinking_tokens
-        },
-        "service_tier": "standard",
-        "inference_geo": "not_available"
-    });
-    // 透传上游 meteringEvent 的 credit_* 字段，让客户端拿到与 Kiro
-    // 后端口径一致的计费元数据；只在收到过 meteringEvent 时才追加。
-    if let Some(m) = &metering {
-        usage_json["credit_usage"] = json!(m.usage);
-        usage_json["credit_unit"] = json!(m.unit);
-        usage_json["credit_unit_plural"] = json!(m.unit_plural);
-    }
-
-    // 构建 Anthropic 响应
+    // 构建 Anthropic 响应（字段顺序对齐官方真实样例；serde_json 开启
+    // preserve_order 后 json! 字面量顺序即为序列化顺序）
     let mut response_body = json!({
         "model": model,
         "id": super::signature_sim::generate_message_id(),
@@ -1484,7 +1311,21 @@ async fn handle_non_stream_request(
         "stop_reason": stop_reason,
         "stop_sequence": null,
         "stop_details": null,
-        "usage": usage_json
+        "usage": {
+            "input_tokens": final_input_tokens,
+            "cache_creation_input_tokens": cache_creation_tokens,
+            "cache_read_input_tokens": cache_read_tokens,
+            "cache_creation": {
+                "ephemeral_5m_input_tokens": resolved.ephemeral_5m_input_tokens,
+                "ephemeral_1h_input_tokens": resolved.ephemeral_1h_input_tokens
+            },
+            "output_tokens": output_tokens,
+            "output_tokens_details": {
+                "thinking_tokens": thinking_tokens
+            },
+            "service_tier": "standard",
+            "inference_geo": "not_available"
+        }
     });
     // 官方仅在请求带 anthropic-beta: context-management-2025-06-27 时才返回
     // 该字段（不是给 null，而是完全不出现），未开启该 beta 时不插入。
@@ -1511,11 +1352,7 @@ async fn handle_non_stream_request(
             output_tokens: output_tokens.max(0) as u64,
             cache_creation_tokens: cache_creation_tokens.max(0) as u64,
             cache_read_tokens: cache_read_tokens.max(0) as u64,
-            credits: if credits.is_finite() && credits > 0.0 {
-                credits
-            } else {
-                0.0
-            },
+            credits: if credits.is_finite() && credits > 0.0 { credits } else { 0.0 },
         },
     );
     (StatusCode::OK, Json(response_body)).into_response()
@@ -1666,9 +1503,6 @@ pub async fn post_messages_cc(
         message_count = %payload.messages.len(),
         "Received POST /cc/v1/messages request"
     );
-    if let Err(error) = validate_max_tokens(payload.max_tokens) {
-        return (StatusCode::BAD_REQUEST, Json(error)).into_response();
-    }
     let hook = UsageRecordHook::from_state(&state, key_ctx.key_id, payload.model.clone());
 
     // 检查 KiroProvider 是否可用
@@ -1710,11 +1544,7 @@ pub async fn post_messages_cc(
             key_ctx.group.as_deref(),
         )
         .await;
-        let status = if resp.status().is_success() {
-            "success"
-        } else {
-            "error"
-        };
+        let status = if resp.status().is_success() { "success" } else { "error" };
         hook.record(0, input_tokens, 0, 0, 0, 0.0, status);
         return resp;
     }
@@ -1723,36 +1553,25 @@ pub async fn post_messages_cc(
     // Mixed-tools (web_search + exec...) case: web_search coexists with other tools and falls onto the normal chat path,
     // where the upstream may return a tool_use with name=web_search. Take the internal agentic loop: search internally and feed the results back.
     if websearch::has_web_search_among_tools(&payload) {
-        tracing::info!(
-            "detected mixed tools containing web_search, entering the web_search agentic loop"
-        );
-        return super::websearch_loop::run_web_search_loop(
-            provider,
-            payload,
-            hook,
-            payload_stream,
-            key_ctx.group.clone(),
-            state.tool_compatibility_mode,
-        )
-        .await;
+        tracing::info!("detected mixed tools containing web_search, entering the web_search agentic loop");
+        return super::websearch_loop::run_web_search_loop(provider, payload, hook, payload_stream, key_ctx.group.clone(), state.tool_compatibility_mode)
+            .await;
     }
 
     // 转换请求
-    let conversion_result = match convert_request_with_mode(&payload, state.tool_compatibility_mode)
-    {
+    let conversion_result = match convert_request_with_mode(&payload, state.tool_compatibility_mode) {
         Ok(result) => result,
         Err(e) => {
             let (error_type, message) = match &e {
-                ConversionError::InvalidModel(reason) => {
-                    ("invalid_request_error", format!("无效模型 ID: {}", reason))
+                ConversionError::UnsupportedModel(model) => {
+                    ("invalid_request_error", format!("模型不支持: {}", model))
                 }
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "消息列表为空".to_string())
                 }
-                ConversionError::UnsupportedToolMapping(reason) => (
-                    "invalid_request_error",
-                    format!("工具映射不支持: {}", reason),
-                ),
+                ConversionError::UnsupportedToolMapping(reason) => {
+                    ("invalid_request_error", format!("工具映射不支持: {}", reason))
+                }
             };
             tracing::warn!("请求转换失败: {}", e);
             hook.record(0, 0, 0, 0, 0, 0.0, "error");
@@ -1904,20 +1723,11 @@ async fn handle_stream_request_buffered(
     group: Option<String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let call_result = match provider
-        .call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref())
-        .await
-    {
+    let call_result = match provider.call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref()).await {
         Ok(resp) => resp,
         Err(e) => {
             hook.record(0, fallback_input_tokens, 0, 0, 0, 0.0, "error");
-            tracer.finalize(
-                "error",
-                last_attempt_outcome(&tracer),
-                Some(&e.to_string()),
-                None,
-                TraceUsage::zero(),
-            );
+            tracer.finalize("error", last_attempt_outcome(&tracer), Some(&e.to_string()), None, TraceUsage::zero());
             return map_provider_error(e);
         }
     };
@@ -1936,12 +1746,8 @@ async fn handle_stream_request_buffered(
     ctx.set_cache_force(cache_force_settings, cache_ttl_secs);
     ctx.set_context_management_enabled(context_management_enabled);
 
-    // 空回取样：仅 KIRO_DUMP_EMPTY 开启时克隆请求体（见 empty_dump 模块）
-    let dump_body = super::empty_dump::is_enabled().then(|| request_body.to_string());
-
     // 创建缓冲 SSE 流
-    let stream =
-        create_buffered_sse_stream(response, ctx, hook, credential_id, tracer, dump_body);
+    let stream = create_buffered_sse_stream(response, ctx, hook, credential_id, tracer);
 
     // 返回 SSE 响应
     Response::builder()
@@ -1966,10 +1772,7 @@ fn create_buffered_sse_stream(
     hook: UsageRecordHook,
     credential_id: u64,
     tracer: std::sync::Arc<RequestTracer>,
-    dump_body: Option<String>,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
-    // 空回取样用的请求体（见实时流路径的说明）
-    let dump_body = dump_body.map(std::sync::Arc::new);
     let body_stream = response.bytes_stream();
 
     stream::unfold(
@@ -1983,9 +1786,8 @@ fn create_buffered_sse_stream(
             credential_id,
             tracer,
             0u64,
-            dump_body,
         ),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, hook, credential_id, tracer, mut sent_bytes, dump_body)| async move {
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, hook, credential_id, tracer, mut sent_bytes)| async move {
             if finished {
                 return None;
             }
@@ -2000,7 +1802,7 @@ fn create_buffered_sse_stream(
                     _ = ping_interval.tick() => {
                         tracing::trace!("发送 ping 保活事件（缓冲模式）");
                         let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes, dump_body)));
+                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes)));
                     }
 
                     // 然后处理数据流
@@ -2053,7 +1855,7 @@ fn create_buffered_sse_stream(
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, dump_body)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes)));
                             }
                             None => {
                                 // 流结束，完成处理并返回所有事件（已更正 input_tokens）。
@@ -2077,31 +1879,6 @@ fn create_buffered_sse_stream(
                                         None,
                                         trace_usage,
                                     );
-                                } else if let Some(reason) = ctx.failure_reason() {
-                                    // 上游流内错误帧，或「200 但零产出零计费」（见实时流路径说明）。
-                                    let message = reason.message();
-                                    tracing::warn!(
-                                        credential_id,
-                                        error_type = reason.error_type(),
-                                        "本次流式请求记为失败: {}",
-                                        message
-                                    );
-                                    if let Some(body) = &dump_body {
-                                        super::empty_dump::record(
-                                            tracer.trace_id(),
-                                            reason.error_type(),
-                                            tracer.model(),
-                                            body,
-                                        );
-                                    }
-                                    hook.record(credential_id, i, o, cc, cr, credits, "error");
-                                    tracer.finalize(
-                                        "error",
-                                        Some(reason.outcome()),
-                                        Some(&message),
-                                        None,
-                                        trace_usage,
-                                    );
                                 } else {
                                     hook.record(credential_id, i, o, cc, cr, credits, "success");
                                     tracer.finalize("success", None, None, None, trace_usage);
@@ -2110,7 +1887,7 @@ fn create_buffered_sse_stream(
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, dump_body)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes)));
                             }
                         }
                     }
@@ -2163,13 +1940,17 @@ mod tests {
         let resp = map_provider_error(err.into());
 
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(resp.headers().get(header::RETRY_AFTER).unwrap(), "1800");
+        assert_eq!(
+            resp.headers().get(header::RETRY_AFTER).unwrap(),
+            "1800"
+        );
     }
 
     #[test]
     fn upstream_rate_limit_drops_invalid_retry_after() {
-        let err =
-            crate::kiro::error::UpstreamRateLimitError::new(Some("not-a-retry-delay".to_string()));
+        let err = crate::kiro::error::UpstreamRateLimitError::new(Some(
+            "not-a-retry-delay".to_string(),
+        ));
         let resp = map_provider_error(err.into());
 
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
@@ -2250,29 +2031,21 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_models_do_not_synthesize_claude_thinking_alias() {
-        let models = aggregate_available_models(vec![UpstreamModel {
-            model_id: "claude-opus-5".to_string(),
-            model_name: Some("Claude Opus 5".to_string()),
-            description: None,
-            token_limits: None,
-        }]);
+    fn available_models_include_opus_4_7_variants() {
+        let models = available_models();
         let ids: Vec<&str> = models.iter().map(|model| model.id.as_str()).collect();
 
-        assert!(ids.contains(&"claude-opus-5"));
-        assert!(!ids.contains(&"claude-opus-5-thinking"));
+        assert!(ids.contains(&"claude-opus-4-7"));
+        assert!(ids.contains(&"claude-opus-4-7-thinking"));
     }
 
     #[test]
     fn count_image_budget_handles_empty() {
-        let req: super::super::types::MessagesRequest = serde_json::from_str(
-            r#"{
+        let req: super::super::types::MessagesRequest = serde_json::from_str(r#"{
             "model": "claude-opus-4-7",
             "max_tokens": 100,
             "messages": []
-        }"#,
-        )
-        .unwrap();
+        }"#).unwrap();
         let stats = count_image_budget(&req);
         assert_eq!(stats.count, 0);
         assert_eq!(stats.total_b64_bytes, 0);
@@ -2302,8 +2075,7 @@ mod tests {
 
     #[test]
     fn count_image_budget_skips_url_only_images() {
-        let req: super::super::types::MessagesRequest = serde_json::from_str(
-            r#"{
+        let req: super::super::types::MessagesRequest = serde_json::from_str(r#"{
             "model": "claude-opus-4-7",
             "max_tokens": 100,
             "messages": [{
@@ -2312,76 +2084,19 @@ mod tests {
                     {"type": "image", "source": {"type": "url", "url": "https://example.com/x.png"}}
                 ]
             }]
-        }"#,
-        )
-        .unwrap();
+        }"#).unwrap();
         let stats = count_image_budget(&req);
         assert_eq!(stats.count, 0);
     }
 
     #[test]
-    fn dynamic_models_merge_metadata_and_do_not_use_input_limit_as_output_limit() {
-        let models = aggregate_available_models(vec![
-            UpstreamModel {
-                model_id: "glm-5".to_string(),
-                model_name: None,
-                description: Some("first".to_string()),
-                token_limits: Some(TokenLimits {
-                    max_input_tokens: Some(200_000),
-                    max_output_tokens: None,
-                }),
-            },
-            UpstreamModel {
-                model_id: "glm-5".to_string(),
-                model_name: Some("GLM 5".to_string()),
-                description: None,
-                token_limits: Some(TokenLimits {
-                    max_input_tokens: Some(1_000_000),
-                    max_output_tokens: Some(32_000),
-                }),
-            },
-        ]);
+    fn available_models_include_4_8_variants() {
+        let models = available_models();
+        let ids: Vec<&str> = models.iter().map(|model| model.id.as_str()).collect();
 
-        assert_eq!(models.len(), 1);
-        assert_eq!(models[0].display_name, "GLM 5");
-        assert_eq!(models[0].owned_by, "kiro");
-        assert_eq!(models[0].max_tokens, 32_000);
-    }
-
-    #[test]
-    fn custom_model_metadata_overrides_dynamic_collision() {
-        let custom = crate::model::config::CustomModel {
-            id: "gpt-next".to_string(),
-            backend_id: "gpt-next".to_string(),
-            display_name: Some("Configured GPT".to_string()),
-            context_window: Some(500_000),
-            max_tokens: Some(12_345),
-            supports_reasoning: Some(true),
-            owned_by: Some("configured-owner".to_string()),
-        };
-        let models = aggregate_available_models_with_custom(
-            vec![UpstreamModel {
-                model_id: "gpt-next".to_string(),
-                model_name: Some("Upstream GPT".to_string()),
-                description: None,
-                token_limits: Some(TokenLimits {
-                    max_input_tokens: Some(300_000),
-                    max_output_tokens: Some(64_000),
-                }),
-            }],
-            &[custom],
-        );
-
-        assert_eq!(models.len(), 1);
-        assert_eq!(models[0].display_name, "Configured GPT");
-        assert_eq!(models[0].owned_by, "configured-owner");
-        assert_eq!(models[0].max_tokens, 12_345);
-    }
-
-    #[test]
-    fn max_tokens_must_be_positive() {
-        assert!(validate_max_tokens(1).is_ok());
-        assert!(validate_max_tokens(0).is_err());
-        assert!(validate_max_tokens(-1).is_err());
+        assert!(ids.contains(&"claude-opus-4-8"));
+        assert!(ids.contains(&"claude-opus-4-8-thinking"));
+        assert!(ids.contains(&"claude-sonnet-4-8"));
+        assert!(ids.contains(&"claude-sonnet-4-8-thinking"));
     }
 }

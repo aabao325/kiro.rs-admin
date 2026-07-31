@@ -67,10 +67,6 @@ function outcomeStyle(outcome: string): {
       return { label: '请求错误', variant: 'destructive' }
     case 'stream_interrupted':
       return { label: '流中断', variant: 'warning' }
-    case 'upstream_stream_error':
-      return { label: '流内上游错误', variant: 'destructive' }
-    case 'upstream_empty_response':
-      return { label: '上游空回', variant: 'destructive' }
     default:
       return { label: outcome || '未知', variant: 'secondary' }
   }
@@ -148,8 +144,6 @@ const ERROR_TYPE_OPTIONS = [
   { value: 'network_error', label: '网络错误' },
   { value: 'bad_request', label: '请求错误' },
   { value: 'stream_interrupted', label: '流中断' },
-  { value: 'upstream_stream_error', label: '流内上游错误' },
-  { value: 'upstream_empty_response', label: '上游空回' },
   { value: 'unknown', label: '未知' },
 ]
 

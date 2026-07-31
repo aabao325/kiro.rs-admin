@@ -17,17 +17,21 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
 /// 面板总开关的三档模式。
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum CacheMode {
     /// 完全不注入缓存字段（模拟官方未使用 cache_control 时的响应）。
     Off,
     /// 现状不变：走 `cache_metering.rs` 的哈希链智能模拟。
-    /// 默认档 —— 行为与引入本模块前完全一致。
-    #[default]
     Auto,
     /// 不管请求有没有 cache_control，按下面三个比例强制拆分。
     Force,
+}
+
+impl Default for CacheMode {
+    fn default() -> Self {
+        CacheMode::Auto
+    }
 }
 
 /// 强制覆盖模式的可调设置（管理面板编辑，持久化）。

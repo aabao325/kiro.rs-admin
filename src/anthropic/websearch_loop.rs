@@ -20,7 +20,7 @@ use futures::{StreamExt, stream};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::kiro::model::events::{Event, MeteringEvent};
+use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::provider::KiroProvider;
@@ -59,12 +59,8 @@ struct RoundOutcome {
     thinking: String,
     /// The complete tool_use for this round (name already restored via tool_name_map)
     tool_uses: Vec<CompletedToolUse>,
-    /// Cumulative credits from meteringEvent (sum of usage across rounds)
+    /// Cumulative credits from meteringEvent
     credits: f64,
-    /// 最近一次 meteringEvent 完整 payload（含 unit / unit_plural / usage）。
-    /// 在 run_web_search_loop 出口处透传到响应 usage 字段；如果上游多次下发
-    /// 则取最后一次（与 /v1/messages 非流 / 流式路径一致）。
-    last_metering: Option<MeteringEvent>,
     /// stop_reason override (max_tokens / model_context_window_exceeded)
     stop_reason_override: Option<String>,
     /// True if the upstream stream ended due to a read error, so the decoded
@@ -152,7 +148,6 @@ async fn decode_round(
     let mut order: Vec<String> = Vec::new();
     let mut tool_uses: Vec<CompletedToolUse> = Vec::new();
     let mut credits = 0.0;
-    let mut last_metering: Option<MeteringEvent> = None;
     let mut stop_reason_override: Option<String> = None;
     let mut stream_error = false;
 
@@ -205,18 +200,11 @@ async fn decode_round(
                         stop_reason_override = Some("model_context_window_exceeded".to_string());
                     }
                 }
-                Event::Metering(m) => {
-                    credits += m.usage;
-                    last_metering = Some(m.clone());
-                }
-                Event::Exception { exception_type, message } => {
-                    tracing::warn!("收到异常事件: {} - {}", exception_type, message);
+                Event::Metering(m) => credits += m.usage,
+                Event::Exception { exception_type, .. } => {
                     if exception_type == "ContentLengthExceededException" {
                         stop_reason_override = Some("max_tokens".to_string());
                     }
-                }
-                Event::Error { error_code, error_message } => {
-                    tracing::error!("收到错误事件: {} - {}", error_code, error_message);
                 }
                 _ => {}
             }
@@ -247,7 +235,6 @@ async fn decode_round(
         thinking,
         tool_uses,
         credits,
-        last_metering,
         stop_reason_override,
         stream_error,
         // Populated by the caller (run_round), which holds ConversionResult::known_tool_names.
@@ -272,8 +259,8 @@ async fn run_round(
         Ok(c) => c,
         Err(e) => {
             let (et, msg) = match &e {
-                ConversionError::InvalidModel(reason) => {
-                    ("invalid_request_error", format!("invalid model id: {}", reason))
+                ConversionError::UnsupportedModel(m) => {
+                    ("invalid_request_error", format!("unsupported model: {}", m))
                 }
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "message list is empty".to_string())
@@ -613,7 +600,6 @@ pub(super) async fn run_web_search_loop(
     let mut presentation: Vec<Value> = Vec::new();
     let mut last_credential_id: u64 = 0;
     let mut total_credits = 0.0;
-    let mut latest_metering: Option<MeteringEvent> = None;
     let mut all_thinking = String::new();
 
     for round_idx in 0..=MAX_WEB_SEARCH_ROUNDS {
@@ -635,11 +621,6 @@ pub(super) async fn run_web_search_loop(
                 };
             last_credential_id = credential_id;
             total_credits += round.credits;
-            // 跨 round 保留最近一次 meteringEvent，多 round 时取最后一次
-            // (clone 以避免与 empty_tool_result_disposition 后续对 round 的借用冲突)。
-            if let Some(ref m) = round.last_metering {
-                latest_metering = Some(m.clone());
-            }
 
             match empty_tool_result_disposition(&payload, &round, empty_retries) {
                 EmptyToolResultDisposition::Accept => {}
@@ -788,14 +769,7 @@ pub(super) async fn run_web_search_loop(
         );
 
         return if stream_client {
-            render_sse(
-                &payload.model,
-                content,
-                &stop_reason,
-                final_input,
-                output_tokens,
-                latest_metering.as_ref(),
-            )
+            render_sse(&payload.model, content, &stop_reason, final_input, output_tokens)
         } else {
             render_json(
                 &payload.model,
@@ -804,7 +778,6 @@ pub(super) async fn run_web_search_loop(
                 final_input,
                 output_tokens,
                 &all_thinking,
-                latest_metering.as_ref(),
             )
         };
     }
@@ -832,21 +805,7 @@ pub(crate) fn render_json(
     input_tokens: i32,
     output_tokens: i32,
     thinking: &str,
-    metering: Option<&MeteringEvent>,
 ) -> Response {
-    let mut usage = json!({
-        "input_tokens": input_tokens,
-        "output_tokens": output_tokens,
-        "cache_creation_input_tokens": 0,
-        "cache_read_input_tokens": 0
-    });
-    // 透传上游 meteringEvent 的 credit_* 字段，让客户端拿到与 Kiro 后端口径
-    // 一致的计费元数据；只在收到过 meteringEvent 时才追加。
-    if let Some(m) = metering {
-        usage["credit_usage"] = json!(m.usage);
-        usage["credit_unit"] = json!(m.unit);
-        usage["credit_unit_plural"] = json!(m.unit_plural);
-    }
     let mut body = json!({
         "id": format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
         "type": "message",
@@ -855,7 +814,12 @@ pub(crate) fn render_json(
         "model": model,
         "stop_reason": stop_reason,
         "stop_sequence": null,
-        "usage": usage
+        "usage": {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0
+        }
     });
     if !thinking.is_empty() {
         body["kiro_thinking"] = json!(thinking);
@@ -870,9 +834,8 @@ pub(crate) fn render_sse(
     stop_reason: &str,
     input_tokens: i32,
     output_tokens: i32,
-    metering: Option<&MeteringEvent>,
 ) -> Response {
-    let events = build_sse_events(model, content, stop_reason, input_tokens, output_tokens, metering);
+    let events = build_sse_events(model, content, stop_reason, input_tokens, output_tokens);
     let stream = stream::iter(
         events
             .into_iter()
@@ -894,7 +857,6 @@ fn build_sse_events(
     stop_reason: &str,
     input_tokens: i32,
     output_tokens: i32,
-    metering: Option<&MeteringEvent>,
 ) -> Vec<SseEvent> {
     let mut events = Vec::new();
     let message_id = format!(
@@ -972,17 +934,10 @@ fn build_sse_events(
         }
     }
 
-    let mut message_delta_usage = json!({ "output_tokens": output_tokens });
-    // 透传上游 meteringEvent 的 credit_* 字段（仅在拿到 meteringEvent 时）。
-    if let Some(m) = metering {
-        message_delta_usage["credit_usage"] = json!(m.usage);
-        message_delta_usage["credit_unit"] = json!(m.unit);
-        message_delta_usage["credit_unit_plural"] = json!(m.unit_plural);
-    }
     events.push(SseEvent::new("message_delta", json!({
         "type": "message_delta",
         "delta": {"stop_reason": stop_reason},
-        "usage": message_delta_usage
+        "usage": {"output_tokens": output_tokens}
     })));
     events.push(SseEvent::new("message_stop", json!({"type": "message_stop"})));
 
@@ -1045,7 +1000,6 @@ mod tests {
             thinking: String::new(),
             tool_uses,
             credits: 0.0,
-            last_metering: None,
             stop_reason_override: None,
             stream_error: false,
             known_tool_names: std::collections::HashSet::new(),
@@ -1233,7 +1187,7 @@ mod tests {
             json!({"type": "text", "text": "done"}),
             json!({"type": "tool_use", "id": "toolu_exec", "name": "exec", "input": {"cmd": "ls"}}),
         ];
-        let events = build_sse_events("claude-sonnet-4-8", content, "tool_use", 10, 5, None);
+        let events = build_sse_events("claude-sonnet-4-8", content, "tool_use", 10, 5);
 
         // Must contain message_start / message_delta(stop_reason) / message_stop
         assert_eq!(events.first().unwrap().event, "message_start");
@@ -1736,111 +1690,5 @@ mod tests {
             "distinct inputs must both be kept. content={:?}",
             content
         );
-    }
-
-    // ---- credit_usage 透传：run_web_search_loop 路径 ----
-
-    fn metering_event(usage: f64) -> MeteringEvent {
-        MeteringEvent {
-            unit: "credit".to_string(),
-            unit_plural: "credits".to_string(),
-            usage,
-        }
-    }
-
-    #[test]
-    fn render_json_carries_credit_fields_when_metering_present() {
-        let content = vec![json!({"type": "text", "text": "ok"})];
-        let metering = metering_event(0.42);
-        let resp = render_json(
-            "claude-opus-4-7",
-            content,
-            "end_turn",
-            10,
-            5,
-            "",
-            Some(&metering),
-        );
-        // 把 Response 的 body 序列化为 JSON 再断言。
-        let body = resp.into_body();
-        let bytes = futures::executor::block_on(async {
-            axum::body::to_bytes(body, 64 * 1024).await.unwrap()
-        });
-        let v: Value = serde_json::from_slice(&bytes).unwrap();
-        let usage = &v["usage"];
-        assert_eq!(usage["credit_usage"], json!(0.42));
-        assert_eq!(usage["credit_unit"], json!("credit"));
-        assert_eq!(usage["credit_unit_plural"], json!("credits"));
-        // 原有字段保持原样
-        assert_eq!(usage["input_tokens"], json!(10));
-        assert_eq!(usage["output_tokens"], json!(5));
-    }
-
-    #[test]
-    fn render_json_omits_credit_fields_without_metering() {
-        let content = vec![json!({"type": "text", "text": "ok"})];
-        let resp = render_json(
-            "claude-opus-4-7",
-            content,
-            "end_turn",
-            10,
-            5,
-            "",
-            None,
-        );
-        let body = resp.into_body();
-        let bytes = futures::executor::block_on(async {
-            axum::body::to_bytes(body, 64 * 1024).await.unwrap()
-        });
-        let v: Value = serde_json::from_slice(&bytes).unwrap();
-        let usage = &v["usage"];
-        assert!(usage.get("credit_usage").is_none());
-        assert!(usage.get("credit_unit").is_none());
-        assert!(usage.get("credit_unit_plural").is_none());
-    }
-
-    #[test]
-    fn build_sse_events_carries_credit_fields_in_message_delta() {
-        let content = vec![json!({"type": "text", "text": "ok"})];
-        let metering = metering_event(0.99);
-        let events = build_sse_events(
-            "claude-opus-4-7",
-            content,
-            "end_turn",
-            10,
-            5,
-            Some(&metering),
-        );
-        let delta = events
-            .iter()
-            .find(|e| e.event == "message_delta")
-            .expect("must have message_delta");
-        let usage = &delta.data["usage"];
-        assert_eq!(usage["credit_usage"], json!(0.99));
-        assert_eq!(usage["credit_unit"], json!("credit"));
-        assert_eq!(usage["credit_unit_plural"], json!("credits"));
-        // 原有字段保持原样
-        assert_eq!(usage["output_tokens"], json!(5));
-    }
-
-    #[test]
-    fn build_sse_events_omits_credit_fields_without_metering() {
-        let content = vec![json!({"type": "text", "text": "ok"})];
-        let events = build_sse_events(
-            "claude-opus-4-7",
-            content,
-            "end_turn",
-            10,
-            5,
-            None,
-        );
-        let delta = events
-            .iter()
-            .find(|e| e.event == "message_delta")
-            .expect("must have message_delta");
-        let usage = &delta.data["usage"];
-        assert!(usage.get("credit_usage").is_none());
-        assert!(usage.get("credit_unit").is_none());
-        assert!(usage.get("credit_unit_plural").is_none());
     }
 }

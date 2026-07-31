@@ -8,7 +8,6 @@
   "defaultEndpoint": "ide",
   "updateAutoApply": false,
   "updateAutoApplyTime": "03:00",
-  "modelCacheTtlSecs": 3600,
   "traceEnabled": true,
   "traceRetentionDays": 7,
   "usageLogRetentionDays": 31

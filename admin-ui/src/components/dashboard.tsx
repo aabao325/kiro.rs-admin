@@ -1259,19 +1259,13 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
           <Card className="hover:shadow-apple-lg hover:-translate-y-0.5">
             <CardContent className="p-3 sm:p-5">
               <div className="text-[11px] font-medium text-muted-foreground sm:text-[13px]">
-                {loadBalancingData?.mode === "balanced" ? "调度模式" : "当前优先"}
+                当前活跃
               </div>
               <div className="mt-1.5 flex min-w-0 flex-wrap items-center gap-1.5 sm:mt-2 sm:gap-2">
                 <span className="truncate text-2xl font-semibold tracking-tight tabular-nums sm:text-3xl">
-                  {loadBalancingData?.mode === "balanced"
-                    ? "均衡负载"
-                    : `#${data?.currentId || "-"}`}
+                  #{data?.currentId || "-"}
                 </span>
-                {loadBalancingData?.mode === "balanced" ? (
-                  <Badge variant="secondary">动态选择</Badge>
-                ) : (
-                  data?.currentId && <Badge variant="success">当前优先</Badge>
-                )}
+                {data?.currentId && <Badge variant="success">活跃</Badge>}
               </div>
             </CardContent>
           </Card>

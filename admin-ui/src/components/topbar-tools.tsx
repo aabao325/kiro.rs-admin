@@ -1,7 +1,7 @@
 import { forwardRef, useEffect, useState, type ComponentPropsWithoutRef } from 'react'
 import {
   Activity, RefreshCw, UploadCloud, Settings, Key, Wand2, Eye, EyeOff, Copy,
-  MoreHorizontal, ShieldAlert, ShieldCheck, Database, Boxes,
+  MoreHorizontal, ShieldAlert, ShieldCheck, Database,
 } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
@@ -25,10 +25,9 @@ import { updateAdminKey } from '@/api/credentials'
 import { extractErrorMessage, generateApiKey } from '@/lib/utils'
 import { ImageUpdateDialog } from '@/components/image-update-dialog'
 import { CacheForceDialog } from '@/components/cache-force-card'
-import { AvailableModelsDialog } from '@/components/available-models-dialog'
 
 /**
- * 顶栏右侧通用工具栏：负载均衡切换、可用模型、刷新、在线更新、设置（Key 管理）。
+ * 顶栏右侧通用工具栏：负载均衡切换、刷新、在线更新、设置（Key 管理）。
  *
  * 与原 Dashboard 中的工具按钮等价，但全局 Tab 都可访问。刷新按钮会失效
  * 凭据/客户端 Key/统计三类查询，覆盖三个 Tab 的主要数据源。
@@ -46,7 +45,6 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
   const { data: updateCheck } = useUpdateCheck()
 
   const [imageUpdateOpen, setImageUpdateOpen] = useState(false)
-  const [modelsDialogOpen, setModelsDialogOpen] = useState(false)
   const [keyDialogOpen, setKeyDialogOpen] = useState(false)
   const [cacheForceOpen, setCacheForceOpen] = useState(false)
   const [newKey, setNewKey] = useState('')
@@ -57,8 +55,6 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
     queryClient.invalidateQueries({ queryKey: ['credentials'] })
     queryClient.invalidateQueries({ queryKey: ['client-keys'] })
     queryClient.invalidateQueries({ queryKey: ['stats'] })
-    queryClient.invalidateQueries({ queryKey: ['current-credential-models'] })
-    queryClient.invalidateQueries({ queryKey: ['credential-models'] })
     toast.success('已刷新')
   }
 
@@ -117,7 +113,6 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
     isSettingThrottle,
     loadBalancingMode: loadBalancingData?.mode,
     openImageUpdate: () => setImageUpdateOpen(true),
-    openModels: () => setModelsDialogOpen(true),
     openKeyDialog,
     openCacheForce: () => setCacheForceOpen(true),
     throttleConfig,
@@ -135,10 +130,6 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
       {compact ? <CompactTools controls={controls} /> : <FullTools controls={controls} />}
       <ImageUpdateDialog open={imageUpdateOpen} onOpenChange={setImageUpdateOpen} />
       <CacheForceDialog open={cacheForceOpen} onOpenChange={setCacheForceOpen} />
-      <AvailableModelsDialog
-        open={modelsDialogOpen}
-        onOpenChange={setModelsDialogOpen}
-      />
 
       <Dialog
         open={keyDialogOpen}
@@ -246,7 +237,6 @@ interface ToolControls {
   openImageUpdate: () => void
   openKeyDialog: () => void
   openCacheForce: () => void
-  openModels: () => void
   throttleConfig?: { failover: boolean; cooldownSecs: number }
   updateCheck?: { hasUpdate: boolean; latestVersion: string; currentVersion: string }
   updateCooldown: (secs: number) => void
@@ -263,7 +253,6 @@ function FullTools({ controls }: { controls: ToolControls }) {
         onToggleFailover={controls.handleToggleFailover}
         onChangeCooldown={controls.updateCooldown}
       />
-      <ModelsButton onOpen={controls.openModels} />
       <RefreshButton onRefresh={controls.handleRefresh} />
       <ImageUpdateButton controls={controls} />
       <KeySettingsMenu
@@ -306,9 +295,6 @@ function CompactTools({ controls }: { controls: ToolControls }) {
         <DropdownMenuItem onSelect={controls.handleRefresh}>
           <RefreshCw />刷新数据
         </DropdownMenuItem>
-        <DropdownMenuItem onSelect={controls.openModels}>
-          <Boxes />可用模型
-        </DropdownMenuItem>
         <DropdownMenuItem onSelect={controls.openImageUpdate}>
           <UploadCloud />镜像在线更新
         </DropdownMenuItem>
@@ -343,14 +329,6 @@ function LoadBalancingButton({ controls }: { controls: ToolControls }) {
             ? '优先级'
             : '均衡负载'}
       </span>
-    </Button>
-  )
-}
-
-function ModelsButton({ onOpen }: { onOpen: () => void }) {
-  return (
-    <Button variant="ghost" size="icon" onClick={onOpen} title="可用模型">
-      <Boxes className="h-4 w-4" />
     </Button>
   )
 }

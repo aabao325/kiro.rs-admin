@@ -7,57 +7,7 @@ use std::collections::HashMap;
 use serde_json::json;
 use uuid::Uuid;
 
-use crate::kiro::model::events::{Event, MeteringEvent};
-
-/// 一次流式请求的失败原因。
-///
-/// 两种都表现为「HTTP 200 但客户端拿不到内容」，区别只在上游有没有说明理由。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum StreamFailure {
-    /// 上游在流内下发了 error / exception 帧。
-    ///
-    /// 实测 `kind` 往往就是字面量 `error`、`message` 是通用文案
-    /// （`Encountered an unexpected error...`，`reason` 为 null），
-    /// 没有可用于分类的具名异常类型，所以这里只做原文透传，不做语义映射。
-    UpstreamFrame { kind: String, message: String },
-    /// 流正常结束但零产出、零计费——上游回了 200 却什么都没干，
-    /// 且没留下任何错误帧。
-    EmptyResponse,
-}
-
-impl StreamFailure {
-    /// 给客户端 `error` 事件用的错误类型标识。
-    pub fn error_type(&self) -> &'static str {
-        match self {
-            Self::UpstreamFrame { .. } => "upstream_stream_error",
-            Self::EmptyResponse => "upstream_empty_response",
-        }
-    }
-
-    /// 给客户端与 trace 用的说明文本。
-    pub fn message(&self) -> String {
-        match self {
-            Self::UpstreamFrame { kind, message } => {
-                if message.is_empty() {
-                    format!("上游在流内返回错误：{}", kind)
-                } else {
-                    format!("上游在流内返回错误（{}）：{}", kind, message)
-                }
-            }
-            Self::EmptyResponse => "上游返回 HTTP 200 但未产出任何内容（无文本、\
-                 无工具调用、无计费事件），本次请求按失败处理。"
-                .to_string(),
-        }
-    }
-
-    /// trace 的 error_type 分类。
-    pub fn outcome(&self) -> &'static str {
-        match self {
-            Self::UpstreamFrame { .. } => crate::admin::trace_db::outcome::UPSTREAM_STREAM_ERROR,
-            Self::EmptyResponse => crate::admin::trace_db::outcome::UPSTREAM_EMPTY_RESPONSE,
-        }
-    }
-}
+use crate::kiro::model::events::Event;
 
 const TOOL_USE_XML_PREFIX: &str = "<tool_use";
 const TOOL_USE_XML_CLOSE: &str = "</tool_use>";
@@ -1314,7 +1264,6 @@ impl SseStateManager {
         ephemeral_5m_input_tokens: i32,
         ephemeral_1h_input_tokens: i32,
         thinking_tokens: i32,
-        metering: Option<&MeteringEvent>,
     ) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
@@ -1335,29 +1284,6 @@ impl SseStateManager {
         // 发送 message_delta
         if !self.message_delta_sent {
             self.message_delta_sent = true;
-            // 字段顺序对齐官方真实样例（serde_json preserve_order）。
-            let mut usage_json = json!({
-                "input_tokens": input_tokens,
-                "cache_creation_input_tokens": cache_creation_input_tokens,
-                "cache_read_input_tokens": cache_read_input_tokens,
-                "cache_creation": {
-                    "ephemeral_5m_input_tokens": ephemeral_5m_input_tokens,
-                    "ephemeral_1h_input_tokens": ephemeral_1h_input_tokens
-                },
-                "output_tokens": output_tokens,
-                "output_tokens_details": {
-                    "thinking_tokens": thinking_tokens
-                },
-                "service_tier": "standard",
-                "inference_geo": "not_available"
-            });
-            // 透传上游 meteringEvent 的 credit_* 字段，让客户端拿到与 Kiro
-            // 后端口径一致的计费元数据；只在收到过 meteringEvent 时才追加。
-            if let Some(m) = metering {
-                usage_json["credit_usage"] = json!(m.usage);
-                usage_json["credit_unit"] = json!(m.unit);
-                usage_json["credit_unit_plural"] = json!(m.unit_plural);
-            }
             events.push(SseEvent::new(
                 "message_delta",
                 json!({
@@ -1366,7 +1292,21 @@ impl SseStateManager {
                         "stop_reason": self.get_stop_reason(),
                         "stop_sequence": null
                     },
-                    "usage": usage_json
+                    "usage": {
+                        "input_tokens": input_tokens,
+                        "cache_creation_input_tokens": cache_creation_input_tokens,
+                        "cache_read_input_tokens": cache_read_input_tokens,
+                        "cache_creation": {
+                            "ephemeral_5m_input_tokens": ephemeral_5m_input_tokens,
+                            "ephemeral_1h_input_tokens": ephemeral_1h_input_tokens
+                        },
+                        "output_tokens": output_tokens,
+                        "output_tokens_details": {
+                            "thinking_tokens": thinking_tokens
+                        },
+                        "service_tier": "standard",
+                        "inference_geo": "not_available"
+                    }
                 }),
             ));
         }
@@ -1449,12 +1389,8 @@ pub struct StreamContext {
     /// 官方仅在该 beta 开启时才在响应里返回 `context_management` 字段
     /// （不是给 null，而是完全不出现该 key），未开启时不插入。
     pub context_management_enabled: bool,
-    /// meteringEvent 上报的 credit 计费量（上游真实下发，多次事件累加得到本次总量）
+    /// meteringEvent 上报的 credit 计费量（上游真实下发）
     pub credits: f64,
-    /// 最近一次 meteringEvent 完整 payload（含 unit / unit_plural / usage）。
-    /// 透传到 message_delta.usage 的 `credit_usage` / `credit_unit` / `credit_unit_plural`
-    /// 字段，与 kiro-rs /v1/messages 行为对齐；上游只下发一次则取该次。
-    pub metering: Option<MeteringEvent>,
     /// 复读熔断：最近一次作为文本吐出的「尾行」内容（去空白）。
     /// Opus 长上下文退化时会把同一个 stray token（call/count/card）一行一行无限复读，
     /// 我们在文本出口处统计「同一短行连续重复了多少次」。
@@ -1469,20 +1405,6 @@ pub struct StreamContext {
     /// 工具调用 JSON 错误（非法 / 半截）。一旦置位，收尾时补发 `error` 事件，
     /// 上层据此把本次请求记为 error 而非 success。
     tool_json_error: Option<ToolJsonAccumulatorError>,
-    /// 上游在流内下发的错误 / 异常帧（`(kind, message)`）。
-    ///
-    /// AWS Event Stream 的机制决定了：HTTP 响应头一旦发出，状态码就锁定了，
-    /// 此后上游要报错只能把错误塞成帧（`:message-type` = `error` / `exception`）。
-    /// 实测见过上游对同一次「模型暂时不可用」用两种方式表达——先发头再放弃时
-    /// 就是 200 + 一个只装着 `MODEL_TEMPORARILY_UNAVAILABLE` 的 exception 帧。
-    ///
-    /// 这类帧过去只打日志、不改状态，导致「上游明确报错」在 trace 里长得和真正
-    /// 的成功一模一样，客户端则收到一个结构完整但没有内容的空消息。一旦置位，
-    /// 收尾时把本次请求记为 error 并把帧原文带进 trace。
-    ///
-    /// 注意 `ContentLengthExceededException` **不**计入：它是「输出被 max_tokens
-    /// 截断」的正常语义，已由 `stop_reason = max_tokens` 表达。
-    upstream_error: Option<(String, String)>,
     /// 跨 chunk 过滤混入 assistant 文本的字面 `<tool_use>` XML 泄漏。
     tool_use_xml_filter: ToolUseXmlLeakFilter,
 }
@@ -1526,62 +1448,6 @@ impl StreamContext {
         self.tool_json_error.as_ref().map(|err| err.message())
     }
 
-    /// 本次流的失败原因（若失败）。两种来源：
-    ///
-    /// 1. 上游在流内下发了 error / exception 帧（有明确原因）。
-    /// 2. 流正常结束但**一个字都没产出**、且上游连 meteringEvent 都没发
-    ///    （无明确原因）。实测上游会在换号重试后回一个 200 却什么都不干，
-    ///    这种情况没有任何错误帧可依据，只能靠「零产出 + 零计费」判定。
-    ///
-    /// 只把「零产出 **且** 零计费」算失败，不能只看 output_tokens：模型合法地
-    /// 只回一个工具调用（无文本）时 output_tokens 也可能是 0，但那种情况上游
-    /// 会照常下发 meteringEvent，且 `has_tool_use` 为真。
-    pub fn failure_reason(&self) -> Option<StreamFailure> {
-        if let Some((kind, message)) = &self.upstream_error {
-            return Some(StreamFailure::UpstreamFrame {
-                kind: kind.clone(),
-                message: message.clone(),
-            });
-        }
-        let produced_nothing = self.output_tokens == 0
-            && self.tool_block_indices.is_empty()
-            && self.metering.is_none()
-            && self.credits == 0.0;
-        if produced_nothing {
-            return Some(StreamFailure::EmptyResponse);
-        }
-        None
-    }
-
-    /// 记录上游流内错误 / 异常帧。只保留**第一条**——上游可能在放弃时连发多帧，
-    /// 首条最接近根因，后续往往是它的衍生描述。
-    fn record_upstream_error(&mut self, kind: &str, message: &str) {
-        if self.upstream_error.is_none() {
-            self.upstream_error = Some((kind.to_string(), message.trim().to_string()));
-        }
-    }
-
-    /// 上游流内错误的 `(kind, message)`。上层据此把本次请求记为 error 而非
-    /// success，并把原文写进 trace 的 `error_message`。
-    pub fn upstream_error(&self) -> Option<(&str, &str)> {
-        self.upstream_error
-            .as_ref()
-            .map(|(k, m)| (k.as_str(), m.as_str()))
-    }
-
-    /// 单行摘要（`kind: message`；message 为空时只给 kind）。
-    /// 生产代码走 [`Self::failure_reason`]，这里仅供测试断言原始记录内容。
-    #[cfg(test)]
-    pub fn upstream_error_message(&self) -> Option<String> {
-        self.upstream_error.as_ref().map(|(kind, msg)| {
-            if msg.is_empty() {
-                kind.clone()
-            } else {
-                format!("{}: {}", kind, msg)
-            }
-        })
-    }
-
     /// 创建 StreamContext
     pub fn new_with_thinking(
         model: impl Into<String>,
@@ -1618,13 +1484,11 @@ impl StreamContext {
             cache_ttl_secs: 300,
             context_management_enabled: false,
             credits: 0.0,
-            metering: None,
             repeat_guard_last_line: String::new(),
             repeat_guard_run: 0,
             repeat_guard_tripped: false,
             tool_json_accumulator: ToolJsonAccumulator::new(),
             tool_json_error: None,
-            upstream_error: None,
             tool_use_xml_filter: ToolUseXmlLeakFilter::default(),
         }
     }
@@ -1730,15 +1594,7 @@ impl StreamContext {
             Event::Metering(metering) => {
                 // 上游 meteringEvent 只下发 credit；token / cache 字段不存在。
                 self.credits += metering.usage;
-                tracing::debug!(
-                    usage = metering.usage,
-                    unit = %metering.unit,
-                    unit_plural = %metering.unit_plural,
-                    "metering credits +{:.6}", metering.usage
-                );
-                // 保留最近一次完整 payload，用于在 message_delta 里透传 credit_*
-                // 字段；如果上游真的多次下发，则以最后一次为准（与 kiro-rs 一致）。
-                self.metering = Some(metering.clone());
+                tracing::debug!("metering credits +{:.6}", metering.usage);
                 Vec::new()
             }
             Event::Error {
@@ -1746,37 +1602,20 @@ impl StreamContext {
                 error_message,
             } => {
                 tracing::error!("收到错误事件: {} - {}", error_code, error_message);
-                self.record_upstream_error(error_code, error_message);
                 Vec::new()
             }
             Event::Exception {
                 exception_type,
                 message,
             } => {
-                tracing::warn!("收到异常事件: {} - {}", exception_type, message);
-                // ContentLengthExceededException 是「输出被 max_tokens 截断」的
-                // 正常语义，用 stop_reason 表达即可，不算上游错误。
+                // 处理 ContentLengthExceededException
                 if exception_type == "ContentLengthExceededException" {
                     self.state_manager.set_stop_reason("max_tokens");
-                } else {
-                    self.record_upstream_error(exception_type, message);
                 }
+                tracing::warn!("收到异常事件: {} - {}", exception_type, message);
                 Vec::new()
             }
-            // Unknown 帧过去连日志都没有，是全链路唯一的完全静默点：上游一旦
-            // 引入新事件类型，表现就是「流跑完了但什么都没发生」，无从排查。
-            // 必须带上类型名与 payload 片段，否则日志只能说「有个不认识的」。
-            Event::Unknown {
-                event_type,
-                payload_snippet,
-            } => {
-                tracing::warn!(
-                    event_type = %event_type,
-                    payload = %payload_snippet,
-                    "收到未识别的上游事件类型（已忽略）"
-                );
-                Vec::new()
-            }
+            _ => Vec::new(),
         }
     }
 
@@ -2684,7 +2523,6 @@ impl StreamContext {
             resolved.ephemeral_5m_input_tokens,
             resolved.ephemeral_1h_input_tokens,
             self.thinking_output_tokens,
-            self.metering.as_ref(),
         ));
 
         // 工具调用 JSON 错误：在最终事件之后补一个 Anthropic `error` 事件，明确告知
@@ -2697,21 +2535,6 @@ impl StreamContext {
                     "error": {
                         "type": err.error_type(),
                         "message": err.message()
-                    }
-                }),
-            ));
-        } else if let Some(reason) = self.failure_reason() {
-            // 上游流内错误帧，或「流跑完了但一个字都没产出」。两者实时流都已回 200、
-            // 初始事件也早已发出，改不了状态码，只能在末尾补一个协议内的 `error`
-            // 事件——否则客户端收到的是一个结构完整、内容为空的消息，看起来像模型
-            // 什么都没说，而不是「这次失败了」。
-            events.push(SseEvent::new(
-                "error",
-                json!({
-                    "type": "error",
-                    "error": {
-                        "type": reason.error_type(),
-                        "message": reason.message()
                     }
                 }),
             ));
@@ -2860,11 +2683,6 @@ impl BufferedStreamContext {
     /// 工具调用 JSON 错误信息（转发内部 StreamContext）。缓冲流据此记 error。
     pub fn tool_json_error_message(&self) -> Option<String> {
         self.inner.tool_json_error_message()
-    }
-
-    /// 本次流的失败原因（见 [`StreamContext::failure_reason`]）。
-    pub fn failure_reason(&self) -> Option<StreamFailure> {
-        self.inner.failure_reason()
     }
 }
 
@@ -4955,267 +4773,5 @@ mod tests {
                 && e.data["content_block"]["type"] == "redacted_thinking"
                 && e.data["content_block"]["data"] == "encrypted-thinking"
         }));
-    }
-
-    // ---- credit_usage 透传 ----
-
-    fn parse_metering(payload: &str) -> MeteringEvent {
-        serde_json::from_str(payload).unwrap()
-    }
-
-    #[test]
-    fn test_generate_final_events_omits_credit_fields_without_metering() {
-        // 没有 meteringEvent 时不应在 usage 里写 credit_* 字段。
-        let mut manager = SseStateManager::new();
-        let events = manager.generate_final_events(10, 5, 0, 0, 0, 0, 0, None);
-        let delta = events
-            .iter()
-            .find(|e| e.event == "message_delta")
-            .expect("must have message_delta");
-        let usage = &delta.data["usage"];
-        assert!(usage.get("credit_usage").is_none());
-        assert!(usage.get("credit_unit").is_none());
-        assert!(usage.get("credit_unit_plural").is_none());
-    }
-
-    #[test]
-    fn test_generate_final_events_carries_credit_fields_when_metering_present() {
-        let mut manager = SseStateManager::new();
-        let metering = parse_metering(
-            r#"{"unit":"credit","unitPlural":"credits","usage":0.75}"#,
-        );
-        let events = manager.generate_final_events(10, 5, 0, 0, 0, 0, 0, Some(&metering));
-        let delta = events
-            .iter()
-            .find(|e| e.event == "message_delta")
-            .expect("must have message_delta");
-        let usage = &delta.data["usage"];
-        assert_eq!(usage["credit_usage"], json!(0.75));
-        assert_eq!(usage["credit_unit"], json!("credit"));
-        assert_eq!(usage["credit_unit_plural"], json!("credits"));
-        // 既有字段保持原样
-        assert_eq!(usage["input_tokens"], json!(10));
-        assert_eq!(usage["output_tokens"], json!(5));
-    }
-
-    #[test]
-    fn test_stream_context_keeps_latest_metering_in_message_delta() {
-        use crate::kiro::model::events::MeteringEvent;
-
-        let mut ctx = StreamContext::new_with_thinking(
-            "claude-opus-4-7",
-            100,
-            false,
-            HashMap::new(),
-            test_known_tools(),
-        );
-        let _ = ctx.generate_initial_events();
-
-        // 第一次下发（异常：上游几乎只会下发一次）
-        ctx.process_kiro_event(&Event::Metering(MeteringEvent {
-            unit: "credit".into(),
-            unit_plural: "credits".into(),
-            usage: 0.10,
-        }));
-        // 第二次下发（应覆盖）
-        ctx.process_kiro_event(&Event::Metering(MeteringEvent {
-            unit: "credit".into(),
-            unit_plural: "credits".into(),
-            usage: 0.42,
-        }));
-
-        let final_events = ctx.generate_final_events();
-        let delta = final_events
-            .iter()
-            .find(|e| e.event == "message_delta")
-            .expect("must have message_delta");
-        let usage = &delta.data["usage"];
-        assert_eq!(usage["credit_usage"], json!(0.42));
-        assert_eq!(usage["credit_unit"], json!("credit"));
-        assert_eq!(usage["credit_unit_plural"], json!("credits"));
-        // 累计 credit 仍然是两次之和
-        assert!((ctx.credits - 0.52).abs() < 1e-9);
-    }
-
-    #[test]
-    fn test_stream_context_omits_credit_fields_without_metering() {
-        let mut ctx = StreamContext::new_with_thinking(
-            "claude-opus-4-7",
-            100,
-            false,
-            HashMap::new(),
-            test_known_tools(),
-        );
-        let _ = ctx.generate_initial_events();
-        let final_events = ctx.generate_final_events();
-        let delta = final_events
-            .iter()
-            .find(|e| e.event == "message_delta")
-            .expect("must have message_delta");
-        let usage = &delta.data["usage"];
-        assert!(usage.get("credit_usage").is_none());
-        assert!(usage.get("credit_unit").is_none());
-        assert!(usage.get("credit_unit_plural").is_none());
-    }
-
-    // ---- 上游流内错误帧（HTTP 200 + exception/error 帧）----
-
-    fn ctx_for_upstream_error() -> StreamContext {
-        StreamContext::new_with_thinking(
-            "claude-opus-5",
-            100,
-            false,
-            HashMap::new(),
-            test_known_tools(),
-        )
-    }
-
-    /// 实测案例：上游先回 200 和响应头，之后才判定模型不可用，只能把错误塞成
-    /// exception 帧。过去这类请求被记成 success，客户端收到空消息。
-    #[test]
-    fn test_upstream_exception_frame_is_recorded_as_error() {
-        let mut ctx = ctx_for_upstream_error();
-        let _ = ctx.generate_initial_events();
-        ctx.process_kiro_event(&Event::Exception {
-            exception_type: "ModelTemporarilyUnavailableException".to_string(),
-            message: "{\"message\":\"Encountered unexpectedly high load when processing the \
-                      request, please try again.\",\"reason\":\"MODEL_TEMPORARILY_UNAVAILABLE\"}"
-                .to_string(),
-        });
-
-        let (kind, msg) = ctx.upstream_error().expect("异常帧必须被记录");
-        assert_eq!(kind, "ModelTemporarilyUnavailableException");
-        assert!(msg.contains("MODEL_TEMPORARILY_UNAVAILABLE"));
-        let summary = ctx.upstream_error_message().unwrap();
-        assert!(summary.starts_with("ModelTemporarilyUnavailableException: "));
-        // 没有任何内容产出——正是过去被误判成成功的形态
-        assert_eq!(ctx.output_tokens, 0);
-    }
-
-    #[test]
-    fn test_upstream_error_frame_is_recorded_as_error() {
-        let mut ctx = ctx_for_upstream_error();
-        let _ = ctx.generate_initial_events();
-        ctx.process_kiro_event(&Event::Error {
-            error_code: "InternalServerError".to_string(),
-            error_message: "  backend exploded  ".to_string(),
-        });
-
-        let (kind, msg) = ctx.upstream_error().expect("错误帧必须被记录");
-        assert_eq!(kind, "InternalServerError");
-        assert_eq!(msg, "backend exploded", "message 应 trim");
-    }
-
-    /// ContentLengthExceededException 是「输出被 max_tokens 截断」的正常语义，
-    /// 不该被当成上游错误——否则正常的长输出会被记成失败。
-    #[test]
-    fn test_content_length_exceeded_is_not_upstream_error() {
-        let mut ctx = ctx_for_upstream_error();
-        let _ = ctx.generate_initial_events();
-        ctx.process_kiro_event(&Event::Exception {
-            exception_type: "ContentLengthExceededException".to_string(),
-            message: String::new(),
-        });
-
-        assert!(ctx.upstream_error().is_none());
-        assert!(ctx.upstream_error_message().is_none());
-        let final_events = ctx.generate_final_events();
-        let delta = final_events
-            .iter()
-            .find(|e| e.event == "message_delta")
-            .expect("must have message_delta");
-        assert_eq!(delta.data["delta"]["stop_reason"], json!("max_tokens"));
-    }
-
-    /// 上游放弃时可能连发多帧，只留首条（最接近根因）。
-    #[test]
-    fn test_upstream_error_keeps_first_frame_only() {
-        let mut ctx = ctx_for_upstream_error();
-        let _ = ctx.generate_initial_events();
-        ctx.process_kiro_event(&Event::Exception {
-            exception_type: "FirstException".to_string(),
-            message: "root cause".to_string(),
-        });
-        ctx.process_kiro_event(&Event::Error {
-            error_code: "SecondError".to_string(),
-            error_message: "derived noise".to_string(),
-        });
-
-        let (kind, msg) = ctx.upstream_error().unwrap();
-        assert_eq!(kind, "FirstException");
-        assert_eq!(msg, "root cause");
-    }
-
-    /// 「200 但零产出零计费」：上游什么都不给就关流，没留下任何错误帧。
-    /// 这是实测那条 12 秒空回的形态，只能靠这个兜住。
-    #[test]
-    fn test_empty_response_is_a_failure() {
-        let mut ctx = ctx_for_upstream_error();
-        let _ = ctx.generate_initial_events();
-
-        assert_eq!(ctx.failure_reason(), Some(StreamFailure::EmptyResponse));
-        let events = ctx.generate_final_events();
-        let err = events
-            .iter()
-            .find(|e| e.event == "error")
-            .expect("空回必须补发 error 事件");
-        assert_eq!(err.data["error"]["type"], json!("upstream_empty_response"));
-    }
-
-    /// 有 meteringEvent 就说明上游确实干了活——即便文本为空（例如只回工具调用），
-    /// 也不能判成空回失败。
-    #[test]
-    fn test_metering_only_stream_is_not_empty_failure() {
-        let mut ctx = ctx_for_upstream_error();
-        let _ = ctx.generate_initial_events();
-        ctx.process_kiro_event(&Event::Metering(MeteringEvent {
-            unit: "credit".into(),
-            unit_plural: "credits".into(),
-            usage: 0.02,
-        }));
-
-        assert_eq!(ctx.failure_reason(), None);
-        let events = ctx.generate_final_events();
-        assert!(
-            !events.iter().any(|e| e.event == "error"),
-            "有计费的流不该补发 error"
-        );
-    }
-
-    /// 错误帧优先于空回判定，且 error 事件带原文。
-    #[test]
-    fn test_upstream_frame_takes_precedence_over_empty() {
-        let mut ctx = ctx_for_upstream_error();
-        let _ = ctx.generate_initial_events();
-        ctx.process_kiro_event(&Event::Exception {
-            exception_type: "error".to_string(),
-            message: "{\"message\":\"Encountered an unexpected error\"}".to_string(),
-        });
-
-        let reason = ctx.failure_reason().unwrap();
-        assert_eq!(reason.error_type(), "upstream_stream_error");
-        let events = ctx.generate_final_events();
-        let err = events.iter().find(|e| e.event == "error").unwrap();
-        assert!(
-            err.data["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("Encountered an unexpected error"),
-            "error 事件必须带上游原文"
-        );
-    }
-
-    /// 正常成功的流不该被误判——没有错误帧时取值器必须为 None。
-    #[test]
-    fn test_normal_stream_has_no_upstream_error() {
-        let mut ctx = ctx_for_upstream_error();
-        let _ = ctx.generate_initial_events();
-        // AssistantResponseEvent 有私有的 flatten 字段，跨模块只能从 JSON 反序列化
-        let resp: crate::kiro::model::events::AssistantResponseEvent =
-            serde_json::from_str(r#"{"content":"hello"}"#).unwrap();
-        ctx.process_kiro_event(&Event::AssistantResponse(resp));
-
-        assert!(ctx.upstream_error().is_none());
-        assert!(ctx.output_tokens > 0);
     }
 }

@@ -16,6 +16,29 @@ services:
       # 触发条件在请求内容里）。开启后仅在判定为空回/流内错误时把发给上游的
       # 请求体落到 KIRO_DUMP_EMPTY_DIR，正常请求不写任何东西。
       # 排查完成后改回 0（或删掉这两行）即可关闭。
-      KIRO_DUMP_EMPTY: "1"
+      KIRO_DUMP_EMPTY: "0"
       KIRO_DUMP_EMPTY_DIR: /app/config/dump
     restart: unless-stopped
+    networks:
+      default:
+        aliases:
+          - kiro-rs
+    
+  warp:
+    container_name: kiro-rs-warp
+    image: caomingjun/warp:latest
+    restart: unless-stopped
+    networks:
+      - default          # ← 必须解注释，否则主容器解析不到 warp
+    environment:
+      - WARP_SLEEP=2
+    cap_add:
+      - NET_ADMIN
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=0
+      - net.ipv4.conf.all.src_valid_mark=1
+
+networks:
+  default:
+    name: kiro-rs
+    driver: bridge

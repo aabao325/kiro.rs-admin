@@ -43,10 +43,6 @@ pub struct TokenLimits {
     /// 最大输入 Token 数
     #[serde(default)]
     pub max_input_tokens: Option<i64>,
-
-    /// 最大输出 Token 数。部分上游响应不提供该字段。
-    #[serde(default)]
-    pub max_output_tokens: Option<i64>,
 }
 
 #[cfg(test)]
@@ -61,10 +57,7 @@ mod tests {
                     "modelId": "claude-sonnet-4.5",
                     "modelName": "Claude Sonnet 4.5",
                     "description": "balanced model",
-                    "tokenLimits": {
-                        "maxInputTokens": 200000,
-                        "maxOutputTokens": 64000
-                    }
+                    "tokenLimits": { "maxInputTokens": 200000 }
                 },
                 {
                     "modelId": "claude-opus-4.6"
@@ -80,10 +73,6 @@ mod tests {
         assert_eq!(
             first.token_limits.as_ref().unwrap().max_input_tokens,
             Some(200000)
-        );
-        assert_eq!(
-            first.token_limits.as_ref().unwrap().max_output_tokens,
-            Some(64000)
         );
 
         // 仅 modelId 的最小对象：其余字段缺省为 None
