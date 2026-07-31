@@ -4,9 +4,10 @@
 //! 下发真实的 thinking signature（对应的密钥只有 Anthropic 自己有）。本模块
 //! 生成"形状像真的"的替代值：
 //!
-//! - `generate_message_id()`：`msg_bdrk_` + 52 位随机小写字母数字，对齐用户
-//!   提供的 AWS Bedrock 真实响应样例格式（本项目代理的 Kiro 上游本身就是
-//!   AWS 体系，用这种形态比直连 Anthropic 的 `msg_01...` 更贴合项目定位）。
+//! - `generate_message_id()`：`msg_01` + 22 位 base62 随机段，对齐 Anthropic
+//!   官方 API 的真实格式（如 `msg_01XFDUDYJgAACzvnptvVoYEL`）。早期版本用过
+//!   `msg_bdrk_` + 52 位小写的 Bedrock 形态，但那个前缀等于在每个响应的 id 里
+//!   写明上游是 AWS Bedrock，属于实现细节泄漏，已改掉。
 //! - `generate_thinking_signature()`：按对真实签名做 protobuf 解码后确认的
 //!   字段位置拼字节（field 6 = model 名，field 7 = 0，field 8 = 字面量
 //!   "thinking"，field 11 = 随机 id，结尾固定 `18 01`），中间和结尾补随机
@@ -22,20 +23,25 @@
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use uuid::Uuid;
 
-const ID_CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
-/// 对齐真实 AWS Bedrock 样例里 `msg_bdrk_` 后缀的长度。
-const BEDROCK_ID_LEN: usize = 52;
+/// 官方 message id 后缀字符集：大小写字母 + 数字（base62）。
+const ID_CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+/// 官方 `msg_01` 之后的随机段长度（对齐 `msg_01XFDUDYJgAACzvnptvVoYEL` 样例）。
+const OFFICIAL_ID_LEN: usize = 22;
+/// 官方 message id 固定前缀。`01` 是 Anthropic 的 id 版本位，不是随机段。
+const OFFICIAL_ID_PREFIX: &str = "msg_01";
 
 const WIRE_VARINT: u8 = 0;
 const WIRE_LEN: u8 = 2;
 
-/// 生成 `msg_bdrk_` 前缀的消息 id（AWS Bedrock 真实格式：前缀 + 52 位纯小写
-/// 字母数字）。
+/// 生成 Anthropic 官方格式的消息 id：`msg_01` + 22 位 base62 随机段。
+///
+/// 刻意不用 `msg_bdrk_` 那种 Bedrock 形态：那个前缀本身就把上游是 AWS Bedrock
+/// 这件事写在了每一个响应里，等于在 id 上泄漏底层实现。
 pub fn generate_message_id() -> String {
-    let suffix: String = (0..BEDROCK_ID_LEN)
+    let suffix: String = (0..OFFICIAL_ID_LEN)
         .map(|_| ID_CHARSET[fastrand::usize(..ID_CHARSET.len())] as char)
         .collect();
-    format!("msg_bdrk_{suffix}")
+    format!("{OFFICIAL_ID_PREFIX}{suffix}")
 }
 
 /// 生成一段模拟的 thinking block signature（base64）。每次调用结果不同。
@@ -136,16 +142,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn message_id_format() {
+    fn message_id_matches_official_anthropic_format() {
         for _ in 0..20 {
             let id = generate_message_id();
-            assert!(id.starts_with("msg_bdrk_"));
-            let suffix = &id["msg_bdrk_".len()..];
-            assert_eq!(suffix.len(), BEDROCK_ID_LEN);
             assert!(
-                suffix.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()),
-                "id 后缀必须是纯小写字母数字: {suffix}"
+                id.starts_with(OFFICIAL_ID_PREFIX),
+                "id 必须是官方 msg_01 前缀: {id}"
             );
+            let suffix = &id[OFFICIAL_ID_PREFIX.len()..];
+            assert_eq!(suffix.len(), OFFICIAL_ID_LEN);
+            assert!(
+                suffix.chars().all(|c| c.is_ascii_alphanumeric()),
+                "id 后缀必须是 base62 字母数字: {suffix}"
+            );
+            // 回归：绝不能再出现暴露上游 Bedrock 的前缀
+            assert!(!id.contains("bdrk"), "id 不得泄漏上游实现: {id}");
         }
     }
 
