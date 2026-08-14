@@ -169,6 +169,17 @@ function getDisabledReasonStyle(reason?: string | null): {
   variant: "destructive" | "warning" | "outline" | "secondary";
 } | null {
   if (!reason) return null;
+  // 自定义错误规则命中：后端编码为 `CustomRule:<0|1>:<规则名>`，
+  // 规则名本身可能含冒号，故只切前两段。
+  if (reason.startsWith("CustomRule:")) {
+    const rest = reason.slice("CustomRule:".length);
+    const sep = rest.indexOf(":");
+    const name = sep >= 0 ? rest.slice(sep + 1) : rest;
+    return {
+      label: name ? `规则『${name}』` : "自定义规则",
+      variant: "destructive",
+    };
+  }
   switch (reason) {
     case "QuotaExceeded":
       return { label: "已超额", variant: "warning" };

@@ -1,7 +1,7 @@
 import { forwardRef, useEffect, useState, type ComponentPropsWithoutRef } from 'react'
 import {
   Activity, RefreshCw, UploadCloud, Settings, Key, Wand2, Eye, EyeOff, Copy,
-  MoreHorizontal, ShieldAlert, ShieldCheck, Database, HeartPulse,
+  MoreHorizontal, ShieldAlert, ShieldCheck, Database, HeartPulse, ShieldX,
 } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
@@ -26,6 +26,7 @@ import { extractErrorMessage, generateApiKey } from '@/lib/utils'
 import { ImageUpdateDialog } from '@/components/image-update-dialog'
 import { CacheForceDialog } from '@/components/cache-force-card'
 import { SelfHealDialog } from '@/components/self-heal-dialog'
+import { ErrorRulesDialog } from '@/components/error-rules-dialog'
 
 /**
  * 顶栏右侧通用工具栏：负载均衡切换、刷新、在线更新、设置（Key 管理）。
@@ -49,6 +50,7 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
   const [keyDialogOpen, setKeyDialogOpen] = useState(false)
   const [cacheForceOpen, setCacheForceOpen] = useState(false)
   const [selfHealOpen, setSelfHealOpen] = useState(false)
+  const [errorRulesOpen, setErrorRulesOpen] = useState(false)
   const [newKey, setNewKey] = useState('')
   const [showPlain, setShowPlain] = useState(false)
   const [updating, setUpdating] = useState(false)
@@ -118,6 +120,7 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
     openKeyDialog,
     openCacheForce: () => setCacheForceOpen(true),
     openSelfHeal: () => setSelfHealOpen(true),
+    openErrorRules: () => setErrorRulesOpen(true),
     throttleConfig,
     updateCheck,
     updateCooldown: (secs: number) =>
@@ -134,6 +137,7 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
       <ImageUpdateDialog open={imageUpdateOpen} onOpenChange={setImageUpdateOpen} />
       <CacheForceDialog open={cacheForceOpen} onOpenChange={setCacheForceOpen} />
       <SelfHealDialog open={selfHealOpen} onOpenChange={setSelfHealOpen} />
+      <ErrorRulesDialog open={errorRulesOpen} onOpenChange={setErrorRulesOpen} />
 
       <Dialog
         open={keyDialogOpen}
@@ -242,6 +246,7 @@ interface ToolControls {
   openKeyDialog: () => void
   openCacheForce: () => void
   openSelfHeal: () => void
+  openErrorRules: () => void
   throttleConfig?: { failover: boolean; cooldownSecs: number }
   updateCheck?: { hasUpdate: boolean; latestVersion: string; currentVersion: string }
   updateCooldown: (secs: number) => void
@@ -264,6 +269,7 @@ function FullTools({ controls }: { controls: ToolControls }) {
         onOpenKeyDialog={controls.openKeyDialog}
         onOpenCacheForce={controls.openCacheForce}
         onOpenSelfHeal={controls.openSelfHeal}
+        onOpenErrorRules={controls.openErrorRules}
       />
     </>
   )
@@ -317,6 +323,9 @@ function CompactTools({ controls }: { controls: ToolControls }) {
         <DropdownMenuItem onSelect={controls.openSelfHeal}>
           <HeartPulse />凭据自愈（冷却间隔 / 连续轮数上限）
         </DropdownMenuItem>
+        <DropdownMenuItem onSelect={controls.openErrorRules}>
+          <ShieldX />自定义错误规则（关键词自动禁用）
+        </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>
   )
@@ -367,11 +376,12 @@ function ImageUpdateButton({ controls }: { controls: ToolControls }) {
 }
 
 function KeySettingsMenu({
-  onOpenKeyDialog, onOpenCacheForce, onOpenSelfHeal,
+  onOpenKeyDialog, onOpenCacheForce, onOpenSelfHeal, onOpenErrorRules,
 }: {
   onOpenKeyDialog: () => void
   onOpenCacheForce: () => void
   onOpenSelfHeal: () => void
+  onOpenErrorRules: () => void
 }) {
   return (
     <DropdownMenu>
@@ -392,6 +402,9 @@ function KeySettingsMenu({
         <DropdownMenuLabel>凭据治理</DropdownMenuLabel>
         <DropdownMenuItem onSelect={onOpenSelfHeal}>
           <HeartPulse />凭据自愈（冷却间隔 / 连续轮数上限）
+        </DropdownMenuItem>
+        <DropdownMenuItem onSelect={onOpenErrorRules}>
+          <ShieldX />自定义错误规则（关键词自动禁用）
         </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>

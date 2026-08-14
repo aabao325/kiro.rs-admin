@@ -431,6 +431,43 @@ export async function setAccountThrottleConfig(
   return data
 }
 
+/** 关键词组合方式 */
+export type RuleMatchMode = 'any' | 'all'
+
+/** 命中后的处置动作 */
+export type RuleAction = 'disable' | 'cooldown' | 'countFailure' | 'abort'
+
+export interface ErrorRule {
+  /** 规则名，用于日志与「被哪条规则禁用」的显示 */
+  name: string
+  enabled: boolean
+  /** 要匹配的关键词，空列表永不命中 */
+  keywords: string[]
+  matchMode: RuleMatchMode
+  caseSensitive: boolean
+  /** 限定生效的 HTTP 状态码，空数组表示不限 */
+  statusCodes: number[]
+  action: RuleAction
+  /** action=cooldown 时的冷却秒数 */
+  cooldownSecs: number
+  /** 被本规则禁用的凭据是否参与自愈 */
+  selfHealable: boolean
+  /** 执行 disable 前至少保留的可用凭据数，0 = 无防护 */
+  minAvailable: number
+}
+
+// 获取自定义错误规则表
+export async function getErrorRules(): Promise<{ rules: ErrorRule[] }> {
+  const { data } = await api.get<{ rules: ErrorRule[] }>('/config/error-rules')
+  return data
+}
+
+// 整表替换自定义错误规则（规则顺序即优先级）
+export async function setErrorRules(rules: ErrorRule[]): Promise<{ rules: ErrorRule[] }> {
+  const { data } = await api.put<{ rules: ErrorRule[] }>('/config/error-rules', { rules })
+  return data
+}
+
 export interface SelfHealConfig {
   /** 是否启用凭据自愈 */
   enabled: boolean

@@ -18,6 +18,8 @@ import {
   setAccountThrottleConfig,
   getSelfHealConfig,
   setSelfHealConfig,
+  getErrorRules,
+  setErrorRules,
   getLogGovernanceConfig,
   setLogGovernanceConfig,
   resetSuccessCount,
@@ -213,6 +215,27 @@ export function useSetAccountThrottleConfig() {
     mutationFn: setAccountThrottleConfig,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['accountThrottleConfig'] })
+    },
+  })
+}
+
+// 获取自定义错误规则表
+export function useErrorRules() {
+  return useQuery({
+    queryKey: ['errorRules'],
+    queryFn: getErrorRules,
+  })
+}
+
+// 整表替换自定义错误规则
+export function useSetErrorRules() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setErrorRules,
+    onSuccess: (data) => {
+      // 服务端会清理规则（裁空白/去空关键词/状态码去重），直接用返回值覆盖，
+      // 让面板立即显示实际生效的内容而不是用户提交的原始输入
+      queryClient.setQueryData(['errorRules'], data)
     },
   })
 }
