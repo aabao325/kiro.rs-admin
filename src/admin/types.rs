@@ -445,6 +445,37 @@ pub struct SetAccountThrottleConfigRequest {
     pub cooldown_secs: Option<u64>,
 }
 
+/// 凭据自愈配置响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SelfHealConfigResponse {
+    /// 是否启用凭据自愈
+    pub enabled: bool,
+    /// 同一凭据两次自愈的最小冷却间隔（秒，0 = 不限）
+    pub min_interval_secs: u64,
+    /// 连续自愈最大轮数（0 = 不限）
+    pub max_consecutive_rounds: u32,
+    /// 只读观测：当前所有凭据中的最大连续自愈轮数
+    pub consecutive_rounds: u32,
+    /// 只读观测：累计自愈恢复凭据的次数
+    pub total_count: u64,
+}
+
+/// 更新凭据自愈配置
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetSelfHealConfigRequest {
+    /// 是否启用自愈；缺省表示不修改
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// 最小冷却间隔（秒）；缺省表示不修改，0..=86400
+    #[serde(default)]
+    pub min_interval_secs: Option<u64>,
+    /// 最大连续轮数；缺省表示不修改，0..=1000
+    #[serde(default)]
+    pub max_consecutive_rounds: Option<u32>,
+}
+
 /// 日志治理配置响应
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]

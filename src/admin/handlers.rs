@@ -25,6 +25,7 @@ use super::{
         CreateClientKeyRequest, CreateClientKeyResponse, GlobalProxyResponse,
         SetAccountThrottleConfigRequest, SetDisabledRequest, SetGlobalProxyRequest,
         SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetPriorityRequest,
+        SetSelfHealConfigRequest,
         SetUpdateConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
         UpdateAdminKeyRequest, UpdateClientKeyRequest, UpdateCredentialRequest,
         UpdateRefreshTokenRequest,
@@ -537,6 +538,24 @@ pub async fn set_account_throttle_config(
     Json(payload): Json<SetAccountThrottleConfigRequest>,
 ) -> impl IntoResponse {
     match state.service.set_account_throttle_config(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/self-heal
+/// 获取凭据自愈配置（含只读观测值）
+pub async fn get_self_heal_config(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_self_heal_config())
+}
+
+/// PUT /api/admin/config/self-heal
+/// 更新凭据自愈配置（运行时生效 + 持久化 config.json）
+pub async fn set_self_heal_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetSelfHealConfigRequest>,
+) -> impl IntoResponse {
+    match state.service.set_self_heal_config(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

@@ -141,6 +141,30 @@ pub struct Config {
     #[serde(default = "default_account_throttle_cooldown_secs")]
     pub account_throttle_cooldown_secs: u64,
 
+    /// 是否启用凭据自愈（默认 true）。
+    ///
+    /// 当前请求的 model/group 作用域内没有可用凭据时，只恢复该作用域内因
+    /// `TooManyFailures` 被自动禁用、且仍满足冷却与轮数上限的凭据。
+    /// 关闭后：当前请求池全灭即直接失败，不做任何恢复尝试。
+    #[serde(default = "default_self_heal_enabled")]
+    pub self_heal_enabled: bool,
+
+    /// 同一凭据两次自愈之间的最小冷却间隔（秒，默认 300 = 5 分钟）。
+    ///
+    /// 冷却窗口内即使再次全灭也不触发自愈。这是打断
+    /// 「全禁 → 自愈 → 再失败 → 全禁」死循环的关键：持续故障时自愈频率被限到
+    /// 每 5 分钟一次，而不是每个请求都重置一遍并无效打上游。
+    /// 设为 `0` 表示不限冷却（回退到旧行为）。
+    #[serde(default = "default_self_heal_min_interval_secs")]
+    pub self_heal_min_interval_secs: u64,
+
+    /// 连续自愈的最大轮数（默认 5，`0` 表示不限）。
+    ///
+    /// 同一凭据连续自愈达到此值、且期间同一模型上没有出现成功调用时，停止自愈
+    /// 并输出错误日志提示人工介入。其它凭据、分组或模型上的成功不会清零该计数。
+    #[serde(default = "default_self_heal_max_consecutive_rounds")]
+    pub self_heal_max_consecutive_rounds: u32,
+
     /// 是否开启非流式响应的 thinking 块提取（默认 true）
     ///
     /// 启用后，非流式响应中的 `<thinking>...</thinking>` 标签会被解析为
@@ -228,6 +252,18 @@ fn default_account_throttle_cooldown_secs() -> u64 {
     30 * 60
 }
 
+fn default_self_heal_enabled() -> bool {
+    true
+}
+
+fn default_self_heal_min_interval_secs() -> u64 {
+    5 * 60
+}
+
+fn default_self_heal_max_consecutive_rounds() -> u32 {
+    5
+}
+
 fn default_update_auto_apply_time() -> String {
     "03:00".to_string()
 }
@@ -285,6 +321,9 @@ impl Default for Config {
             load_balancing_mode: default_load_balancing_mode(),
             account_throttle_failover: default_account_throttle_failover(),
             account_throttle_cooldown_secs: default_account_throttle_cooldown_secs(),
+            self_heal_enabled: default_self_heal_enabled(),
+            self_heal_min_interval_secs: default_self_heal_min_interval_secs(),
+            self_heal_max_consecutive_rounds: default_self_heal_max_consecutive_rounds(),
             extract_thinking: default_extract_thinking(),
             tool_compatibility_mode: default_tool_compatibility_mode(),
             default_endpoint: default_endpoint(),

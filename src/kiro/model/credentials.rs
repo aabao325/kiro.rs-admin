@@ -129,6 +129,31 @@ pub struct KiroCredentials {
     #[serde(default)]
     pub disabled: bool,
 
+    /// 禁用原因。与 `disabled` 一起持久化。
+    ///
+    /// 不持久化时，重启后所有被禁用的凭据都会被当成手动禁用，自动禁用的归因
+    /// （连续失败 / 额度用尽 / 自定义规则命中）全部丢失，自愈也无从判断哪些
+    /// 凭据该复活。取值为 `DisabledReason` 的字符串形式。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled_reason: Option<String>,
+
+    /// 当前凭据连续执行自愈的轮数。同一凭据同一模型上出现成功调用后清零。
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub self_heal_consecutive_rounds: u32,
+
+    /// 当前凭据累计被自愈恢复的次数，仅用于观测，不参与判断。
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub self_heal_total_count: u64,
+
+    /// 最近一次自愈时间（RFC3339）。持久化以便冷却窗口跨进程重启继续生效
+    /// —— 否则重启即可绕过冷却，死循环仍会成立。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_self_heal_at: Option<String>,
+
+    /// 触发当前连续自愈轮次的模型。`None` 表示 MCP / 无模型请求。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_heal_model: Option<String>,
+
     /// Kiro API Key（headless 模式）
     /// 格式: ksk_xxxxxxxx
     /// 设置后直接作为 Bearer Token 使用，无需 refreshToken
@@ -160,6 +185,11 @@ pub struct KiroCredentials {
 
 /// 判断是否为零（用于跳过序列化）
 fn is_zero(value: &u32) -> bool {
+    *value == 0
+}
+
+/// `is_zero` 的 u64 版本（自愈累计次数用）
+fn is_zero_u64(value: &u64) -> bool {
     *value == 0
 }
 
@@ -200,6 +230,14 @@ impl std::fmt::Debug for KiroCredentials {
             .field("proxy_username", &self.proxy_username)
             .field("proxy_password", &fmt_redacted(&self.proxy_password))
             .field("disabled", &self.disabled)
+            .field("disabled_reason", &self.disabled_reason)
+            .field(
+                "self_heal_consecutive_rounds",
+                &self.self_heal_consecutive_rounds,
+            )
+            .field("self_heal_total_count", &self.self_heal_total_count)
+            .field("last_self_heal_at", &self.last_self_heal_at)
+            .field("self_heal_model", &self.self_heal_model)
             .field("kiro_api_key", &fmt_redacted(&self.kiro_api_key))
             .field("endpoint", &self.endpoint)
             .field("groups", &self.groups)

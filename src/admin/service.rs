@@ -29,7 +29,8 @@ use super::types::{
     CredentialsExportResponse,
     LoadBalancingModeResponse, LogGovernanceConfigResponse, PollIdcLoginResponse,
     ProxyCheckAllResponse, ProxyCheckResponse, ProxyPoolEntry, ProxyPoolResponse,
-    QuotaExceededResult, SetAccountThrottleConfigRequest, SetLoadBalancingModeRequest,
+    QuotaExceededResult, SelfHealConfigResponse, SetAccountThrottleConfigRequest,
+    SetLoadBalancingModeRequest, SetSelfHealConfigRequest,
     SetLogGovernanceConfigRequest, SetUpdateConfigRequest, StartIdcLoginRequest,
     StartIdcLoginResponse, StartSocialLoginRequest, StartSocialLoginResponse, UpdateCheckInfo,
     UpdateConfigResponse, UpdateCredentialRequest, UpdateRefreshTokenRequest,
@@ -1080,6 +1081,12 @@ impl AdminService {
             proxy_username: req.proxy_username,
             proxy_password: req.proxy_password,
             disabled: false, // 新添加的凭据默认启用
+            disabled_reason: None,
+            // 新凭据没有自愈历史
+            self_heal_consecutive_rounds: 0,
+            self_heal_total_count: 0,
+            last_self_heal_at: None,
+            self_heal_model: None,
             kiro_api_key: req.kiro_api_key,
             endpoint: req.endpoint,
             groups: req.groups,
@@ -1871,6 +1878,46 @@ impl AdminService {
             .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
 
         Ok(self.get_account_throttle_config())
+    }
+
+    /// 读取凭据自愈配置（含只读观测值）
+    pub fn get_self_heal_config(&self) -> SelfHealConfigResponse {
+        let (enabled, min_interval_secs, max_consecutive_rounds) =
+            self.token_manager.get_self_heal_config();
+        let (consecutive_rounds, total_count) = self.token_manager.get_self_heal_observed();
+        SelfHealConfigResponse {
+            enabled,
+            min_interval_secs,
+            max_consecutive_rounds,
+            consecutive_rounds,
+            total_count,
+        }
+    }
+
+    /// 更新凭据自愈配置：改运行时原子值 + 持久化到 config.json。
+    /// 任一字段缺省表示不修改。
+    pub fn set_self_heal_config(
+        &self,
+        req: SetSelfHealConfigRequest,
+    ) -> Result<SelfHealConfigResponse, AdminServiceError> {
+        if req.enabled.is_none()
+            && req.min_interval_secs.is_none()
+            && req.max_consecutive_rounds.is_none()
+        {
+            return Err(AdminServiceError::InvalidCredential(
+                "至少提供 enabled、minIntervalSecs 或 maxConsecutiveRounds 一个字段".to_string(),
+            ));
+        }
+
+        self.token_manager
+            .set_self_heal_config(
+                req.enabled,
+                req.min_interval_secs,
+                req.max_consecutive_rounds,
+            )
+            .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
+
+        Ok(self.get_self_heal_config())
     }
 
     /// 读取日志治理配置（trace 开关 / trace 保留天数 / usage 保留天数）

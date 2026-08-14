@@ -17,11 +17,13 @@ use super::{
         export_credentials, force_refresh_token, get_account_throttle_config,
         get_all_credentials, get_cache_force_config, get_credential_balance, get_credential_models,
         get_global_proxy, get_load_balancing_mode, get_log_governance_config, get_proxy_pool,
-        get_update_config, list_client_keys, list_groups, list_traces, trace_failure_stats,
+        get_self_heal_config, get_update_config, list_client_keys, list_groups, list_traces,
+        trace_failure_stats,
         poll_idc_login, poll_idc_relogin, poll_social_login,
         poll_social_relogin, pull_update_image, reset_all_success_count, reset_client_key_stats,
         reset_failure_count, reset_success_count, rollback_image_update, rotate_client_key,
         set_account_throttle_config, set_cache_force_config, set_client_key_disabled,
+        set_self_heal_config,
         set_credential_disabled, set_credential_overage, set_credential_priority,
         set_global_proxy, set_load_balancing_mode, set_log_governance_config, set_proxy_enabled,
         set_update_config, start_idc_login, start_idc_relogin, start_social_login,
@@ -53,6 +55,8 @@ const MAX_ADMIN_BODY_SIZE: usize = 50 * 1024 * 1024;
 /// - `GET /credentials/:id/balance` - 获取凭据余额
 /// - `GET /config/load-balancing` - 获取负载均衡模式
 /// - `PUT /config/load-balancing` - 设置负载均衡模式
+/// - `GET /config/self-heal` - 获取凭据自愈配置（含只读观测值）
+/// - `PUT /config/self-heal` - 设置凭据自愈配置
 ///
 /// # 认证
 /// 需要登录API密钥认证，支持：
@@ -105,6 +109,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route(
             "/config/account-throttle",
             get(get_account_throttle_config).put(set_account_throttle_config),
+        )
+        .route(
+            "/config/self-heal",
+            get(get_self_heal_config).put(set_self_heal_config),
         )
         .route(
             "/config/log-governance",

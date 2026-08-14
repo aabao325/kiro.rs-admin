@@ -564,7 +564,10 @@ impl KiroProvider {
                     sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()),
                     outcome::SUCCESS, None, attempt_start,
                 );
-                self.token_manager.report_success(ctx.id);
+                // 带上 model：自愈的连续轮数按模型归属，只有同一模型上的成功
+                // 才能清零该凭据的轮数（见 report_success_for_request）。
+                self.token_manager
+                    .report_success_for_request(ctx.id, model.as_deref());
                 return Ok(KiroCallResult {
                     response,
                     credential_id: ctx.id,

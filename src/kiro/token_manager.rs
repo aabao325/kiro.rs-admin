@@ -13,7 +13,7 @@ use tokio::sync::Mutex as TokioMutex;
 use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, build_client};
@@ -892,6 +892,26 @@ struct CredentialEntry {
     /// `Some(t)` 且 `t > now()` 时视为不可用；`t <= now()` 时自动恢复。
     /// 不持久化，进程重启后清空。
     throttled_until: Option<Instant>,
+    /// 当前连续自愈轮数。同一凭据同一模型上出现成功调用后清零。
+    self_heal_consecutive_rounds: u32,
+    /// 累计被自愈恢复的次数，仅用于观测。手动重置失败计数不清零。
+    self_heal_total_count: u64,
+    /// 最近一次自愈时间。持久化以便冷却窗口跨重启生效。
+    last_self_heal_at: Option<DateTime<Utc>>,
+    /// 触发当前连续自愈轮次的模型。`None` 表示 MCP / 无模型请求。
+    self_heal_model: Option<String>,
+}
+
+impl CredentialEntry {
+    /// 清空连续自愈状态（成功调用后调用）。
+    ///
+    /// 只清「连续轮数 / 上次时间 / 关联模型」，**不清** `self_heal_total_count`
+    /// —— 后者是累计观测值，需要跨自愈周期保留。
+    fn clear_self_heal_streak(&mut self) {
+        self.self_heal_consecutive_rounds = 0;
+        self.last_self_heal_at = None;
+        self.self_heal_model = None;
+    }
 }
 
 /// 禁用原因
@@ -909,6 +929,35 @@ enum DisabledReason {
     InvalidRefreshToken,
     /// 凭据配置无效（如 authMethod=api_key 但缺少 kiroApiKey）
     InvalidConfig,
+}
+
+impl DisabledReason {
+    /// 持久化用的稳定字符串。改动取值会让已落盘的 credentials.json 失配，
+    /// 反序列化时退化成 `None`（即"禁用但原因未知"），不要随意重命名。
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Manual => "Manual",
+            Self::TooManyFailures => "TooManyFailures",
+            Self::TooManyRefreshFailures => "TooManyRefreshFailures",
+            Self::QuotaExceeded => "QuotaExceeded",
+            Self::InvalidRefreshToken => "InvalidRefreshToken",
+            Self::InvalidConfig => "InvalidConfig",
+        }
+    }
+
+    /// 从持久化字符串还原。未知取值返回 `None`，调用方据此保留
+    /// "已禁用但原因不明"的状态，而不是猜成手动禁用。
+    fn from_persisted(value: &str) -> Option<Self> {
+        match value {
+            "Manual" => Some(Self::Manual),
+            "TooManyFailures" => Some(Self::TooManyFailures),
+            "TooManyRefreshFailures" => Some(Self::TooManyRefreshFailures),
+            "QuotaExceeded" => Some(Self::QuotaExceeded),
+            "InvalidRefreshToken" => Some(Self::InvalidRefreshToken),
+            "InvalidConfig" => Some(Self::InvalidConfig),
+            _ => None,
+        }
+    }
 }
 
 /// 统计数据持久化条目
@@ -1026,6 +1075,12 @@ pub struct MultiTokenManager {
     account_throttle_failover: AtomicBool,
     /// 账号级风控冷却时长（秒，运行时可修改）
     account_throttle_cooldown_secs: AtomicU64,
+    /// 凭据自愈总开关（运行时可修改）
+    self_heal_enabled: AtomicBool,
+    /// 同一凭据两次自愈的最小冷却间隔（秒，运行时可修改，0 = 不限）
+    self_heal_min_interval_secs: AtomicU64,
+    /// 连续自愈最大轮数（运行时可修改，0 = 不限）
+    self_heal_max_consecutive_rounds: AtomicU32,
     /// 最近一次统计持久化时间（用于 debounce）
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
@@ -1049,6 +1104,17 @@ pub struct CallContext {
     pub credentials: KiroCredentials,
     /// 访问 Token
     pub token: String,
+}
+
+/// 规范化自愈连续轮次绑定的模型名。
+///
+/// 大小写与首尾空白不应把同一个模型拆成两条独立的故障线，否则轮数上限会被
+/// 绕过。空串等同于"无模型"（MCP 请求）。
+fn normalize_self_heal_model(model: Option<&str>) -> Option<String> {
+    model
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .map(|m| m.to_ascii_lowercase())
 }
 
 /// 判断某账号的分组集合是否匹配请求所属分组（严格隔离）
@@ -1120,6 +1186,22 @@ impl MultiTokenManager {
                         Some(machine_id::generate_from_credentials(&cred, config_ref));
                     has_new_machine_ids = true;
                 }
+                // 禁用原因从文件还原：老版本文件没有 disabledReason 字段，
+                // 此时无法区分手动禁用与自动禁用，沿用旧行为按 Manual 处理
+                // （偏保守：Manual 不参与自愈，不会在重启后擅自复活凭据）。
+                let disabled_reason = if cred.disabled {
+                    cred.disabled_reason
+                        .as_deref()
+                        .and_then(DisabledReason::from_persisted)
+                        .or(Some(DisabledReason::Manual))
+                } else {
+                    None
+                };
+                let last_self_heal_at = cred
+                    .last_self_heal_at
+                    .as_deref()
+                    .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                    .map(|value| value.with_timezone(&Utc));
                 CredentialEntry {
                     id,
                     credentials: cred.clone(),
@@ -1127,14 +1209,14 @@ impl MultiTokenManager {
                     total_failure_count: 0,
                     refresh_failure_count: 0,
                     disabled: cred.disabled, // 从配置文件读取 disabled 状态
-                    disabled_reason: if cred.disabled {
-                        Some(DisabledReason::Manual)
-                    } else {
-                        None
-                    },
+                    disabled_reason,
                     success_count: 0,
                     last_used_at: None,
                     throttled_until: None,
+                    self_heal_consecutive_rounds: cred.self_heal_consecutive_rounds,
+                    self_heal_total_count: cred.self_heal_total_count,
+                    last_self_heal_at,
+                    self_heal_model: cred.self_heal_model.clone(),
                 }
             })
             .collect();
@@ -1182,6 +1264,9 @@ impl MultiTokenManager {
         let load_balancing_mode = config.load_balancing_mode.clone();
         let throttle_failover = config.account_throttle_failover;
         let throttle_cooldown_secs = config.account_throttle_cooldown_secs;
+        let self_heal_enabled = config.self_heal_enabled;
+        let self_heal_min_interval_secs = config.self_heal_min_interval_secs;
+        let self_heal_max_consecutive_rounds = config.self_heal_max_consecutive_rounds;
         let manager = Self {
             config,
             proxy: Mutex::new(proxy),
@@ -1195,6 +1280,9 @@ impl MultiTokenManager {
             load_balancing_mode: Mutex::new(load_balancing_mode),
             account_throttle_failover: AtomicBool::new(throttle_failover),
             account_throttle_cooldown_secs: AtomicU64::new(throttle_cooldown_secs),
+            self_heal_enabled: AtomicBool::new(self_heal_enabled),
+            self_heal_min_interval_secs: AtomicU64::new(self_heal_min_interval_secs),
+            self_heal_max_consecutive_rounds: AtomicU32::new(self_heal_max_consecutive_rounds),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
         };
@@ -1373,25 +1461,9 @@ impl MultiTokenManager {
                     // 当前凭据不可用或 balanced 模式，根据负载均衡策略选择
                     let mut best = self.select_next_credential(model, group);
 
-                    // 没有可用凭据：如果是"自动禁用导致全灭"，做一次类似重启的自愈
-                    if best.is_none() {
-                        let mut entries = self.entries.lock();
-                        if entries.iter().any(|e| {
-                            e.disabled && e.disabled_reason == Some(DisabledReason::TooManyFailures)
-                        }) {
-                            tracing::warn!(
-                                "所有凭据均已被自动禁用，执行自愈：重置失败计数并重新启用（等价于重启）"
-                            );
-                            for e in entries.iter_mut() {
-                                if e.disabled_reason == Some(DisabledReason::TooManyFailures) {
-                                    e.disabled = false;
-                                    e.disabled_reason = None;
-                                    e.failure_count = 0;
-                                }
-                            }
-                            drop(entries);
-                            best = self.select_next_credential(model, group);
-                        }
+                    // 没有可用凭据：尝试受控自愈（冷却 + 连续轮数上限，见 try_self_heal）
+                    if best.is_none() && self.try_self_heal(model, group) {
+                        best = self.select_next_credential(model, group);
                     }
 
                     if let Some((new_id, new_creds)) = best {
@@ -1616,6 +1688,15 @@ impl MultiTokenManager {
                     cred.canonicalize_auth_method();
                     // 同步 disabled 状态到凭据对象
                     cred.disabled = e.disabled;
+                    // 禁用原因随 disabled 一起落盘，否则重启后自动禁用会被误判为
+                    // 手动禁用，自愈无从判断哪些凭据可以恢复。
+                    cred.disabled_reason = e.disabled_reason.map(|r| r.as_str().to_string());
+                    // 自愈状态持久化：冷却窗口与连续轮数上限必须跨重启生效，
+                    // 否则重启即可绕过限制，死循环仍然成立。
+                    cred.self_heal_consecutive_rounds = e.self_heal_consecutive_rounds;
+                    cred.self_heal_total_count = e.self_heal_total_count;
+                    cred.last_self_heal_at = e.last_self_heal_at.map(|t| t.to_rfc3339());
+                    cred.self_heal_model = e.self_heal_model.clone();
                     cred
                 })
                 .collect()
@@ -1857,29 +1938,59 @@ impl MultiTokenManager {
         }
     }
 
-    /// 报告指定凭据 API 调用成功
+    /// 报告指定凭据 API 调用成功（无模型上下文，如 MCP 请求）
     ///
     /// 重置该凭据的失败计数
     ///
     /// # Arguments
     /// * `id` - 凭据 ID（来自 CallContext）
     pub fn report_success(&self, id: u64) {
-        {
+        self.report_success_for_request(id, None);
+    }
+
+    /// 报告指定凭据 API 调用成功，并携带本次请求的模型。
+    ///
+    /// `model` 只用于自愈连续轮数的清零判断：只有当成功发生在**触发该连续轮次的
+    /// 同一模型**上时才清零。否则「模型 A 正常、模型 B 持续失败」的场景下，A 的
+    /// 成功会不断清掉 B 累积的轮数，让轮数上限永远达不到、死循环得以延续。
+    pub fn report_success_for_request(&self, id: u64, model: Option<&str>) {
+        let requested_model = normalize_self_heal_model(model);
+        let cleared_self_heal = {
             let mut entries = self.entries.lock();
-            if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                entry.failure_count = 0;
-                entry.refresh_failure_count = 0;
-                entry.success_count += 1;
-                entry.last_used_at = Some(Utc::now().to_rfc3339());
-                // 成功 = 风控已解除，提前结束冷却
-                entry.throttled_until = None;
-                tracing::debug!(
-                    "凭据 #{} API 调用成功（累计 {} 次）",
-                    id,
-                    entry.success_count
-                );
+            match entries.iter_mut().find(|e| e.id == id) {
+                Some(entry) => {
+                    entry.failure_count = 0;
+                    entry.refresh_failure_count = 0;
+                    entry.success_count += 1;
+                    entry.last_used_at = Some(Utc::now().to_rfc3339());
+                    // 成功 = 风控已解除，提前结束冷却
+                    entry.throttled_until = None;
+                    tracing::debug!(
+                        "凭据 #{} API 调用成功（累计 {} 次）",
+                        id,
+                        entry.success_count
+                    );
+
+                    // 同一模型上恢复正常 → 该凭据的连续自愈轮次视为已收敛
+                    let should_clear = entry.self_heal_consecutive_rounds > 0
+                        && entry.self_heal_model == requested_model;
+                    if should_clear {
+                        entry.clear_self_heal_streak();
+                    }
+                    should_clear
+                }
+                None => false,
             }
+        };
+
+        // 连续轮数状态是持久化的，清零后必须落盘，否则重启会读回旧的高轮数、
+        // 把一个已经恢复正常的凭据判成"已达上限、拒绝自愈"。
+        if cleared_self_heal
+            && let Err(e) = self.persist_credentials()
+        {
+            tracing::warn!("自愈状态清零后持久化失败: {}", e);
         }
+
         self.save_stats_debounced();
     }
 
@@ -2220,17 +2331,9 @@ impl MultiTokenManager {
                     has_proxy: e.credentials.proxy_url.is_some(),
                     proxy_url: e.credentials.proxy_url.clone(),
                     refresh_failure_count: e.refresh_failure_count,
-                    disabled_reason: e.disabled_reason.map(|r| {
-                        match r {
-                            DisabledReason::Manual => "Manual",
-                            DisabledReason::TooManyFailures => "TooManyFailures",
-                            DisabledReason::TooManyRefreshFailures => "TooManyRefreshFailures",
-                            DisabledReason::QuotaExceeded => "QuotaExceeded",
-                            DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
-                            DisabledReason::InvalidConfig => "InvalidConfig",
-                        }
-                        .to_string()
-                    }),
+                    // 与持久化用同一套字符串（DisabledReason::as_str），避免两处
+                    // match 各自演化后面板显示与落盘取值不一致。
+                    disabled_reason: e.disabled_reason.map(|r| r.as_str().to_string()),
                     throttled_remaining_secs: e
                         .throttled_until
                         .and_then(|t| t.checked_duration_since(now))
@@ -2262,6 +2365,11 @@ impl MultiTokenManager {
                 entry.refresh_failure_count = 0;
                 entry.disabled_reason = None;
                 entry.throttled_until = None;
+                // 人工手动启用视为故障线已处理，清掉连续自愈轮数，让该凭据重新
+                // 获得完整的自愈配额（累计次数 self_heal_total_count 保留，
+                // 那是观测值）。否则一个曾达上限的凭据即使人工恢复，下次全灭时
+                // 仍会被判成"已达上限、拒绝自愈"。
+                entry.clear_self_heal_streak();
             } else {
                 entry.disabled_reason = Some(DisabledReason::Manual);
             }
@@ -2383,6 +2491,8 @@ impl MultiTokenManager {
             entry.disabled = false;
             entry.disabled_reason = None;
             entry.throttled_until = None;
+            // 与 set_disabled 一致：人工重置视为故障线终结，归还完整自愈配额。
+            entry.clear_self_heal_streak();
         }
         // 持久化更改
         self.persist_credentials()?;
@@ -2970,6 +3080,11 @@ impl MultiTokenManager {
                 success_count: 0,
                 last_used_at: None,
                 throttled_until: None,
+                // 新凭据没有自愈历史
+                self_heal_consecutive_rounds: 0,
+                self_heal_total_count: 0,
+                last_self_heal_at: None,
+                self_heal_model: None,
             });
         }
 
@@ -3407,6 +3522,221 @@ impl MultiTokenManager {
 
         Ok(())
     }
+
+    /// 读取自愈配置（Admin API）。返回 (启用, 最小间隔秒, 最大连续轮数)。
+    pub fn get_self_heal_config(&self) -> (bool, u64, u32) {
+        (
+            self.self_heal_enabled.load(Ordering::Relaxed),
+            self.self_heal_min_interval_secs.load(Ordering::Relaxed),
+            self.self_heal_max_consecutive_rounds
+                .load(Ordering::Relaxed),
+        )
+    }
+
+    /// 自愈的只读观测值（Admin API）：(当前最大连续轮数, 累计自愈次数)。
+    ///
+    /// 连续轮数取所有凭据中的最大值 —— 面板关心的是"有没有凭据卡在上限附近"，
+    /// 而不是逐个凭据的明细。
+    pub fn get_self_heal_observed(&self) -> (u32, u64) {
+        let entries = self.entries.lock();
+        let max_rounds = entries
+            .iter()
+            .map(|e| e.self_heal_consecutive_rounds)
+            .max()
+            .unwrap_or(0);
+        let total = entries
+            .iter()
+            .map(|e| e.self_heal_total_count)
+            .fold(0u64, |acc, v| acc.saturating_add(v));
+        (max_rounds, total)
+    }
+
+    /// 设置自愈配置（Admin API）。任一参数传 `None` 表示不修改该字段。
+    pub fn set_self_heal_config(
+        &self,
+        enabled: Option<bool>,
+        min_interval_secs: Option<u64>,
+        max_consecutive_rounds: Option<u32>,
+    ) -> anyhow::Result<()> {
+        if let Some(secs) = min_interval_secs {
+            // 0 = 不限冷却；上限 24 小时，避免误填成毫秒之类的巨值把自愈彻底冻死
+            if secs > 86_400 {
+                anyhow::bail!("自愈最小间隔必须在 0..=86400 秒内: {}", secs);
+            }
+        }
+        if let Some(rounds) = max_consecutive_rounds {
+            // 0 = 不限轮数；上限取一个明显足够大的值防误填
+            if rounds > 1_000 {
+                anyhow::bail!("自愈最大连续轮数必须在 0..=1000 内: {}", rounds);
+            }
+        }
+
+        let (prev_enabled, prev_interval, prev_rounds) = self.get_self_heal_config();
+        let new_enabled = enabled.unwrap_or(prev_enabled);
+        let new_interval = min_interval_secs.unwrap_or(prev_interval);
+        let new_rounds = max_consecutive_rounds.unwrap_or(prev_rounds);
+
+        if new_enabled == prev_enabled
+            && new_interval == prev_interval
+            && new_rounds == prev_rounds
+        {
+            return Ok(());
+        }
+
+        self.self_heal_enabled.store(new_enabled, Ordering::Relaxed);
+        self.self_heal_min_interval_secs
+            .store(new_interval, Ordering::Relaxed);
+        self.self_heal_max_consecutive_rounds
+            .store(new_rounds, Ordering::Relaxed);
+
+        if let Err(err) = self.persist_self_heal_config(new_enabled, new_interval, new_rounds) {
+            // 回滚内存值，保证内存与磁盘一致
+            self.self_heal_enabled
+                .store(prev_enabled, Ordering::Relaxed);
+            self.self_heal_min_interval_secs
+                .store(prev_interval, Ordering::Relaxed);
+            self.self_heal_max_consecutive_rounds
+                .store(prev_rounds, Ordering::Relaxed);
+            return Err(err);
+        }
+
+        tracing::info!(
+            "凭据自愈配置已更新: enabled={}, min_interval_secs={}, max_consecutive_rounds={}",
+            new_enabled,
+            new_interval,
+            new_rounds
+        );
+        Ok(())
+    }
+
+    fn persist_self_heal_config(
+        &self,
+        enabled: bool,
+        min_interval_secs: u64,
+        max_consecutive_rounds: u32,
+    ) -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        let config_path = match self.config.config_path() {
+            Some(path) => path.to_path_buf(),
+            None => {
+                tracing::warn!("配置文件路径未知，自愈配置仅在当前进程生效");
+                return Ok(());
+            }
+        };
+
+        let mut config = Config::load(&config_path)
+            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
+        config.self_heal_enabled = enabled;
+        config.self_heal_min_interval_secs = min_interval_secs;
+        config.self_heal_max_consecutive_rounds = max_consecutive_rounds;
+        config
+            .save()
+            .with_context(|| format!("持久化自愈配置失败: {}", config_path.display()))?;
+
+        Ok(())
+    }
+
+    /// 受控的凭据自愈。
+    ///
+    /// 当前请求的 model/group 作用域没有可用凭据时，在以下约束下恢复该作用域内
+    /// 因 [`DisabledReason::TooManyFailures`] 被自动禁用的凭据：
+    ///
+    /// - `self_heal_enabled` 关闭时完全不自愈；
+    /// - 每个凭据独立计算连续轮数与冷却，状态跨重启持久化；
+    /// - 只有同一凭据、同一模型上的成功才清零连续轮数（见
+    ///   [`Self::report_success_for_request`]）；
+    /// - 只复活 `TooManyFailures`；手动禁用、额度用尽、token 失效等其它原因
+    ///   禁用的凭据一概不动。
+    ///
+    /// 替代了旧的"全灭即无条件重置全部凭据"实现：那种做法没有冷却也没有上限，
+    /// 持续故障时会形成 `全禁 → 自愈 → 再失败 → 全禁` 的紧密死循环，
+    /// 表现为日志刷屏、无效打上游、面板状态抖动。
+    ///
+    /// 返回本次是否实际恢复了凭据（调用方据此决定要不要重新选取）。
+    fn try_self_heal(&self, model: Option<&str>, group: Option<&str>) -> bool {
+        if !self.self_heal_enabled.load(Ordering::Relaxed) {
+            tracing::debug!("当前请求没有可用凭据，但凭据自愈已关闭");
+            return false;
+        }
+
+        let max_rounds = self
+            .self_heal_max_consecutive_rounds
+            .load(Ordering::Relaxed);
+        let min_interval = self.self_heal_min_interval_secs.load(Ordering::Relaxed);
+        let requested_model = normalize_self_heal_model(model);
+        let now = Utc::now();
+        let mut recovered = Vec::new();
+        let mut max_blocked = Vec::new();
+
+        {
+            let mut entries = self.entries.lock();
+            for entry in entries.iter_mut() {
+                if !entry.disabled
+                    || entry.disabled_reason != Some(DisabledReason::TooManyFailures)
+                    || !credential_matches_request(&entry.credentials, model, group)
+                {
+                    continue;
+                }
+
+                // 连续轮次绑定在具体模型上：模型不同说明是另一条故障线，
+                // 不能共用同一个轮数配额。
+                if entry.self_heal_consecutive_rounds > 0
+                    && entry.self_heal_model != requested_model
+                {
+                    continue;
+                }
+
+                if max_rounds > 0 && entry.self_heal_consecutive_rounds >= max_rounds {
+                    max_blocked.push((entry.id, entry.self_heal_consecutive_rounds));
+                    continue;
+                }
+
+                // 冷却窗口内不重复自愈。这是打断死循环的核心约束。
+                if let Some(previous) = entry.last_self_heal_at {
+                    let elapsed = now.signed_duration_since(previous).num_seconds();
+                    if elapsed < min_interval as i64 {
+                        continue;
+                    }
+                }
+
+                entry.self_heal_consecutive_rounds =
+                    entry.self_heal_consecutive_rounds.saturating_add(1);
+                entry.self_heal_total_count = entry.self_heal_total_count.saturating_add(1);
+                entry.last_self_heal_at = Some(now);
+                entry.self_heal_model = requested_model.clone();
+                entry.disabled = false;
+                entry.disabled_reason = None;
+                entry.failure_count = 0;
+                recovered.push((entry.id, entry.self_heal_consecutive_rounds));
+            }
+        }
+
+        for (id, rounds) in max_blocked {
+            tracing::error!(
+                "凭据 #{} 已连续自愈 {} 轮仍无成功调用（上限 {}），保持禁用并等待人工处理",
+                id,
+                rounds,
+                max_rounds
+            );
+        }
+
+        if recovered.is_empty() {
+            return false;
+        }
+
+        tracing::warn!(
+            model = model.unwrap_or("<none>"),
+            group = group.unwrap_or("<all>"),
+            recovered_count = recovered.len(),
+            recovered = ?recovered,
+            "当前请求作用域无可用凭据，执行受控自愈"
+        );
+        if let Err(error) = self.persist_credentials() {
+            tracing::warn!("自愈状态持久化失败: {}", error);
+        }
+        true
+    }
 }
 
 impl Drop for MultiTokenManager {
@@ -3728,6 +4058,225 @@ mod tests {
         assert!(manager.report_failure(2));
         assert!(!manager.report_failure(2)); // 所有凭据都禁用了
         assert_eq!(manager.available_count(), 0);
+    }
+
+    /// 自愈受冷却约束：同一凭据在 `min_interval_secs` 窗口内只自愈一次。
+    ///
+    /// 这是旧实现最要命的缺失——没有冷却时，持续故障会形成
+    /// `全禁 → 自愈 → 再失败 → 全禁` 的紧密死循环，每个请求都触发一轮。
+    #[test]
+    fn self_heal_respects_cooldown_window() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        // 连续失败到自动禁用
+        for _ in 0..MAX_FAILURES_PER_CREDENTIAL {
+            manager.report_failure(1);
+        }
+        assert_eq!(manager.available_count(), 0, "应已被自动禁用");
+
+        // 第一次自愈：冷却窗口内没有历史记录，允许恢复
+        assert!(manager.try_self_heal(None, None), "首次应允许自愈");
+        assert_eq!(manager.available_count(), 1);
+
+        // 再次禁用后立刻尝试：默认 300 秒冷却未过，必须拒绝
+        for _ in 0..MAX_FAILURES_PER_CREDENTIAL {
+            manager.report_failure(1);
+        }
+        assert!(
+            !manager.try_self_heal(None, None),
+            "冷却窗口内不应重复自愈"
+        );
+        assert_eq!(manager.available_count(), 0, "应保持禁用");
+    }
+
+    /// 连续轮数达上限后停止自愈，等待人工处理。
+    #[test]
+    fn self_heal_stops_at_max_consecutive_rounds() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        // 关掉冷却、上限设为 2，单独验证轮数约束
+        manager.set_self_heal_config(None, Some(0), Some(2)).unwrap();
+
+        for round in 1..=2 {
+            for _ in 0..MAX_FAILURES_PER_CREDENTIAL {
+                manager.report_failure(1);
+            }
+            assert!(
+                manager.try_self_heal(None, None),
+                "第 {round} 轮应允许自愈"
+            );
+        }
+
+        // 第 3 轮：已达上限
+        for _ in 0..MAX_FAILURES_PER_CREDENTIAL {
+            manager.report_failure(1);
+        }
+        assert!(
+            !manager.try_self_heal(None, None),
+            "达到最大连续轮数后不应继续自愈"
+        );
+
+        let (rounds, total) = manager.get_self_heal_observed();
+        assert_eq!(rounds, 2, "连续轮数应停在上限");
+        assert_eq!(total, 2, "累计自愈次数应为 2");
+    }
+
+    /// 关闭总开关后完全不自愈。
+    #[test]
+    fn self_heal_disabled_switch_blocks_recovery() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        manager
+            .set_self_heal_config(Some(false), None, None)
+            .unwrap();
+
+        for _ in 0..MAX_FAILURES_PER_CREDENTIAL {
+            manager.report_failure(1);
+        }
+        assert!(!manager.try_self_heal(None, None), "开关关闭时不应自愈");
+        assert_eq!(manager.available_count(), 0);
+    }
+
+    /// 只有同一模型上的成功才清零连续轮数。
+    ///
+    /// 否则「模型 A 正常、模型 B 持续失败」时，A 的成功会不断清掉 B 累积的轮数，
+    /// 轮数上限永远达不到，死循环得以延续。
+    #[test]
+    fn self_heal_streak_cleared_only_by_same_model_success() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        manager.set_self_heal_config(None, Some(0), Some(5)).unwrap();
+
+        for _ in 0..MAX_FAILURES_PER_CREDENTIAL {
+            manager.report_failure(1);
+        }
+        // 在模型 B 上自愈，连续轮数归属 model-b
+        assert!(manager.try_self_heal(Some("model-b"), None));
+        assert_eq!(manager.get_self_heal_observed().0, 1);
+
+        // 模型 A 的成功不应清零 model-b 的轮数
+        manager.report_success_for_request(1, Some("model-a"));
+        assert_eq!(
+            manager.get_self_heal_observed().0,
+            1,
+            "其它模型的成功不应清零轮数"
+        );
+
+        // 同一模型（大小写/空白不敏感）的成功才清零
+        manager.report_success_for_request(1, Some("  MODEL-B "));
+        assert_eq!(
+            manager.get_self_heal_observed().0,
+            0,
+            "同一模型的成功应清零轮数"
+        );
+    }
+
+    /// 只复活 TooManyFailures：手动禁用与额度用尽不受自愈影响。
+    #[test]
+    fn self_heal_only_revives_too_many_failures() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![KiroCredentials::default(), KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        manager.set_self_heal_config(None, Some(0), Some(0)).unwrap();
+
+        manager.set_disabled(1, true).unwrap(); // Manual
+        manager.report_quota_exhausted(2); // QuotaExceeded
+        assert_eq!(manager.available_count(), 0);
+
+        assert!(
+            !manager.try_self_heal(None, None),
+            "手动禁用与额度用尽都不该被自愈复活"
+        );
+        assert_eq!(manager.available_count(), 0);
+    }
+
+    /// 人工重置应归还完整自愈配额（清连续轮数），但保留累计观测值。
+    #[test]
+    fn manual_reset_clears_streak_but_keeps_total() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        manager.set_self_heal_config(None, Some(0), Some(1)).unwrap();
+
+        for _ in 0..MAX_FAILURES_PER_CREDENTIAL {
+            manager.report_failure(1);
+        }
+        assert!(manager.try_self_heal(None, None));
+        assert_eq!(manager.get_self_heal_observed(), (1, 1));
+
+        // 达上限后本应拒绝
+        for _ in 0..MAX_FAILURES_PER_CREDENTIAL {
+            manager.report_failure(1);
+        }
+        assert!(!manager.try_self_heal(None, None));
+
+        // 人工重置后重新获得配额
+        manager.reset_and_enable(1).unwrap();
+        let (rounds, total) = manager.get_self_heal_observed();
+        assert_eq!(rounds, 0, "连续轮数应清零");
+        assert_eq!(total, 1, "累计次数应保留");
+
+        for _ in 0..MAX_FAILURES_PER_CREDENTIAL {
+            manager.report_failure(1);
+        }
+        assert!(manager.try_self_heal(None, None), "重置后应可再次自愈");
+    }
+
+    /// 自愈配置的越界值应被拒绝，且不改动内存状态。
+    #[test]
+    fn self_heal_config_rejects_out_of_range() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let before = manager.get_self_heal_config();
+        assert!(manager.set_self_heal_config(None, Some(86_401), None).is_err());
+        assert!(manager.set_self_heal_config(None, None, Some(1_001)).is_err());
+        assert_eq!(manager.get_self_heal_config(), before, "失败不应改动配置");
+
+        // 0 是合法值（表示不限）
+        assert!(manager.set_self_heal_config(None, Some(0), Some(0)).is_ok());
+        assert_eq!(manager.get_self_heal_config(), (true, 0, 0));
     }
 
     #[test]
