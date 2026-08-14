@@ -431,6 +431,38 @@ export async function setAccountThrottleConfig(
   return data
 }
 
+export interface SelfHealConfig {
+  /** 是否启用凭据自愈 */
+  enabled: boolean
+  /** 同一凭据两次自愈的最小冷却间隔（秒，0 = 不限） */
+  minIntervalSecs: number
+  /** 连续自愈最大轮数（0 = 不限） */
+  maxConsecutiveRounds: number
+  /** 只读观测：当前所有凭据中的最大连续自愈轮数 */
+  consecutiveRounds: number
+  /** 只读观测：累计自愈恢复凭据的次数 */
+  totalCount: number
+}
+
+/** 可写字段（观测值由服务端返回，不参与提交） */
+export type SelfHealConfigPatch = Partial<
+  Pick<SelfHealConfig, 'enabled' | 'minIntervalSecs' | 'maxConsecutiveRounds'>
+>
+
+// 获取凭据自愈配置（含只读观测值）
+export async function getSelfHealConfig(): Promise<SelfHealConfig> {
+  const { data } = await api.get<SelfHealConfig>('/config/self-heal')
+  return data
+}
+
+// 更新凭据自愈配置
+export async function setSelfHealConfig(
+  patch: SelfHealConfigPatch,
+): Promise<SelfHealConfig> {
+  const { data } = await api.put<SelfHealConfig>('/config/self-heal', patch)
+  return data
+}
+
 export interface LogGovernanceConfig {
   traceEnabled: boolean
   traceRetentionDays: number

@@ -16,6 +16,8 @@ import {
   setLoadBalancingMode,
   getAccountThrottleConfig,
   setAccountThrottleConfig,
+  getSelfHealConfig,
+  setSelfHealConfig,
   getLogGovernanceConfig,
   setLogGovernanceConfig,
   resetSuccessCount,
@@ -211,6 +213,28 @@ export function useSetAccountThrottleConfig() {
     mutationFn: setAccountThrottleConfig,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['accountThrottleConfig'] })
+    },
+  })
+}
+
+// 获取凭据自愈配置（含只读观测值）
+export function useSelfHealConfig() {
+  return useQuery({
+    queryKey: ['selfHealConfig'],
+    queryFn: getSelfHealConfig,
+  })
+}
+
+// 更新凭据自愈配置
+export function useSetSelfHealConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setSelfHealConfig,
+    onSuccess: (data) => {
+      // 服务端返回的就是生效后的完整状态（含观测值），直接写入避免多一次往返
+      queryClient.setQueryData(['selfHealConfig'], data)
+      // 自愈会改动凭据的禁用状态，顺带刷新凭据列表
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
     },
   })
 }

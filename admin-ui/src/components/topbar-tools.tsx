@@ -1,7 +1,7 @@
 import { forwardRef, useEffect, useState, type ComponentPropsWithoutRef } from 'react'
 import {
   Activity, RefreshCw, UploadCloud, Settings, Key, Wand2, Eye, EyeOff, Copy,
-  MoreHorizontal, ShieldAlert, ShieldCheck, Database,
+  MoreHorizontal, ShieldAlert, ShieldCheck, Database, HeartPulse,
 } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
@@ -25,6 +25,7 @@ import { updateAdminKey } from '@/api/credentials'
 import { extractErrorMessage, generateApiKey } from '@/lib/utils'
 import { ImageUpdateDialog } from '@/components/image-update-dialog'
 import { CacheForceDialog } from '@/components/cache-force-card'
+import { SelfHealDialog } from '@/components/self-heal-dialog'
 
 /**
  * 顶栏右侧通用工具栏：负载均衡切换、刷新、在线更新、设置（Key 管理）。
@@ -47,6 +48,7 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
   const [imageUpdateOpen, setImageUpdateOpen] = useState(false)
   const [keyDialogOpen, setKeyDialogOpen] = useState(false)
   const [cacheForceOpen, setCacheForceOpen] = useState(false)
+  const [selfHealOpen, setSelfHealOpen] = useState(false)
   const [newKey, setNewKey] = useState('')
   const [showPlain, setShowPlain] = useState(false)
   const [updating, setUpdating] = useState(false)
@@ -115,6 +117,7 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
     openImageUpdate: () => setImageUpdateOpen(true),
     openKeyDialog,
     openCacheForce: () => setCacheForceOpen(true),
+    openSelfHeal: () => setSelfHealOpen(true),
     throttleConfig,
     updateCheck,
     updateCooldown: (secs: number) =>
@@ -130,6 +133,7 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
       {compact ? <CompactTools controls={controls} /> : <FullTools controls={controls} />}
       <ImageUpdateDialog open={imageUpdateOpen} onOpenChange={setImageUpdateOpen} />
       <CacheForceDialog open={cacheForceOpen} onOpenChange={setCacheForceOpen} />
+      <SelfHealDialog open={selfHealOpen} onOpenChange={setSelfHealOpen} />
 
       <Dialog
         open={keyDialogOpen}
@@ -237,6 +241,7 @@ interface ToolControls {
   openImageUpdate: () => void
   openKeyDialog: () => void
   openCacheForce: () => void
+  openSelfHeal: () => void
   throttleConfig?: { failover: boolean; cooldownSecs: number }
   updateCheck?: { hasUpdate: boolean; latestVersion: string; currentVersion: string }
   updateCooldown: (secs: number) => void
@@ -258,6 +263,7 @@ function FullTools({ controls }: { controls: ToolControls }) {
       <KeySettingsMenu
         onOpenKeyDialog={controls.openKeyDialog}
         onOpenCacheForce={controls.openCacheForce}
+        onOpenSelfHeal={controls.openSelfHeal}
       />
     </>
   )
@@ -306,6 +312,10 @@ function CompactTools({ controls }: { controls: ToolControls }) {
         <DropdownMenuLabel>缓存</DropdownMenuLabel>
         <DropdownMenuItem onSelect={controls.openCacheForce}>
           <Database />缓存强制覆盖（关闭/智能模拟/比例强制）
+        </DropdownMenuItem>
+        <DropdownMenuLabel>凭据治理</DropdownMenuLabel>
+        <DropdownMenuItem onSelect={controls.openSelfHeal}>
+          <HeartPulse />凭据自愈（冷却间隔 / 连续轮数上限）
         </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>
@@ -357,10 +367,11 @@ function ImageUpdateButton({ controls }: { controls: ToolControls }) {
 }
 
 function KeySettingsMenu({
-  onOpenKeyDialog, onOpenCacheForce,
+  onOpenKeyDialog, onOpenCacheForce, onOpenSelfHeal,
 }: {
   onOpenKeyDialog: () => void
   onOpenCacheForce: () => void
+  onOpenSelfHeal: () => void
 }) {
   return (
     <DropdownMenu>
@@ -377,6 +388,10 @@ function KeySettingsMenu({
         <DropdownMenuLabel>缓存</DropdownMenuLabel>
         <DropdownMenuItem onSelect={onOpenCacheForce}>
           <Database />缓存强制覆盖（关闭/智能模拟/比例强制）
+        </DropdownMenuItem>
+        <DropdownMenuLabel>凭据治理</DropdownMenuLabel>
+        <DropdownMenuItem onSelect={onOpenSelfHeal}>
+          <HeartPulse />凭据自愈（冷却间隔 / 连续轮数上限）
         </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>

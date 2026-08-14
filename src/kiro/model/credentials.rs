@@ -655,6 +655,7 @@ mod tests {
             endpoint: None,
             groups: vec![],
             source_channel: None,
+            ..Default::default()
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -849,6 +850,7 @@ mod tests {
             endpoint: None,
             groups: vec![],
             source_channel: None,
+            ..Default::default()
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -887,6 +889,7 @@ mod tests {
             endpoint: None,
             groups: vec![],
             source_channel: None,
+            ..Default::default()
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -1008,6 +1011,7 @@ mod tests {
             endpoint: None,
             groups: vec![],
             source_channel: None,
+            ..Default::default()
         };
 
         let json = original.to_pretty_json().unwrap();
