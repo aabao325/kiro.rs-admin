@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from "react";
+import type { CredentialStatusItem } from "@/types/api";
 import {
   RefreshCw,
   LogOut,
@@ -34,7 +35,69 @@ import {
   List,
   Search,
   X,
+  ArrowUpDown,
+  Clock,
+  User,
+  Ban,
 } from "lucide-react";
+
+type SortField = "manual" | "createdAt" | "lastUsedAt" | "successCount";
+type StatusFilter = "current" | "available" | "disabled" | "throttled";
+
+const SORT_LABELS: Record<SortField, string> = {
+  manual: "手动顺序",
+  createdAt: "加入时间",
+  lastUsedAt: "最后使用",
+  successCount: "成功次数",
+};
+
+const STATUS_LABELS: Record<StatusFilter, string> = {
+  current: "当前活跃",
+  available: "可用",
+  disabled: "已禁用",
+  throttled: "风控冷却",
+};
+
+/** 根据当前选中 ID 判断凭据的状态 */
+function statusOf(c: CredentialStatusItem, currentId?: number): StatusFilter {
+  if (c.id === currentId) return "current";
+  if (c.disabled) return "disabled";
+  if ((c.throttledRemainingSecs ?? 0) > 0) return "throttled";
+  return "available";
+}
+
+/** 排序实现：返回新数组，不改原数组 */
+function sortCredentials(
+  list: CredentialStatusItem[],
+  field: SortField,
+  asc: boolean,
+): CredentialStatusItem[] {
+  const copy = [...list];
+  copy.sort((a, b) => {
+    let valA: number | string = "";
+    let valB: number | string = "";
+    switch (field) {
+      case "createdAt":
+        valA = a.createdAt ?? "";
+        valB = b.createdAt ?? "";
+        break;
+      case "lastUsedAt":
+        valA = a.lastUsedAt ?? "";
+        valB = b.lastUsedAt ?? "";
+        break;
+      case "successCount":
+        valA = a.successCount;
+        valB = b.successCount;
+        break;
+      default:
+        return 0;
+    }
+    if (valA === valB) return 0;
+    const cmp = valA < valB ? -1 : 1;
+    return asc ? cmp : -cmp;
+  });
+  return copy;
+}
 
 function GithubIcon({ className }: { className?: string }) {
   return (
@@ -251,6 +314,38 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const [tierFilter, setTierFilter] = useState<Set<Tier>>(new Set());
   // 模糊搜索：按来源渠道（备注）/ 邮箱做大小写不敏感的子串匹配；空串 = 不限
   const [searchQuery, setSearchQuery] = useState("");
+  // 排序字段与方向。'manual' = 服务端优先级顺序，也是唯一允许拖拽调整的模式：
+  // 字段排序期间若还能拖拽，视觉顺序会与服务端 priority 脱节。
+  const [sortField, setSortField] = useState<SortField>("manual");
+  const [sortAsc, setSortAsc] = useState(true);
+  // 按状态隐藏（多选）：集合内的状态会被隐藏；空集合 = 全部显示
+  const [hiddenStatuses, setHiddenStatuses] = useState<Set<StatusFilter>>(
+    new Set(),
+  );
+  const toggleSort = (field: SortField) => {
+    if (field === "manual") {
+      setSortField("manual");
+      setSortAsc(true);
+      return;
+    }
+    // 重复点同一字段 = 切换升降序
+    setSortField((prev) => {
+      if (prev === field) {
+        setSortAsc((a) => !a);
+        return prev;
+      }
+      setSortAsc(true);
+      return field;
+    });
+  };
+  const toggleHiddenStatus = (s: StatusFilter) => {
+    setHiddenStatuses((prev) => {
+      const next = new Set(prev);
+      if (next.has(s)) next.delete(s);
+      else next.add(s);
+      return next;
+    });
+  };
   const toggleTier = (t: Tier) => {
     setTierFilter((prev) => {
       const next = new Set(prev);
@@ -283,13 +378,21 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
           (c.email ?? "").toLowerCase().includes(q),
       );
     }
+    if (hiddenStatuses.size > 0) {
+      // 当前活跃凭据来自凭据状态接口（balanced 模式下服务端固定回 0）
+      const currentId = data?.currentId;
+      out = out.filter((c) => !hiddenStatuses.has(statusOf(c, currentId)));
+    }
+    if (sortField !== "manual") {
+      out = sortCredentials(out, sortField, sortAsc);
+    }
     return out;
   })();
 
   // 切换分组 / 分级筛选 / 搜索时复位到第 1 页，避免空页
   useEffect(() => {
     setCurrentPage(1);
-  }, [groupFilter, tierFilter, searchQuery]);
+  }, [groupFilter, tierFilter, searchQuery, sortField, hiddenStatuses]);
 
   // pageSize === 0 表示“全部”：单页容纳全部已筛选凭据
   const effectivePageSize =
@@ -1312,6 +1415,106 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
               </Badge>
             )}
 
+            {sortField !== "manual" && (
+              <Badge variant="outline" className="gap-1">
+                排序：{SORT_LABELS[sortField]}
+                {sortAsc ? " ↑" : " ↓"}
+                <button
+                  type="button"
+                  className="ml-1 text-muted-foreground hover:text-foreground"
+                  onClick={() => toggleSort("manual")}
+                  title="恢复手动顺序（可拖拽）"
+                >
+                  ×
+                </button>
+              </Badge>
+            )}
+            {hiddenStatuses.size > 0 && (
+              <Badge variant="outline" className="gap-1">
+                已隐藏：
+                {Array.from(hiddenStatuses)
+                  .map((s) => STATUS_LABELS[s])
+                  .join("、")}
+                <button
+                  type="button"
+                  className="ml-1 text-muted-foreground hover:text-foreground"
+                  onClick={() => setHiddenStatuses(new Set())}
+                  title="取消隐藏"
+                >
+                  ×
+                </button>
+              </Badge>
+            )}
+
+            {/* 排序 + 按状态隐藏 */}
+            <DropdownMenu modal={false}>
+              <DropdownMenuTrigger asChild>
+                <Button size="sm" variant="outline" className="px-2 sm:px-3">
+                  <ArrowUpDown className="h-3.5 w-3.5" />
+                  <span className="hidden sm:inline">排序 / 隐藏</span>
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="start" className="w-56">
+                <DropdownMenuLabel>排序</DropdownMenuLabel>
+                <DropdownMenuItem onSelect={() => toggleSort("manual")}>
+                  <List />
+                  手动顺序（可拖拽）
+                  {sortField === "manual" && (
+                    <CheckCircle2 className="ml-auto h-3.5 w-3.5 text-emerald-600" />
+                  )}
+                </DropdownMenuItem>
+                <DropdownMenuItem onSelect={() => toggleSort("createdAt")}>
+                  <Clock />
+                  加入时间
+                  {sortField === "createdAt" && (
+                    <span className="ml-auto text-xs">{sortAsc ? "↑" : "↓"}</span>
+                  )}
+                </DropdownMenuItem>
+                <DropdownMenuItem onSelect={() => toggleSort("lastUsedAt")}>
+                  <Activity />
+                  最后使用
+                  {sortField === "lastUsedAt" && (
+                    <span className="ml-auto text-xs">{sortAsc ? "↑" : "↓"}</span>
+                  )}
+                </DropdownMenuItem>
+                <DropdownMenuItem onSelect={() => toggleSort("successCount")}>
+                  <CheckCircle2 />
+                  成功次数
+                  {sortField === "successCount" && (
+                    <span className="ml-auto text-xs">{sortAsc ? "↑" : "↓"}</span>
+                  )}
+                </DropdownMenuItem>
+                <DropdownMenuLabel className="pt-1">
+                  按状态隐藏
+                </DropdownMenuLabel>
+                {(
+                  ["current", "available", "disabled", "throttled"] as StatusFilter[]
+                ).map((s) => (
+                  <DropdownMenuItem
+                    key={s}
+                    onSelect={(e) => {
+                      e.preventDefault();
+                      toggleHiddenStatus(s);
+                    }}
+                  >
+                    {s === "current" ? (
+                      <User />
+                    ) : s === "disabled" ? (
+                      <Ban />
+                    ) : s === "throttled" ? (
+                      <Clock />
+                    ) : (
+                      <CheckCircle2 />
+                    )}
+                    {STATUS_LABELS[s]}
+                    {hiddenStatuses.has(s) && (
+                      <EyeOff className="ml-auto h-3.5 w-3.5 text-amber-600" />
+                    )}
+                  </DropdownMenuItem>
+                ))}
+              </DropdownMenuContent>
+            </DropdownMenu>
+
             {currentCredentials.length > 0 && (
               <Button
                 size="sm"
@@ -1758,6 +1961,10 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                     ? verticalListSortingStrategy
                     : rectSortingStrategy
                 }
+                // 字段排序期间禁用拖拽：拖拽调整的是服务端 priority，而此时
+                // 卡片按其它字段排序，视觉顺序与 priority 已脱节，允许拖拽会
+                // 让用户以为自己在调整看到的顺序。要改优先级需先切回手动顺序。
+                disabled={sortField !== "manual"}
               >
                 <div
                   className={

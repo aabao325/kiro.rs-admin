@@ -1092,6 +1092,8 @@ impl AdminService {
             endpoint: req.endpoint,
             groups: req.groups,
             source_channel: req.source_channel,
+            // 导入数据自带时保留；缺省由 add_credential 以入库时刻填充
+            created_at: req.created_at,
         };
 
         // 调用 token_manager 添加凭据

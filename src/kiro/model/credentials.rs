@@ -154,6 +154,13 @@ pub struct KiroCredentials {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub self_heal_model: Option<String>,
 
+    /// 凭据加入时间（RFC3339）。
+    ///
+    /// 由 `add_credential` 在首次入库时写入，此后随凭据一起持久化。导入数据
+    /// 自带该字段时保留原值。旧配置文件缺失时为 `None`，前端展示为"未知"。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+
     /// Kiro API Key（headless 模式）
     /// 格式: ksk_xxxxxxxx
     /// 设置后直接作为 Bearer Token 使用，无需 refreshToken
@@ -238,6 +245,7 @@ impl std::fmt::Debug for KiroCredentials {
             .field("self_heal_total_count", &self.self_heal_total_count)
             .field("last_self_heal_at", &self.last_self_heal_at)
             .field("self_heal_model", &self.self_heal_model)
+            .field("created_at", &self.created_at)
             .field("kiro_api_key", &fmt_redacted(&self.kiro_api_key))
             .field("endpoint", &self.endpoint)
             .field("groups", &self.groups)

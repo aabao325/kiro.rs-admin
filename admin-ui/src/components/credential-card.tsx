@@ -756,7 +756,20 @@ export function CredentialCard({
 
       {/* 最后调用（中大屏） */}
       <div className="hidden w-24 shrink-0 truncate text-right text-xs text-muted-foreground md:block">
-        {formatLastUsed(credential.lastUsedAt)}
+        <div>{formatLastUsed(credential.lastUsedAt)}</div>
+        {/* 加入时间：旧凭据无该字段时显示"未知"，不留空以免看着像渲染缺失 */}
+        <div
+          className="mt-0.5 text-[10px] opacity-70"
+          title={
+            credential.createdAt
+              ? `加入时间：${new Date(credential.createdAt).toLocaleString()}`
+              : "加入时间未知（该凭据在此功能上线前已存在）"
+          }
+        >
+          {credential.createdAt
+            ? `加入 ${formatLastUsed(credential.createdAt)}`
+            : "加入 未知"}
+        </div>
       </div>
 
       {/* 操作区 */}

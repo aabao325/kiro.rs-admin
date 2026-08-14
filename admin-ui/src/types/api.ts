@@ -36,6 +36,8 @@ export interface CredentialStatusItem {
   groups?: string[]
   /** 账号来源渠道（纯备注） */
   sourceChannel?: string
+  /** 凭据加入时间（RFC3339）。旧凭据无此字段时前端显示"未知" */
+  createdAt?: string
   /** 后端缓存的最近一次余额（5 分钟内） */
   balance?: BalanceResponse
   /** 余额缓存的更新时间（Unix 秒） */

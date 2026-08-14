@@ -1071,6 +1071,9 @@ pub struct CredentialEntrySnapshot {
     /// 账号来源渠道（纯备注）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_channel: Option<String>,
+    /// 凭据加入时间（RFC3339）。旧凭据无此字段时为 None，前端展示为"未知"。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
 }
 
 /// 凭据管理器状态快照
@@ -2436,6 +2439,7 @@ impl MultiTokenManager {
                     endpoint: e.credentials.endpoint.clone(),
                     groups: e.credentials.groups.clone(),
                     source_channel: e.credentials.source_channel.clone(),
+                    created_at: e.credentials.created_at.clone(),
                 })
                 .collect(),
             current_id,
@@ -3264,6 +3268,14 @@ impl MultiTokenManager {
         // 5. 设置 ID 并保留用户输入的元数据
         validated_cred.id = Some(new_id);
         validated_cred.priority = new_cred.priority;
+        // 加入时间：导入数据自带时保留原值（保住真实的历史时间），
+        // 否则以入库时刻为准。刷新链路可能丢掉该字段，故从原始输入回填。
+        let refreshed_created_at = validated_cred.created_at.take();
+        validated_cred.created_at = new_cred
+            .created_at
+            .clone()
+            .or(refreshed_created_at)
+            .or_else(|| Some(Utc::now().to_rfc3339()));
         validated_cred.auth_method = new_cred.auth_method.as_deref().map(|m| {
             crate::kiro::model::credentials::canonicalize_auth_method_value(m).to_string()
         });
@@ -4506,6 +4518,53 @@ mod tests {
         assert!(manager.report_failure(2));
         assert!(!manager.report_failure(2)); // 所有凭据都禁用了
         assert_eq!(manager.available_count(), 0);
+    }
+
+    /// add_credential 应为新凭据写入 created_at；导入自带时保留原值。
+    #[tokio::test]
+    async fn add_credential_records_created_at() {
+        let manager = MultiTokenManager::new(Config::default(), vec![], None, None, true).unwrap();
+
+        // 未提供 createdAt → 以入库时刻填充
+        let mut fresh = KiroCredentials::default();
+        fresh.kiro_api_key = Some("ksk_created_at_probe".to_string());
+        fresh.auth_method = Some("api_key".to_string());
+        let id = manager.add_credential(fresh).await.unwrap();
+
+        let snapshot = manager.snapshot();
+        let created_at = snapshot
+            .entries
+            .iter()
+            .find(|e| e.id == id)
+            .expect("凭据应已入库")
+            .created_at
+            .clone()
+            .expect("应写入 created_at");
+        assert!(
+            DateTime::parse_from_rfc3339(&created_at).is_ok(),
+            "created_at 应是合法 RFC3339，实际 {created_at}"
+        );
+
+        // 显式提供 createdAt → 保留原值（导入历史数据的场景）
+        let imported_at = "2020-01-02T03:04:05+00:00";
+        let mut imported = KiroCredentials::default();
+        imported.kiro_api_key = Some("ksk_imported_probe".to_string());
+        imported.auth_method = Some("api_key".to_string());
+        imported.created_at = Some(imported_at.to_string());
+        let imported_id = manager.add_credential(imported).await.unwrap();
+
+        let snapshot = manager.snapshot();
+        assert_eq!(
+            snapshot
+                .entries
+                .iter()
+                .find(|e| e.id == imported_id)
+                .unwrap()
+                .created_at
+                .as_deref(),
+            Some(imported_at),
+            "导入自带的加入时间应保留"
+        );
     }
 
     /// RPM 默认关闭 → 不改变任何既有调度行为。

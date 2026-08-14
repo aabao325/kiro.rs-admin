@@ -194,6 +194,13 @@ pub struct AddCredentialRequest {
     /// 账号来源渠道（纯备注，可选）
     #[serde(default)]
     pub source_channel: Option<String>,
+
+    /// 凭据加入时间（RFC3339，可选）。
+    ///
+    /// 导入既有数据时可显式提供以保留真实的历史时间；缺省则由服务端以入库
+    /// 时刻填充。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
 }
 
 fn default_auth_method() -> String {
