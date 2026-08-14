@@ -4567,10 +4567,11 @@ mod tests {
         // 第一次占满额度
         assert!(manager.acquire_context(None, None).await.is_ok());
 
-        let err = manager
-            .acquire_context(None, None)
-            .await
-            .expect_err("额度耗尽应报错");
+        // 不用 expect_err：CallContext 未实现 Debug（含 token，刻意不可打印）
+        let err = match manager.acquire_context(None, None).await {
+            Ok(_) => panic!("额度耗尽时不应还能取到凭据"),
+            Err(e) => e,
+        };
         let rate_limit = err
             .downcast_ref::<UpstreamRateLimitError>()
             .expect("应是类型化 429 而非通用错误");

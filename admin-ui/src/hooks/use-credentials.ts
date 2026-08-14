@@ -20,6 +20,8 @@ import {
   setSelfHealConfig,
   getErrorRules,
   setErrorRules,
+  getAccountRpmConfig,
+  setAccountRpmConfig,
   getLogGovernanceConfig,
   setLogGovernanceConfig,
   resetSuccessCount,
@@ -215,6 +217,25 @@ export function useSetAccountThrottleConfig() {
     mutationFn: setAccountThrottleConfig,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['accountThrottleConfig'] })
+    },
+  })
+}
+
+// 获取单账号 RPM 限流配置
+export function useAccountRpmConfig() {
+  return useQuery({
+    queryKey: ['accountRpmConfig'],
+    queryFn: getAccountRpmConfig,
+  })
+}
+
+// 更新单账号 RPM 限流配置
+export function useSetAccountRpmConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setAccountRpmConfig,
+    onSuccess: (data) => {
+      queryClient.setQueryData(['accountRpmConfig'], data)
     },
   })
 }

@@ -431,6 +431,27 @@ export async function setAccountThrottleConfig(
   return data
 }
 
+export interface AccountRpmConfig {
+  /** 是否启用单账号 RPM 主动限流 */
+  enabled: boolean
+  /** 每分钟请求上限（0 = 不限） */
+  limit: number
+}
+
+// 获取单账号 RPM 限流配置
+export async function getAccountRpmConfig(): Promise<AccountRpmConfig> {
+  const { data } = await api.get<AccountRpmConfig>('/config/account-rpm-limit')
+  return data
+}
+
+// 更新单账号 RPM 限流配置
+export async function setAccountRpmConfig(
+  patch: Partial<AccountRpmConfig>,
+): Promise<AccountRpmConfig> {
+  const { data } = await api.put<AccountRpmConfig>('/config/account-rpm-limit', patch)
+  return data
+}
+
 /** 关键词组合方式 */
 export type RuleMatchMode = 'any' | 'all'
 

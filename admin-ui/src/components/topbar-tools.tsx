@@ -1,7 +1,7 @@
 import { forwardRef, useEffect, useState, type ComponentPropsWithoutRef } from 'react'
 import {
   Activity, RefreshCw, UploadCloud, Settings, Key, Wand2, Eye, EyeOff, Copy,
-  MoreHorizontal, ShieldAlert, ShieldCheck, Database, HeartPulse, ShieldX,
+  MoreHorizontal, ShieldAlert, ShieldCheck, Database, HeartPulse, ShieldX, Gauge,
 } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
@@ -27,6 +27,7 @@ import { ImageUpdateDialog } from '@/components/image-update-dialog'
 import { CacheForceDialog } from '@/components/cache-force-card'
 import { SelfHealDialog } from '@/components/self-heal-dialog'
 import { ErrorRulesDialog } from '@/components/error-rules-dialog'
+import { AccountRpmDialog } from '@/components/account-rpm-dialog'
 
 /**
  * 顶栏右侧通用工具栏：负载均衡切换、刷新、在线更新、设置（Key 管理）。
@@ -51,6 +52,7 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
   const [cacheForceOpen, setCacheForceOpen] = useState(false)
   const [selfHealOpen, setSelfHealOpen] = useState(false)
   const [errorRulesOpen, setErrorRulesOpen] = useState(false)
+  const [accountRpmOpen, setAccountRpmOpen] = useState(false)
   const [newKey, setNewKey] = useState('')
   const [showPlain, setShowPlain] = useState(false)
   const [updating, setUpdating] = useState(false)
@@ -121,6 +123,7 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
     openCacheForce: () => setCacheForceOpen(true),
     openSelfHeal: () => setSelfHealOpen(true),
     openErrorRules: () => setErrorRulesOpen(true),
+    openAccountRpm: () => setAccountRpmOpen(true),
     throttleConfig,
     updateCheck,
     updateCooldown: (secs: number) =>
@@ -138,6 +141,7 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
       <CacheForceDialog open={cacheForceOpen} onOpenChange={setCacheForceOpen} />
       <SelfHealDialog open={selfHealOpen} onOpenChange={setSelfHealOpen} />
       <ErrorRulesDialog open={errorRulesOpen} onOpenChange={setErrorRulesOpen} />
+      <AccountRpmDialog open={accountRpmOpen} onOpenChange={setAccountRpmOpen} />
 
       <Dialog
         open={keyDialogOpen}
@@ -247,6 +251,7 @@ interface ToolControls {
   openCacheForce: () => void
   openSelfHeal: () => void
   openErrorRules: () => void
+  openAccountRpm: () => void
   throttleConfig?: { failover: boolean; cooldownSecs: number }
   updateCheck?: { hasUpdate: boolean; latestVersion: string; currentVersion: string }
   updateCooldown: (secs: number) => void
@@ -270,6 +275,7 @@ function FullTools({ controls }: { controls: ToolControls }) {
         onOpenCacheForce={controls.openCacheForce}
         onOpenSelfHeal={controls.openSelfHeal}
         onOpenErrorRules={controls.openErrorRules}
+        onOpenAccountRpm={controls.openAccountRpm}
       />
     </>
   )
@@ -326,6 +332,9 @@ function CompactTools({ controls }: { controls: ToolControls }) {
         <DropdownMenuItem onSelect={controls.openErrorRules}>
           <ShieldX />自定义错误规则（关键词自动禁用）
         </DropdownMenuItem>
+        <DropdownMenuItem onSelect={controls.openAccountRpm}>
+          <Gauge />单账号请求限流（每分钟上限）
+        </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>
   )
@@ -376,12 +385,13 @@ function ImageUpdateButton({ controls }: { controls: ToolControls }) {
 }
 
 function KeySettingsMenu({
-  onOpenKeyDialog, onOpenCacheForce, onOpenSelfHeal, onOpenErrorRules,
+  onOpenKeyDialog, onOpenCacheForce, onOpenSelfHeal, onOpenErrorRules, onOpenAccountRpm,
 }: {
   onOpenKeyDialog: () => void
   onOpenCacheForce: () => void
   onOpenSelfHeal: () => void
   onOpenErrorRules: () => void
+  onOpenAccountRpm: () => void
 }) {
   return (
     <DropdownMenu>
@@ -405,6 +415,9 @@ function KeySettingsMenu({
         </DropdownMenuItem>
         <DropdownMenuItem onSelect={onOpenErrorRules}>
           <ShieldX />自定义错误规则（关键词自动禁用）
+        </DropdownMenuItem>
+        <DropdownMenuItem onSelect={onOpenAccountRpm}>
+          <Gauge />单账号请求限流（每分钟上限）
         </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>
