@@ -19,9 +19,6 @@ on:
   push:
     branches:
       - master
-      # 当前正在移植上游功能的工作分支：让镜像在合入 master 之前就能拉到，
-      # 只产出 sha- 标签、不动 latest。分支合并后可以删掉这一行。
-      - merge-upstream-0.7.2
     paths-ignore:
       - '**.md'
       - 'docs/**'
