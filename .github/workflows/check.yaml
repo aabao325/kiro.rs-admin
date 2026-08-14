@@ -1,0 +1,86 @@
+name: Check
+
+# 轻量类型检查 + 单测，非 master 分支 push 均触发。
+# 用途：合并上游 / 开发新功能时在推分支阶段就拿到编译错误，
+# 不必等 master 上那套七平台 release 构建。
+on:
+  push:
+    branches-ignore:
+      - master
+    paths-ignore:
+      - '**.md'
+      - '.gitignore'
+      - '.gitattributes'
+      - 'LICENSE'
+      - 'config.example.json'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # rust-embed 要求 admin-ui/dist 存在才能编译（嵌入静态文件）。
+      # 这里只做类型检查，不需要真实前端产物，放个占位文件即可。
+      - name: Stub admin-ui dist
+        run: |
+          mkdir -p admin-ui/dist
+          echo '<!doctype html><title>stub</title>' > admin-ui/dist/index.html
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "rust-cache-check"
+          cache-on-failure: true
+
+      - name: cargo check
+        run: cargo check --locked --all-targets --no-default-features
+
+      - name: cargo test
+        run: cargo test --locked --no-default-features
+
+      # 仅作参考、不阻断：仓库（含上游代码）从未跑过 clippy，存量风格类 lint
+      # 有一百多条（field_reassign_with_default / collapsible_if 居多）。
+      # 用 -D warnings 会把这些存量建议变成硬失败，与"验证本次改动能否编译"
+      # 的目的无关。真正的编译错误由上面的 cargo check 拦住。
+      - name: cargo clippy (advisory)
+        continue-on-error: true
+        run: cargo clippy --locked --all-targets --no-default-features
+
+  # 管理面板：`bun run build` 已经是 `tsc -b && vite build`，
+  # 因此这一步同时覆盖类型检查与生产构建，不需要单独跑 tsc。
+  admin-ui:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.3'
+
+      - name: Cache bun install
+        uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: ${{ runner.os }}-bun-${{ hashFiles('admin-ui/bun.lock') }}
+          restore-keys: ${{ runner.os }}-bun-
+
+      - name: Install dependencies
+        working-directory: admin-ui
+        run: bun install --frozen-lockfile --ignore-scripts
+
+      - name: Type check and build
+        working-directory: admin-ui
+        run: bun run build
