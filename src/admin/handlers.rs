@@ -25,7 +25,7 @@ use super::{
         CreateClientKeyRequest, CreateClientKeyResponse, GlobalProxyResponse,
         SetAccountThrottleConfigRequest, SetDisabledRequest, SetGlobalProxyRequest,
         SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetPriorityRequest,
-        SetSelfHealConfigRequest, SetErrorRulesRequest,
+        SetSelfHealConfigRequest, SetErrorRulesRequest, SetAccountRpmConfigRequest,
         SetUpdateConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
         UpdateAdminKeyRequest, UpdateClientKeyRequest, UpdateCredentialRequest,
         UpdateRefreshTokenRequest,
@@ -538,6 +538,24 @@ pub async fn set_account_throttle_config(
     Json(payload): Json<SetAccountThrottleConfigRequest>,
 ) -> impl IntoResponse {
     match state.service.set_account_throttle_config(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/account-rpm-limit
+/// 获取单账号 RPM 限流配置
+pub async fn get_account_rpm_config(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_account_rpm_config())
+}
+
+/// PUT /api/admin/config/account-rpm-limit
+/// 更新单账号 RPM 限流配置（运行时生效 + 持久化 config.json）
+pub async fn set_account_rpm_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetAccountRpmConfigRequest>,
+) -> impl IntoResponse {
+    match state.service.set_account_rpm_config(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

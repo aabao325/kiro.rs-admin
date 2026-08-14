@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex as TokioMutex;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -901,6 +901,10 @@ struct CredentialEntry {
     last_self_heal_at: Option<DateTime<Utc>>,
     /// 触发当前连续自愈轮次的模型。`None` 表示 MCP / 无模型请求。
     self_heal_model: Option<String>,
+    /// RPM 主动限流的滑动窗口：最近 60 秒内该凭据被选中发起请求的时间戳。
+    /// 长度达到 `account_rpm_limit` 时，该凭据在本窗口内退出候选。
+    /// 不持久化，进程重启后清空（重启即等于窗口自然过期）。
+    rpm_window: VecDeque<Instant>,
 }
 
 impl CredentialEntry {
@@ -1113,6 +1117,10 @@ pub struct MultiTokenManager {
     account_throttle_failover: AtomicBool,
     /// 账号级风控冷却时长（秒，运行时可修改）
     account_throttle_cooldown_secs: AtomicU64,
+    /// 单账号 RPM 主动限流开关（运行时可修改）
+    account_rpm_limit_enabled: AtomicBool,
+    /// 单账号每分钟请求上限（运行时可修改，0 = 不限）
+    account_rpm_limit: AtomicU32,
     /// 自定义错误规则表（运行时可修改 + 持久化）
     error_rules: Arc<crate::kiro::error_rules::ErrorRuleStore>,
     /// 凭据自愈总开关（运行时可修改）
@@ -1129,6 +1137,9 @@ pub struct MultiTokenManager {
 
 /// 每个凭据最大 API 调用失败次数
 const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
+
+/// 单账号 RPM 限流的滑动窗口长度（秒）。固定 60 秒 = 每分钟。
+const RPM_WINDOW_SECS: u64 = 60;
 /// 统计数据持久化防抖间隔
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
 
@@ -1257,6 +1268,7 @@ impl MultiTokenManager {
                     self_heal_total_count: cred.self_heal_total_count,
                     last_self_heal_at,
                     self_heal_model: cred.self_heal_model.clone(),
+                    rpm_window: VecDeque::new(),
                 }
             })
             .collect();
@@ -1307,6 +1319,8 @@ impl MultiTokenManager {
         let self_heal_enabled = config.self_heal_enabled;
         let self_heal_min_interval_secs = config.self_heal_min_interval_secs;
         let self_heal_max_consecutive_rounds = config.self_heal_max_consecutive_rounds;
+        let rpm_limit_enabled = config.account_rpm_limit_enabled;
+        let rpm_limit = config.account_rpm_limit;
         let error_rules = Arc::new(crate::kiro::error_rules::ErrorRuleStore::new(
             config.error_rules.clone(),
             config.config_path().map(|p| p.to_path_buf()),
@@ -1324,6 +1338,8 @@ impl MultiTokenManager {
             load_balancing_mode: Mutex::new(load_balancing_mode),
             account_throttle_failover: AtomicBool::new(throttle_failover),
             account_throttle_cooldown_secs: AtomicU64::new(throttle_cooldown_secs),
+            account_rpm_limit_enabled: AtomicBool::new(rpm_limit_enabled),
+            account_rpm_limit: AtomicU32::new(rpm_limit),
             error_rules,
             self_heal_enabled: AtomicBool::new(self_heal_enabled),
             self_heal_min_interval_secs: AtomicU64::new(self_heal_min_interval_secs),
@@ -1425,6 +1441,10 @@ impl MultiTokenManager {
                 if !credential_matches_request(&e.credentials, model, group) {
                     return false;
                 }
+                // 本 60 秒窗口内已达 RPM 上限：临时退出候选，等窗口滑走再参与
+                if self.rpm_exceeded(e, now) {
+                    return false;
+                }
                 true
             })
             .collect();
@@ -1496,6 +1516,7 @@ impl MultiTokenManager {
                                 && !e.disabled
                                 && !e.throttled_until.map(|t| t > now).unwrap_or(false)
                                 && credential_matches_request(&e.credentials, model, group)
+                                && !self.rpm_exceeded(e, now)
                         })
                         .map(|e| (e.id, e.credentials.clone()))
                 };
@@ -1518,6 +1539,22 @@ impl MultiTokenManager {
                         (new_id, new_creds)
                     } else {
                         let entries = self.entries.lock();
+                        // 区分两种"选不出凭据"：所有候选都只是 RPM 额度用尽
+                        // （可等待恢复）时返回类型化 429 + Retry-After，
+                        // 而不是退化成"所有凭据均已禁用"的通用错误。
+                        if let Some(retry_after) =
+                            self.rpm_retry_after_secs(&entries, model, group, Instant::now())
+                        {
+                            drop(entries);
+                            tracing::warn!(
+                                "所有匹配凭据的每分钟请求额度均已用尽，返回 429（Retry-After: {}s）",
+                                retry_after
+                            );
+                            return Err(UpstreamRateLimitError::new(Some(
+                                retry_after.to_string(),
+                            ))
+                            .into());
+                        }
                         // 注意：必须在 bail! 之前计算 available_count，
                         // 因为 available_count() 会尝试获取 entries 锁，
                         // 而此时我们已经持有该锁，会导致死锁
@@ -1530,6 +1567,14 @@ impl MultiTokenManager {
             // 尝试获取/刷新 Token
             match self.try_ensure_token(id, &credentials).await {
                 Ok(ctx) => {
+                    // 预留 RPM 额度。清理 + 检查 + 记账在同一把锁内完成，因此
+                    // 并发请求不会同时通过上面的只读检查后一起写入窗口而超限。
+                    // 抢占失败说明额度刚被别的请求占走，重新走一轮选择。
+                    if !self.record_request(id) {
+                        tracing::debug!("凭据 #{} 的 RPM 额度被并发请求占用，重新选择", id);
+                        attempt_count += 1;
+                        continue;
+                    }
                     return Ok(ctx);
                 }
                 Err(e) => {
@@ -3282,6 +3327,7 @@ impl MultiTokenManager {
                 self_heal_total_count: 0,
                 last_self_heal_at: None,
                 self_heal_model: None,
+                rpm_window: VecDeque::new(),
             });
         }
 
@@ -3723,6 +3769,201 @@ impl MultiTokenManager {
     /// 自定义错误规则表（provider 求值 / Admin API 读写）
     pub fn error_rules(&self) -> &Arc<crate::kiro::error_rules::ErrorRuleStore> {
         &self.error_rules
+    }
+
+    /// 判断凭据在当前 60 秒滑动窗口内是否已达到 RPM 上限。
+    ///
+    /// 只读判断，不清理窗口（清理在 [`Self::record_request`] 的写路径里做，
+    /// 那里持写锁且必须与记账原子）。
+    fn rpm_exceeded(&self, entry: &CredentialEntry, now: Instant) -> bool {
+        if !self.account_rpm_limit_enabled.load(Ordering::Relaxed) {
+            return false;
+        }
+        let limit = self.account_rpm_limit.load(Ordering::Relaxed);
+        if limit == 0 {
+            return false;
+        }
+        let window = StdDuration::from_secs(RPM_WINDOW_SECS);
+        let fresh = entry
+            .rpm_window
+            .iter()
+            .filter(|&&ts| now.duration_since(ts) < window)
+            .count();
+        fresh as u32 >= limit
+    }
+
+    /// 当"其它条件都满足的候选"全部耗尽 RPM 额度时，返回最早可重试秒数。
+    ///
+    /// 返回 `None` 表示至少还有一个候选有额度（即本次失败不是 RPM 造成的），
+    /// 调用方据此区分"额度耗尽（429）"与"全部禁用（500）"两种语义。
+    fn rpm_retry_after_secs(
+        &self,
+        entries: &[CredentialEntry],
+        model: Option<&str>,
+        group: Option<&str>,
+        now: Instant,
+    ) -> Option<u64> {
+        if !self.account_rpm_limit_enabled.load(Ordering::Relaxed) {
+            return None;
+        }
+        let limit = self.account_rpm_limit.load(Ordering::Relaxed) as usize;
+        if limit == 0 {
+            return None;
+        }
+
+        let window = StdDuration::from_secs(RPM_WINDOW_SECS);
+        let mut earliest_retry_after: Option<u64> = None;
+        let mut saw_candidate = false;
+
+        for entry in entries.iter().filter(|entry| {
+            !entry.disabled
+                && !entry
+                    .throttled_until
+                    .map(|until| until > now)
+                    .unwrap_or(false)
+                && credential_matches_request(&entry.credentials, model, group)
+        }) {
+            saw_candidate = true;
+            let fresh: Vec<Instant> = entry
+                .rpm_window
+                .iter()
+                .copied()
+                .filter(|&ts| now.duration_since(ts) < window)
+                .collect();
+            if fresh.len() < limit {
+                // 还有额度 → 本次选择失败与 RPM 无关
+                return None;
+            }
+
+            // 窗口内条数可能因运行时下调 limit 而多于上限；需等到
+            // fresh.len() - limit + 1 个时间戳过期后才重新有额度。
+            let release_index = fresh.len() - limit;
+            let Some(&release_ts) = fresh.get(release_index) else {
+                continue;
+            };
+            let release_at = release_ts + window;
+            let remaining = release_at.saturating_duration_since(now);
+            // 向上取整并至少 1 秒：Retry-After: 0 对客户端没有意义
+            let retry_after = remaining
+                .as_secs()
+                .saturating_add(u64::from(remaining.subsec_nanos() > 0))
+                .max(1);
+            earliest_retry_after = Some(
+                earliest_retry_after
+                    .map(|cur| cur.min(retry_after))
+                    .unwrap_or(retry_after),
+            );
+        }
+
+        if saw_candidate { earliest_retry_after } else { None }
+    }
+
+    /// 为一次真实业务请求预留 RPM 额度。
+    ///
+    /// 过期清理、上限检查与记账在同一把 `entries` 锁内完成，因此多个并发请求
+    /// 不会在选择阶段同时通过检查、随后一起写入窗口而突破上限。
+    /// 返回 `false` 表示额度已被其它并发请求抢先占用，调用方应重新选择凭据。
+    fn record_request(&self, id: u64) -> bool {
+        let now = Instant::now();
+        let window = StdDuration::from_secs(RPM_WINDOW_SECS);
+        let mut entries = self.entries.lock();
+        let Some(entry) = entries.iter_mut().find(|e| e.id == id) else {
+            return false;
+        };
+
+        // 关闭或不限时顺手清空窗口，避免运行时再开启后读到一堆陈旧时间戳
+        if !self.account_rpm_limit_enabled.load(Ordering::Relaxed) {
+            entry.rpm_window.clear();
+            return true;
+        }
+        let limit = self.account_rpm_limit.load(Ordering::Relaxed);
+        if limit == 0 {
+            entry.rpm_window.clear();
+            return true;
+        }
+
+        while let Some(&front) = entry.rpm_window.front() {
+            if now.duration_since(front) >= window {
+                entry.rpm_window.pop_front();
+            } else {
+                break;
+            }
+        }
+        if entry.rpm_window.len() >= limit as usize {
+            return false;
+        }
+        entry.rpm_window.push_back(now);
+        true
+    }
+
+    /// 读取 RPM 限流配置（Admin API）。返回 (启用, 每分钟上限)。
+    pub fn get_account_rpm_config(&self) -> (bool, u32) {
+        (
+            self.account_rpm_limit_enabled.load(Ordering::Relaxed),
+            self.account_rpm_limit.load(Ordering::Relaxed),
+        )
+    }
+
+    /// 设置 RPM 限流配置（Admin API）。任一参数传 `None` 表示不修改该字段。
+    pub fn set_account_rpm_config(
+        &self,
+        enabled: Option<bool>,
+        limit: Option<u32>,
+    ) -> anyhow::Result<()> {
+        if let Some(v) = limit {
+            // 0 = 不限；上限取一个明显足够大的值防误填
+            if v > 100_000 {
+                anyhow::bail!("每分钟请求上限必须在 0..=100000 内: {}", v);
+            }
+        }
+
+        let (prev_enabled, prev_limit) = self.get_account_rpm_config();
+        let new_enabled = enabled.unwrap_or(prev_enabled);
+        let new_limit = limit.unwrap_or(prev_limit);
+
+        if new_enabled == prev_enabled && new_limit == prev_limit {
+            return Ok(());
+        }
+
+        self.account_rpm_limit_enabled
+            .store(new_enabled, Ordering::Relaxed);
+        self.account_rpm_limit.store(new_limit, Ordering::Relaxed);
+
+        if let Err(err) = self.persist_account_rpm_config(new_enabled, new_limit) {
+            self.account_rpm_limit_enabled
+                .store(prev_enabled, Ordering::Relaxed);
+            self.account_rpm_limit.store(prev_limit, Ordering::Relaxed);
+            return Err(err);
+        }
+
+        tracing::info!(
+            "单账号 RPM 限流配置已更新: enabled={}, limit={}",
+            new_enabled,
+            new_limit
+        );
+        Ok(())
+    }
+
+    fn persist_account_rpm_config(&self, enabled: bool, limit: u32) -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        let config_path = match self.config.config_path() {
+            Some(path) => path.to_path_buf(),
+            None => {
+                tracing::warn!("配置文件路径未知，RPM 限流配置仅在当前进程生效");
+                return Ok(());
+            }
+        };
+
+        let mut config = Config::load(&config_path)
+            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
+        config.account_rpm_limit_enabled = enabled;
+        config.account_rpm_limit = limit;
+        config
+            .save()
+            .with_context(|| format!("持久化 RPM 限流配置失败: {}", config_path.display()))?;
+
+        Ok(())
     }
 
     /// 读取自愈配置（Admin API）。返回 (启用, 最小间隔秒, 最大连续轮数)。
@@ -4265,6 +4506,176 @@ mod tests {
         assert!(manager.report_failure(2));
         assert!(!manager.report_failure(2)); // 所有凭据都禁用了
         assert_eq!(manager.available_count(), 0);
+    }
+
+    /// RPM 默认关闭 → 不改变任何既有调度行为。
+    #[test]
+    fn rpm_limit_disabled_by_default() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(manager.get_account_rpm_config(), (false, 60));
+        // 关闭时无论调用多少次都能继续预留
+        for _ in 0..200 {
+            assert!(manager.record_request(1), "关闭时不应限流");
+        }
+    }
+
+    /// 达到上限后该凭据退出候选，额度用尽时 record_request 返回 false。
+    #[test]
+    fn rpm_limit_blocks_after_reaching_limit() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        manager.set_account_rpm_config(Some(true), Some(3)).unwrap();
+
+        for i in 1..=3 {
+            assert!(manager.record_request(1), "第 {i} 次应成功");
+        }
+        assert!(!manager.record_request(1), "达到上限后应拒绝");
+
+        // 达上限的凭据不应再出现在候选里
+        assert!(
+            manager.select_next_credential(None, None).is_none(),
+            "额度耗尽的凭据应退出候选"
+        );
+    }
+
+    /// 额度耗尽时 acquire_context 返回类型化 429 + Retry-After，
+    /// 而不是退化成"所有凭据均已禁用"。
+    #[tokio::test]
+    async fn rpm_exhausted_yields_typed_rate_limit_error() {
+        let mut cred = KiroCredentials::default();
+        cred.access_token = Some("token".to_string());
+        cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![cred], None, None, false).unwrap();
+        manager.set_account_rpm_config(Some(true), Some(1)).unwrap();
+
+        // 第一次占满额度
+        assert!(manager.acquire_context(None, None).await.is_ok());
+
+        let err = manager
+            .acquire_context(None, None)
+            .await
+            .expect_err("额度耗尽应报错");
+        let rate_limit = err
+            .downcast_ref::<UpstreamRateLimitError>()
+            .expect("应是类型化 429 而非通用错误");
+        let retry_after: u64 = rate_limit
+            .retry_after()
+            .expect("应带 Retry-After")
+            .parse()
+            .expect("Retry-After 应是秒数");
+        assert!(
+            retry_after >= 1 && retry_after <= RPM_WINDOW_SECS,
+            "Retry-After 应落在窗口内，实际 {retry_after}"
+        );
+    }
+
+    /// 一个凭据耗尽额度时，请求应故障转移到另一个仍有额度的凭据。
+    #[test]
+    fn rpm_exhausted_credential_fails_over_to_next() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![KiroCredentials::default(), KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        manager.set_account_rpm_config(Some(true), Some(1)).unwrap();
+
+        assert!(manager.record_request(1));
+        // #1 已满，选择应落到 #2
+        let (picked, _) = manager
+            .select_next_credential(None, None)
+            .expect("应还有可用凭据");
+        assert_eq!(picked, 2, "应故障转移到未耗尽额度的凭据");
+    }
+
+    /// 只有部分候选耗尽时不应报 429（还有额度可用）。
+    #[test]
+    fn rpm_retry_after_none_when_some_capacity_remains() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![KiroCredentials::default(), KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        manager.set_account_rpm_config(Some(true), Some(1)).unwrap();
+        manager.record_request(1);
+
+        let entries = manager.entries.lock();
+        assert!(
+            manager
+                .rpm_retry_after_secs(&entries, None, None, Instant::now())
+                .is_none(),
+            "仍有候选有额度时不应返回 Retry-After"
+        );
+    }
+
+    /// 关闭限流会清空窗口，避免运行时再开启后读到陈旧时间戳。
+    #[test]
+    fn disabling_rpm_clears_window() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        manager.set_account_rpm_config(Some(true), Some(2)).unwrap();
+        manager.record_request(1);
+        manager.record_request(1);
+        assert!(!manager.record_request(1), "应已达上限");
+
+        // 关闭后第一次 record 会清空窗口
+        manager.set_account_rpm_config(Some(false), None).unwrap();
+        assert!(manager.record_request(1));
+        assert_eq!(manager.entries.lock()[0].rpm_window.len(), 0);
+
+        // 重新开启后额度是干净的
+        manager.set_account_rpm_config(Some(true), None).unwrap();
+        assert!(manager.record_request(1), "重开后应有完整额度");
+    }
+
+    /// 配置越界应被拒绝且不改动内存状态；0 合法（表示不限）。
+    #[test]
+    fn rpm_config_rejects_out_of_range() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let before = manager.get_account_rpm_config();
+        assert!(manager.set_account_rpm_config(None, Some(100_001)).is_err());
+        assert_eq!(manager.get_account_rpm_config(), before, "失败不应改动配置");
+
+        assert!(manager.set_account_rpm_config(Some(true), Some(0)).is_ok());
+        // 0 = 不限
+        for _ in 0..100 {
+            assert!(manager.record_request(1));
+        }
     }
 
     fn test_rule(name: &str, action: crate::kiro::error_rules::RuleAction) -> crate::kiro::error_rules::ErrorRule {

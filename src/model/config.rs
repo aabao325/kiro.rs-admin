@@ -141,6 +141,19 @@ pub struct Config {
     #[serde(default = "default_account_throttle_cooldown_secs")]
     pub account_throttle_cooldown_secs: u64,
 
+    /// 是否启用单账号 RPM 主动限流（默认 false = 不改变现有调度行为）。
+    ///
+    /// 开启后每个凭据独立维护 60 秒滑动窗口，达到 `account_rpm_limit` 后临时
+    /// 退出候选，请求自动故障转移到下一个可用账号；所有匹配账号都耗尽时返回
+    /// 标准 429 并按最早释放的窗口计算 `Retry-After`。
+    #[serde(default = "default_account_rpm_limit_enabled")]
+    pub account_rpm_limit_enabled: bool,
+
+    /// 单账号每分钟请求上限（默认 60）。仅在 `account_rpm_limit_enabled` 为 true 时生效。
+    /// 设为 `0` 等同于不限。
+    #[serde(default = "default_account_rpm_limit")]
+    pub account_rpm_limit: u32,
+
     /// 自定义错误规则表（默认空数组 = 不改变任何现有行为）。
     ///
     /// 按响应体关键词匹配上游错误并自动处置凭据（禁用 / 冷却 / 计失败 / 终止）。
@@ -260,6 +273,14 @@ fn default_account_throttle_cooldown_secs() -> u64 {
     30 * 60
 }
 
+fn default_account_rpm_limit_enabled() -> bool {
+    false
+}
+
+fn default_account_rpm_limit() -> u32 {
+    60
+}
+
 fn default_self_heal_enabled() -> bool {
     true
 }
@@ -329,6 +350,8 @@ impl Default for Config {
             load_balancing_mode: default_load_balancing_mode(),
             account_throttle_failover: default_account_throttle_failover(),
             account_throttle_cooldown_secs: default_account_throttle_cooldown_secs(),
+            account_rpm_limit_enabled: default_account_rpm_limit_enabled(),
+            account_rpm_limit: default_account_rpm_limit(),
             error_rules: Vec::new(),
             self_heal_enabled: default_self_heal_enabled(),
             self_heal_min_interval_secs: default_self_heal_min_interval_secs(),

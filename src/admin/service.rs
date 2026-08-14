@@ -21,6 +21,7 @@ use crate::model::config::Config;
 use super::error::AdminServiceError;
 use super::proxy_pool::{GetUrlResult, ProxyPoolManager};
 use super::types::{
+    AccountRpmConfigResponse, SetAccountRpmConfigRequest,
     AccountThrottleConfigResponse, AddCredentialRequest, AddCredentialResponse,
     AssignProxyRequest, AssignRoundRobinResponse, AvailableModelItem, AvailableModelsResponse,
     BalanceResponse, BatchAddProxyRequest, BatchImportEvent,
@@ -1878,6 +1879,30 @@ impl AdminService {
             .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
 
         Ok(self.get_account_throttle_config())
+    }
+
+    /// 读取单账号 RPM 限流配置
+    pub fn get_account_rpm_config(&self) -> AccountRpmConfigResponse {
+        let (enabled, limit) = self.token_manager.get_account_rpm_config();
+        AccountRpmConfigResponse { enabled, limit }
+    }
+
+    /// 更新单账号 RPM 限流配置（运行时生效 + 持久化 config.json）
+    pub fn set_account_rpm_config(
+        &self,
+        req: SetAccountRpmConfigRequest,
+    ) -> Result<AccountRpmConfigResponse, AdminServiceError> {
+        if req.enabled.is_none() && req.limit.is_none() {
+            return Err(AdminServiceError::InvalidCredential(
+                "至少提供 enabled 或 limit 一个字段".to_string(),
+            ));
+        }
+
+        self.token_manager
+            .set_account_rpm_config(req.enabled, req.limit)
+            .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
+
+        Ok(self.get_account_rpm_config())
     }
 
     /// 读取自定义错误规则表
