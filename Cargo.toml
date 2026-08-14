@@ -1,6 +1,14 @@
 [package]
 name = "kiro-rs"
-version = "0.7.1"
+# fork 版本号约定：`<上游基线>-fork.<迭代>`。
+#
+# 基线数字表示"已对齐到上游哪一代"，不代表功能等同 —— 本 fork 既删过上游功能
+# （动态模型发现），也有上游没有的自有功能（身份锁定、cache_force、signature_sim、
+# 自定义错误规则）。故不能直接标成上游版本号，否则会让人以为具备该版全部能力。
+#
+# 更新检查（admin/service.rs 的 compare_semver）只比前三段数字，`-fork.N` 会被
+# 忽略，因此与上游同代时不会误报"可更新"，上游发下一版才提示 —— 正好用作上游观察。
+version = "0.7.6-fork.1"
 edition = "2024"
 
 [features]
