@@ -138,6 +138,8 @@ pub mod outcome {
     pub const TRANSIENT: &str = "transient";
     pub const NETWORK_ERROR: &str = "network_error";
     pub const BAD_REQUEST: &str = "bad_request";
+    /// 命中管理员配置的自定义错误规则（可按规则名归因失败）
+    pub const CUSTOM_RULE: &str = "custom_rule";
     pub const UNKNOWN: &str = "unknown";
     /// 仅用作 record.error_type：流式响应已开始但上游中途断开
     pub const STREAM_INTERRUPTED: &str = "stream_interrupted";

@@ -3,6 +3,7 @@
 pub mod auth;
 pub mod endpoint;
 pub mod error;
+pub mod error_rules;
 pub mod kiro_version;
 pub mod machine_id;
 pub mod model;

@@ -26,7 +26,7 @@ use super::types::{
     BalanceResponse, BatchAddProxyRequest, BatchImportEvent,
     CheckRateLimitRequest, CredentialStatusItem, CredentialsStatusResponse, EnableOverageAllResult,
     GitHubRateLimitInfo, ImageUpdateResponse, ExportedAccount, ExportedCredentials,
-    CredentialsExportResponse,
+    CredentialsExportResponse, ErrorRulesResponse, SetErrorRulesRequest,
     LoadBalancingModeResponse, LogGovernanceConfigResponse, PollIdcLoginResponse,
     ProxyCheckAllResponse, ProxyCheckResponse, ProxyPoolEntry, ProxyPoolResponse,
     QuotaExceededResult, SelfHealConfigResponse, SetAccountThrottleConfigRequest,
@@ -1878,6 +1878,26 @@ impl AdminService {
             .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
 
         Ok(self.get_account_throttle_config())
+    }
+
+    /// 读取自定义错误规则表
+    pub fn get_error_rules(&self) -> ErrorRulesResponse {
+        ErrorRulesResponse {
+            rules: self.token_manager.error_rules().snapshot(),
+        }
+    }
+
+    /// 整表替换自定义错误规则（运行时生效 + 持久化 config.json）
+    pub fn set_error_rules(
+        &self,
+        req: SetErrorRulesRequest,
+    ) -> Result<ErrorRulesResponse, AdminServiceError> {
+        let rules = self
+            .token_manager
+            .error_rules()
+            .replace(req.rules)
+            .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
+        Ok(ErrorRulesResponse { rules })
     }
 
     /// 读取凭据自愈配置（含只读观测值）

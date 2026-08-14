@@ -14,7 +14,7 @@ use super::{
         check_rate_limit, check_update, clear_throttle, complete_social_login,
         complete_social_relogin, create_client_key, create_group, delete_client_key,
         delete_credential, delete_group, delete_proxy, disable_quota_exceeded, enable_overage_all,
-        export_credentials, force_refresh_token, get_account_throttle_config,
+        export_credentials, force_refresh_token, get_account_throttle_config, get_error_rules,
         get_all_credentials, get_cache_force_config, get_credential_balance, get_credential_models,
         get_global_proxy, get_load_balancing_mode, get_log_governance_config, get_proxy_pool,
         get_self_heal_config, get_update_config, list_client_keys, list_groups, list_traces,
@@ -23,7 +23,7 @@ use super::{
         poll_social_relogin, pull_update_image, reset_all_success_count, reset_client_key_stats,
         reset_failure_count, reset_success_count, rollback_image_update, rotate_client_key,
         set_account_throttle_config, set_cache_force_config, set_client_key_disabled,
-        set_self_heal_config,
+        set_self_heal_config, set_error_rules,
         set_credential_disabled, set_credential_overage, set_credential_priority,
         set_global_proxy, set_load_balancing_mode, set_log_governance_config, set_proxy_enabled,
         set_update_config, start_idc_login, start_idc_relogin, start_social_login,
@@ -57,6 +57,8 @@ const MAX_ADMIN_BODY_SIZE: usize = 50 * 1024 * 1024;
 /// - `PUT /config/load-balancing` - 设置负载均衡模式
 /// - `GET /config/self-heal` - 获取凭据自愈配置（含只读观测值）
 /// - `PUT /config/self-heal` - 设置凭据自愈配置
+/// - `GET /config/error-rules` - 获取自定义错误规则表
+/// - `PUT /config/error-rules` - 整表替换自定义错误规则
 ///
 /// # 认证
 /// 需要登录API密钥认证，支持：
@@ -113,6 +115,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route(
             "/config/self-heal",
             get(get_self_heal_config).put(set_self_heal_config),
+        )
+        .route(
+            "/config/error-rules",
+            get(get_error_rules).put(set_error_rules),
         )
         .route(
             "/config/log-governance",

@@ -13,6 +13,7 @@ use tokio::sync::Mutex as TokioMutex;
 use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
@@ -915,7 +916,10 @@ impl CredentialEntry {
 }
 
 /// 禁用原因
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// 不是 `Copy`：`CustomRule` 需要携带规则名（面板要显示"被哪条规则禁用"）。
+/// 取值比较（`==` / `!=`）不受影响，只有按值 `map` 的地方需要 `as_ref()`。
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum DisabledReason {
     /// Admin API 手动禁用
     Manual,
@@ -929,25 +933,49 @@ enum DisabledReason {
     InvalidRefreshToken,
     /// 凭据配置无效（如 authMethod=api_key 但缺少 kiroApiKey）
     InvalidConfig,
+    /// 命中管理员配置的自定义错误规则后禁用。
+    ///
+    /// 携带规则名以便面板显示"被规则『xxx』禁用"，以及该规则是否允许自愈
+    /// —— 后者必须随禁用状态一起记住，否则重启后无从判断这条禁用能不能恢复。
+    CustomRule { name: String, self_healable: bool },
 }
 
+/// `CustomRule` 持久化前缀。格式：`CustomRule:<0|1>:<规则名>`
+const CUSTOM_RULE_PREFIX: &str = "CustomRule:";
+
 impl DisabledReason {
-    /// 持久化用的稳定字符串。改动取值会让已落盘的 credentials.json 失配，
+    /// 持久化 / 面板显示用的字符串。改动取值会让已落盘的 credentials.json 失配，
     /// 反序列化时退化成 `None`（即"禁用但原因未知"），不要随意重命名。
-    fn as_str(self) -> &'static str {
+    fn to_persisted(&self) -> String {
         match self {
-            Self::Manual => "Manual",
-            Self::TooManyFailures => "TooManyFailures",
-            Self::TooManyRefreshFailures => "TooManyRefreshFailures",
-            Self::QuotaExceeded => "QuotaExceeded",
-            Self::InvalidRefreshToken => "InvalidRefreshToken",
-            Self::InvalidConfig => "InvalidConfig",
+            Self::Manual => "Manual".to_string(),
+            Self::TooManyFailures => "TooManyFailures".to_string(),
+            Self::TooManyRefreshFailures => "TooManyRefreshFailures".to_string(),
+            Self::QuotaExceeded => "QuotaExceeded".to_string(),
+            Self::InvalidRefreshToken => "InvalidRefreshToken".to_string(),
+            Self::InvalidConfig => "InvalidConfig".to_string(),
+            Self::CustomRule { name, self_healable } => {
+                // 规则名可能含冒号，故只 splitn 前两段，名字整体作为剩余部分
+                format!(
+                    "{}{}:{}",
+                    CUSTOM_RULE_PREFIX,
+                    if *self_healable { 1 } else { 0 },
+                    name
+                )
+            }
         }
     }
 
     /// 从持久化字符串还原。未知取值返回 `None`，调用方据此保留
     /// "已禁用但原因不明"的状态，而不是猜成手动禁用。
     fn from_persisted(value: &str) -> Option<Self> {
+        if let Some(rest) = value.strip_prefix(CUSTOM_RULE_PREFIX) {
+            let (flag, name) = rest.split_once(':')?;
+            return Some(Self::CustomRule {
+                name: name.to_string(),
+                self_healable: flag == "1",
+            });
+        }
         match value {
             "Manual" => Some(Self::Manual),
             "TooManyFailures" => Some(Self::TooManyFailures),
@@ -956,6 +984,16 @@ impl DisabledReason {
             "InvalidRefreshToken" => Some(Self::InvalidRefreshToken),
             "InvalidConfig" => Some(Self::InvalidConfig),
             _ => None,
+        }
+    }
+
+    /// 该禁用原因是否允许被自愈恢复。
+    fn is_self_healable(&self) -> bool {
+        match self {
+            Self::TooManyFailures => true,
+            Self::CustomRule { self_healable, .. } => *self_healable,
+            // 手动禁用、额度用尽、token 失效、配置无效都不该被自动复活
+            _ => false,
         }
     }
 }
@@ -1075,6 +1113,8 @@ pub struct MultiTokenManager {
     account_throttle_failover: AtomicBool,
     /// 账号级风控冷却时长（秒，运行时可修改）
     account_throttle_cooldown_secs: AtomicU64,
+    /// 自定义错误规则表（运行时可修改 + 持久化）
+    error_rules: Arc<crate::kiro::error_rules::ErrorRuleStore>,
     /// 凭据自愈总开关（运行时可修改）
     self_heal_enabled: AtomicBool,
     /// 同一凭据两次自愈的最小冷却间隔（秒，运行时可修改，0 = 不限）
@@ -1267,6 +1307,10 @@ impl MultiTokenManager {
         let self_heal_enabled = config.self_heal_enabled;
         let self_heal_min_interval_secs = config.self_heal_min_interval_secs;
         let self_heal_max_consecutive_rounds = config.self_heal_max_consecutive_rounds;
+        let error_rules = Arc::new(crate::kiro::error_rules::ErrorRuleStore::new(
+            config.error_rules.clone(),
+            config.config_path().map(|p| p.to_path_buf()),
+        ));
         let manager = Self {
             config,
             proxy: Mutex::new(proxy),
@@ -1280,6 +1324,7 @@ impl MultiTokenManager {
             load_balancing_mode: Mutex::new(load_balancing_mode),
             account_throttle_failover: AtomicBool::new(throttle_failover),
             account_throttle_cooldown_secs: AtomicU64::new(throttle_cooldown_secs),
+            error_rules,
             self_heal_enabled: AtomicBool::new(self_heal_enabled),
             self_heal_min_interval_secs: AtomicU64::new(self_heal_min_interval_secs),
             self_heal_max_consecutive_rounds: AtomicU32::new(self_heal_max_consecutive_rounds),
@@ -1690,7 +1735,8 @@ impl MultiTokenManager {
                     cred.disabled = e.disabled;
                     // 禁用原因随 disabled 一起落盘，否则重启后自动禁用会被误判为
                     // 手动禁用，自愈无从判断哪些凭据可以恢复。
-                    cred.disabled_reason = e.disabled_reason.map(|r| r.as_str().to_string());
+                    cred.disabled_reason =
+                        e.disabled_reason.as_ref().map(DisabledReason::to_persisted);
                     // 自愈状态持久化：冷却窗口与连续轮数上限必须跨重启生效，
                     // 否则重启即可绕过限制，死循环仍然成立。
                     cred.self_heal_consecutive_rounds = e.self_heal_consecutive_rounds;
@@ -2331,9 +2377,12 @@ impl MultiTokenManager {
                     has_proxy: e.credentials.proxy_url.is_some(),
                     proxy_url: e.credentials.proxy_url.clone(),
                     refresh_failure_count: e.refresh_failure_count,
-                    // 与持久化用同一套字符串（DisabledReason::as_str），避免两处
-                    // match 各自演化后面板显示与落盘取值不一致。
-                    disabled_reason: e.disabled_reason.map(|r| r.as_str().to_string()),
+                    // 与持久化用同一套字符串（DisabledReason::to_persisted），避免
+                    // 两处各自演化后面板显示与落盘取值不一致。
+                    disabled_reason: e
+                        .disabled_reason
+                        .as_ref()
+                        .map(DisabledReason::to_persisted),
                     throttled_remaining_secs: e
                         .throttled_until
                         .and_then(|t| t.checked_duration_since(now))
@@ -2377,6 +2426,154 @@ impl MultiTokenManager {
         // 持久化更改
         self.persist_credentials()?;
         Ok(())
+    }
+
+    /// 自定义错误规则命中后处置凭据。
+    ///
+    /// 由 provider 在识别出规则命中时调用。返回 `(实际执行的动作, 该请求范围内
+    /// 剩余可用凭据数)` —— 动作可能与规则声明的不同：`disable` 在触发
+    /// `min_available` 保底时会降级为 `countFailure`。
+    ///
+    /// `Abort` 不在此处理（那是"立即终止本次请求"，不改动凭据状态），
+    /// provider 直接终止即可，不必调用本方法。
+    pub fn report_custom_rule_hit(
+        &self,
+        id: u64,
+        rule: &crate::kiro::error_rules::ErrorRule,
+        model: Option<&str>,
+        group: Option<&str>,
+    ) -> (crate::kiro::error_rules::RuleAction, usize) {
+        use crate::kiro::error_rules::RuleAction;
+
+        // 统计当前请求范围内仍可用（未禁用、未冷却、分组/模型匹配）的凭据数。
+        // 与 report_account_throttled_for_request 用同一套判定。
+        let count_available = |entries: &[CredentialEntry]| {
+            let now = Instant::now();
+            entries
+                .iter()
+                .filter(|e| {
+                    !e.disabled
+                        && !e.throttled_until.map(|t| t > now).unwrap_or(false)
+                        && credential_matches_request(&e.credentials, model, group)
+                })
+                .count()
+        };
+
+        let mut effective = rule.action;
+        let remaining;
+        {
+            let mut entries = self.entries.lock();
+            let Some(idx) = entries.iter().position(|e| e.id == id) else {
+                return (effective, count_available(&entries));
+            };
+
+            if entries[idx].disabled {
+                return (effective, count_available(&entries));
+            }
+
+            // 保底可用数：禁用会让可用凭据跌破下限时，降级为只计失败。
+            // 用于避免「模型下架」这类根因不在账号的错误把整池逐个禁干净。
+            if effective == RuleAction::Disable && rule.min_available > 0 {
+                let available_after = count_available(&entries).saturating_sub(1);
+                if available_after < rule.min_available as usize {
+                    tracing::warn!(
+                        "凭据 #{} 命中规则『{}』，但禁用后可用凭据将少于保底值 {}，降级为仅计失败",
+                        id,
+                        rule.name,
+                        rule.min_available
+                    );
+                    effective = RuleAction::CountFailure;
+                }
+            }
+
+            // 可变借用限定在本块内，结束后才能重新以只读方式遍历 entries
+            let current_unusable = {
+                let entry = &mut entries[idx];
+                entry.total_failure_count += 1;
+                entry.last_used_at = Some(Utc::now().to_rfc3339());
+
+                match effective {
+                    RuleAction::Disable => {
+                        entry.disabled = true;
+                        entry.disabled_reason = Some(DisabledReason::CustomRule {
+                            name: rule.name.clone(),
+                            self_healable: rule.self_healable,
+                        });
+                        tracing::error!(
+                            "凭据 #{} 命中自定义错误规则『{}』，已禁用（可自愈: {}）",
+                            id,
+                            rule.name,
+                            rule.self_healable
+                        );
+                    }
+                    RuleAction::Cooldown => {
+                        let until =
+                            Instant::now() + StdDuration::from_secs(rule.cooldown_secs.max(1));
+                        entry.throttled_until = Some(match entry.throttled_until {
+                            Some(prev) if prev > until => prev,
+                            _ => until,
+                        });
+                        tracing::warn!(
+                            "凭据 #{} 命中自定义错误规则『{}』，冷却 {} 秒",
+                            id,
+                            rule.name,
+                            rule.cooldown_secs
+                        );
+                    }
+                    RuleAction::CountFailure => {
+                        entry.failure_count += 1;
+                        let failure_count = entry.failure_count;
+                        tracing::warn!(
+                            "凭据 #{} 命中自定义错误规则『{}』，计入失败（{}/{}）",
+                            id,
+                            rule.name,
+                            failure_count,
+                            MAX_FAILURES_PER_CREDENTIAL
+                        );
+                        if failure_count >= MAX_FAILURES_PER_CREDENTIAL {
+                            entry.disabled = true;
+                            entry.disabled_reason = Some(DisabledReason::TooManyFailures);
+                            tracing::error!(
+                                "凭据 #{} 已连续失败 {} 次，已被禁用",
+                                id,
+                                failure_count
+                            );
+                        }
+                    }
+                    // Abort 不改动凭据状态，provider 不会走到这里
+                    RuleAction::Abort => {}
+                }
+
+                let now = Instant::now();
+                entry.disabled || entry.throttled_until.map(|t| t > now).unwrap_or(false)
+            };
+
+            // 当前凭据已不可用时，把 current_id 挪到下一个可用凭据，
+            // 避免 priority 模式下反复命中同一个坏账号。
+            if current_unusable {
+                let now = Instant::now();
+                let next = entries
+                    .iter()
+                    .filter(|e| {
+                        !e.disabled
+                            && !e.throttled_until.map(|t| t > now).unwrap_or(false)
+                            && credential_matches_request(&e.credentials, model, group)
+                    })
+                    .min_by_key(|e| e.credentials.priority)
+                    .map(|e| e.id);
+                if let Some(next_id) = next {
+                    *self.current_id.lock() = next_id;
+                }
+            }
+
+            remaining = count_available(&entries);
+        }
+
+        if let Err(e) = self.persist_credentials() {
+            tracing::warn!("自定义规则处置后持久化失败: {}", e);
+        }
+
+        (effective, remaining)
     }
 
     /// 标记凭据进入临时冷却期（账号级 429 风控触发）
@@ -3523,6 +3720,11 @@ impl MultiTokenManager {
         Ok(())
     }
 
+    /// 自定义错误规则表（provider 求值 / Admin API 读写）
+    pub fn error_rules(&self) -> &Arc<crate::kiro::error_rules::ErrorRuleStore> {
+        &self.error_rules
+    }
+
     /// 读取自愈配置（Admin API）。返回 (启用, 最小间隔秒, 最大连续轮数)。
     pub fn get_self_heal_config(&self) -> (bool, u64, u32) {
         (
@@ -3640,14 +3842,15 @@ impl MultiTokenManager {
     /// 受控的凭据自愈。
     ///
     /// 当前请求的 model/group 作用域没有可用凭据时，在以下约束下恢复该作用域内
-    /// 因 [`DisabledReason::TooManyFailures`] 被自动禁用的凭据：
+    /// 可自愈的被禁用凭据：
     ///
     /// - `self_heal_enabled` 关闭时完全不自愈；
     /// - 每个凭据独立计算连续轮数与冷却，状态跨重启持久化；
     /// - 只有同一凭据、同一模型上的成功才清零连续轮数（见
     ///   [`Self::report_success_for_request`]）；
-    /// - 只复活 `TooManyFailures`；手动禁用、额度用尽、token 失效等其它原因
-    ///   禁用的凭据一概不动。
+    /// - 可自愈的判定见 [`DisabledReason::is_self_healable`]：`TooManyFailures`
+    ///   以及显式声明 `selfHealable` 的自定义规则；手动禁用、额度用尽、
+    ///   token 失效、配置无效一概不动。
     ///
     /// 替代了旧的"全灭即无条件重置全部凭据"实现：那种做法没有冷却也没有上限，
     /// 持续故障时会形成 `全禁 → 自愈 → 再失败 → 全禁` 的紧密死循环，
@@ -3672,8 +3875,12 @@ impl MultiTokenManager {
         {
             let mut entries = self.entries.lock();
             for entry in entries.iter_mut() {
+                let healable = entry
+                    .disabled_reason
+                    .as_ref()
+                    .is_some_and(DisabledReason::is_self_healable);
                 if !entry.disabled
-                    || entry.disabled_reason != Some(DisabledReason::TooManyFailures)
+                    || !healable
                     || !credential_matches_request(&entry.credentials, model, group)
                 {
                     continue;
@@ -4058,6 +4265,226 @@ mod tests {
         assert!(manager.report_failure(2));
         assert!(!manager.report_failure(2)); // 所有凭据都禁用了
         assert_eq!(manager.available_count(), 0);
+    }
+
+    fn test_rule(name: &str, action: crate::kiro::error_rules::RuleAction) -> crate::kiro::error_rules::ErrorRule {
+        crate::kiro::error_rules::ErrorRule {
+            name: name.to_string(),
+            enabled: true,
+            keywords: vec!["Invalid model ID".to_string()],
+            match_mode: crate::kiro::error_rules::MatchMode::Any,
+            case_sensitive: false,
+            status_codes: vec![400],
+            action,
+            cooldown_secs: 60,
+            self_healable: false,
+            min_available: 0,
+        }
+    }
+
+    /// `disable` 动作：立即禁用并带上规则名，剩余可用数正确反映。
+    #[test]
+    fn custom_rule_disable_marks_reason_with_rule_name() {
+        use crate::kiro::error_rules::RuleAction;
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![KiroCredentials::default(), KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let rule = test_rule("模型下架", RuleAction::Disable);
+        let (effective, remaining) = manager.report_custom_rule_hit(1, &rule, Some("m"), None);
+
+        assert_eq!(effective, RuleAction::Disable);
+        assert_eq!(remaining, 1, "两个凭据禁一个后应剩一个");
+
+        let status = manager.snapshot();
+        let entry = status.entries.iter().find(|e| e.id == 1).unwrap();
+        assert!(entry.disabled);
+        assert_eq!(
+            entry.disabled_reason.as_deref(),
+            Some("CustomRule:0:模型下架"),
+            "面板应能看到是哪条规则禁用的"
+        );
+    }
+
+    /// `minAvailable` 保底：禁用会跌破下限时降级为只计失败，不禁用。
+    ///
+    /// 用户已确认默认走「无防护、命中就禁用」（minAvailable=0），此字段是留给
+    /// 「模型下架把整池禁干净」时的止血开关，故必须有测试保证它真的生效。
+    #[test]
+    fn custom_rule_min_available_downgrades_to_count_failure() {
+        use crate::kiro::error_rules::RuleAction;
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let mut rule = test_rule("模型下架", RuleAction::Disable);
+        rule.min_available = 1; // 至少保留 1 个可用
+
+        let (effective, remaining) = manager.report_custom_rule_hit(1, &rule, None, None);
+        assert_eq!(
+            effective,
+            RuleAction::CountFailure,
+            "唯一凭据禁用后会跌破保底值，应降级"
+        );
+        assert_eq!(remaining, 1, "凭据应保持可用");
+        assert_eq!(manager.available_count(), 1);
+    }
+
+    /// `minAvailable = 0`（默认）时无防护，命中即禁用直到池空。
+    #[test]
+    fn custom_rule_without_min_available_can_disable_whole_pool() {
+        use crate::kiro::error_rules::RuleAction;
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![KiroCredentials::default(), KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let rule = test_rule("模型下架", RuleAction::Disable);
+        manager.report_custom_rule_hit(1, &rule, None, None);
+        let (_, remaining) = manager.report_custom_rule_hit(2, &rule, None, None);
+
+        assert_eq!(remaining, 0, "无保底时整池会被禁完");
+        assert_eq!(manager.available_count(), 0);
+    }
+
+    /// `cooldown` 动作：不永久禁用，到期自动恢复。
+    #[test]
+    fn custom_rule_cooldown_does_not_disable() {
+        use crate::kiro::error_rules::RuleAction;
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![KiroCredentials::default(), KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let rule = test_rule("临时故障", RuleAction::Cooldown);
+        let (effective, remaining) = manager.report_custom_rule_hit(1, &rule, None, None);
+
+        assert_eq!(effective, RuleAction::Cooldown);
+        assert_eq!(remaining, 1, "冷却中的凭据不计入可用");
+
+        let status = manager.snapshot();
+        let entry = status.entries.iter().find(|e| e.id == 1).unwrap();
+        assert!(!entry.disabled, "冷却不应设置 disabled");
+        assert!(
+            entry.throttled_remaining_secs.unwrap_or(0) > 0,
+            "应有剩余冷却时间"
+        );
+    }
+
+    /// `countFailure` 动作：累加到阈值后才由既有逻辑禁用。
+    #[test]
+    fn custom_rule_count_failure_disables_only_at_threshold() {
+        use crate::kiro::error_rules::RuleAction;
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let rule = test_rule("宽松处理", RuleAction::CountFailure);
+        for _ in 0..MAX_FAILURES_PER_CREDENTIAL - 1 {
+            manager.report_custom_rule_hit(1, &rule, None, None);
+            assert_eq!(manager.available_count(), 1, "未到阈值不应禁用");
+        }
+        manager.report_custom_rule_hit(1, &rule, None, None);
+        assert_eq!(manager.available_count(), 0, "达阈值应禁用");
+    }
+
+    /// 规则声明 selfHealable 时，被它禁用的凭据可参与自愈；默认 false 则不可。
+    #[test]
+    fn custom_rule_self_healable_flag_controls_recovery() {
+        use crate::kiro::error_rules::RuleAction;
+
+        // 默认 self_healable = false → 不可自愈
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        manager.set_self_heal_config(None, Some(0), Some(0)).unwrap();
+        manager.report_custom_rule_hit(1, &test_rule("下架", RuleAction::Disable), None, None);
+        assert!(
+            !manager.try_self_heal(None, None),
+            "self_healable=false 的规则禁用不应被自愈复活"
+        );
+
+        // self_healable = true → 可自愈
+        let manager2 = MultiTokenManager::new(
+            Config::default(),
+            vec![KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        manager2.set_self_heal_config(None, Some(0), Some(0)).unwrap();
+        let mut healable = test_rule("疑似瞬态", RuleAction::Disable);
+        healable.self_healable = true;
+        manager2.report_custom_rule_hit(1, &healable, None, None);
+        assert!(
+            manager2.try_self_heal(None, None),
+            "self_healable=true 的规则禁用应可被自愈复活"
+        );
+        assert_eq!(manager2.available_count(), 1);
+    }
+
+    /// CustomRule 的禁用原因必须能跨重启还原（含规则名与可自愈标记）。
+    #[test]
+    fn custom_rule_reason_roundtrips_through_persistence() {
+        let reason = DisabledReason::CustomRule {
+            name: "模型下架".to_string(),
+            self_healable: true,
+        };
+        let persisted = reason.to_persisted();
+        assert_eq!(persisted, "CustomRule:1:模型下架");
+        assert_eq!(DisabledReason::from_persisted(&persisted), Some(reason));
+
+        // 规则名含冒号也不能破坏解析
+        let tricky = DisabledReason::CustomRule {
+            name: "a:b:c".to_string(),
+            self_healable: false,
+        };
+        assert_eq!(
+            DisabledReason::from_persisted(&tricky.to_persisted()),
+            Some(tricky)
+        );
+
+        // 未知取值 → None（保留"禁用但原因不明"）
+        assert_eq!(DisabledReason::from_persisted("SomethingNew"), None);
+        // 内置取值不受影响
+        assert_eq!(
+            DisabledReason::from_persisted("TooManyFailures"),
+            Some(DisabledReason::TooManyFailures)
+        );
     }
 
     /// 自愈受冷却约束：同一凭据在 `min_interval_secs` 窗口内只自愈一次。

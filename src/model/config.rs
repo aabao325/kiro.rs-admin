@@ -141,6 +141,14 @@ pub struct Config {
     #[serde(default = "default_account_throttle_cooldown_secs")]
     pub account_throttle_cooldown_secs: u64,
 
+    /// 自定义错误规则表（默认空数组 = 不改变任何现有行为）。
+    ///
+    /// 按响应体关键词匹配上游错误并自动处置凭据（禁用 / 冷却 / 计失败 / 终止）。
+    /// 用于应对上游临时改报错文案、下架模型这类"内置判定短语跟不上"的情况，
+    /// 无需改代码重新发版。规则顺序即优先级。
+    #[serde(default)]
+    pub error_rules: Vec<crate::kiro::error_rules::ErrorRule>,
+
     /// 是否启用凭据自愈（默认 true）。
     ///
     /// 当前请求的 model/group 作用域内没有可用凭据时，只恢复该作用域内因
@@ -321,6 +329,7 @@ impl Default for Config {
             load_balancing_mode: default_load_balancing_mode(),
             account_throttle_failover: default_account_throttle_failover(),
             account_throttle_cooldown_secs: default_account_throttle_cooldown_secs(),
+            error_rules: Vec::new(),
             self_heal_enabled: default_self_heal_enabled(),
             self_heal_min_interval_secs: default_self_heal_min_interval_secs(),
             self_heal_max_consecutive_rounds: default_self_heal_max_consecutive_rounds(),

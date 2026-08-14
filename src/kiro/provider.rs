@@ -355,6 +355,45 @@ impl KiroProvider {
             // 失败响应
             let body = response.text().await.unwrap_or_default();
 
+            // 自定义错误规则：与 API 链路同理，必须先于状态码分支（含下方 400）。
+            // MCP 无模型上下文，model 传 None。
+            if let Some(rule) = self.match_error_rule(status.as_u16(), &body) {
+                use crate::kiro::error_rules::RuleAction;
+
+                if rule.action == RuleAction::Abort {
+                    tracing::warn!(
+                        "MCP 请求失败（命中规则『{}』，立即终止）: {} {}",
+                        rule.name,
+                        status,
+                        body
+                    );
+                    anyhow::bail!("MCP 请求失败: {} {}", status, body);
+                }
+
+                let (effective, remaining) =
+                    self.token_manager
+                        .report_custom_rule_hit(ctx.id, &rule, None, group);
+                tracing::warn!(
+                    "MCP 请求失败（命中规则『{}』，动作 {}，剩余可用凭据 {}）: {} {}",
+                    rule.name,
+                    effective.as_str(),
+                    remaining,
+                    status,
+                    body
+                );
+
+                if remaining == 0 {
+                    anyhow::bail!(
+                        "MCP 请求失败（命中规则『{}』且已无可用凭据）: {} {}",
+                        rule.name,
+                        status,
+                        body
+                    );
+                }
+                last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
+                continue;
+            }
+
             // 402 额度用尽
             if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
                 let has_available = self.token_manager.report_quota_exhausted(ctx.id);
@@ -576,6 +615,68 @@ impl KiroProvider {
 
             // 失败响应：读取 body 用于日志/错误信息
             let body = response.text().await.unwrap_or_default();
+
+            // 自定义错误规则：必须先于所有状态码分支求值。
+            //
+            // 上游会不打招呼地改报错文案、下架模型，内置判定都是硬编码短语跟不上。
+            // 尤其 400 分支在下方直接 bail（不计失败、不禁用、不切换），
+            // 若规则放在其后，400 类错误（如 INVALID_MODEL_ID）永远走不到规则。
+            //
+            // 规则表默认为空，has_enabled() 廉价短路，不引入额外开销。
+            if let Some(rule) = self.match_error_rule(status.as_u16(), &body) {
+                use crate::kiro::error_rules::RuleAction;
+
+                Self::emit_attempt(
+                    sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()),
+                    outcome::CUSTOM_RULE, Some(&body), attempt_start,
+                );
+
+                // Abort：立即终止本次请求，不重试、不切换、不动凭据状态
+                if rule.action == RuleAction::Abort {
+                    tracing::warn!(
+                        "API 请求失败（命中规则『{}』，立即终止）: {} {}",
+                        rule.name,
+                        status,
+                        body
+                    );
+                    anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
+                }
+
+                let (effective, remaining) = self.token_manager.report_custom_rule_hit(
+                    ctx.id,
+                    &rule,
+                    model.as_deref(),
+                    group,
+                );
+                tracing::warn!(
+                    "API 请求失败（命中规则『{}』，动作 {}，剩余可用凭据 {}，尝试 {}/{}）: {} {}",
+                    rule.name,
+                    effective.as_str(),
+                    remaining,
+                    attempt + 1,
+                    max_retries,
+                    status,
+                    body
+                );
+
+                if remaining == 0 {
+                    anyhow::bail!(
+                        "{} API 请求失败（命中规则『{}』且已无可用凭据）: {} {}",
+                        api_type,
+                        rule.name,
+                        status,
+                        body
+                    );
+                }
+
+                last_error = Some(anyhow::anyhow!(
+                    "{} API 请求失败: {} {}",
+                    api_type,
+                    status,
+                    body
+                ));
+                continue;
+            }
 
             // 402 Payment Required 且额度用尽：禁用凭据并故障转移
             if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
@@ -833,6 +934,22 @@ impl KiroProvider {
                 max_retries
             )
         }))
+    }
+
+    /// 对失败响应求值自定义错误规则，返回第一条命中的规则。
+    ///
+    /// 规则表默认为空，此时 `has_enabled()` 只取一次读锁即返回，不做任何字符串
+    /// 扫描 —— 未配置规则的部署完全不受影响。
+    fn match_error_rule(
+        &self,
+        status: u16,
+        body: &str,
+    ) -> Option<crate::kiro::error_rules::ErrorRule> {
+        let store = self.token_manager.error_rules();
+        if !store.has_enabled() {
+            return None;
+        }
+        store.first_match(Some(status), body)
     }
 
     /// 向 trace sink 上报一跳结果（sink 为 None 时无开销）

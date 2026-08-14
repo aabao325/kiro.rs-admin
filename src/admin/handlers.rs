@@ -25,7 +25,7 @@ use super::{
         CreateClientKeyRequest, CreateClientKeyResponse, GlobalProxyResponse,
         SetAccountThrottleConfigRequest, SetDisabledRequest, SetGlobalProxyRequest,
         SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetPriorityRequest,
-        SetSelfHealConfigRequest,
+        SetSelfHealConfigRequest, SetErrorRulesRequest,
         SetUpdateConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
         UpdateAdminKeyRequest, UpdateClientKeyRequest, UpdateCredentialRequest,
         UpdateRefreshTokenRequest,
@@ -538,6 +538,24 @@ pub async fn set_account_throttle_config(
     Json(payload): Json<SetAccountThrottleConfigRequest>,
 ) -> impl IntoResponse {
     match state.service.set_account_throttle_config(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/error-rules
+/// 获取自定义错误规则表
+pub async fn get_error_rules(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_error_rules())
+}
+
+/// PUT /api/admin/config/error-rules
+/// 整表替换自定义错误规则（运行时生效 + 持久化 config.json）
+pub async fn set_error_rules(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetErrorRulesRequest>,
+) -> impl IntoResponse {
+    match state.service.set_error_rules(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

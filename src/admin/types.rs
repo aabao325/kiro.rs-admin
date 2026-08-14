@@ -445,6 +445,23 @@ pub struct SetAccountThrottleConfigRequest {
     pub cooldown_secs: Option<u64>,
 }
 
+/// 自定义错误规则表响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ErrorRulesResponse {
+    pub rules: Vec<crate::kiro::error_rules::ErrorRule>,
+}
+
+/// 整表替换自定义错误规则
+///
+/// 刻意用整表替换而非逐条增删改：规则顺序即优先级，前端本就持有完整列表，
+/// 整表提交能避免"并发编辑两条规则导致顺序错乱"这类问题。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetErrorRulesRequest {
+    pub rules: Vec<crate::kiro::error_rules::ErrorRule>,
+}
+
 /// 凭据自愈配置响应
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
