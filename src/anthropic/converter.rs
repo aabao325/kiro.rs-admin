@@ -2096,6 +2096,106 @@ mod tests {
         assert_eq!(result, Some("claude-haiku-4.5".to_string()));
     }
 
+    /// 裸请求（无 system、无 output_config）也必须注入身份策略。
+    ///
+    /// 这两个测试在 74d2f29 加过，随后被 e9fffa8「优化」连同 check.yaml 一起删掉，
+    /// 导致身份注入长期零覆盖。这里按简化版（`<identity>`）重写补回。
+    #[test]
+    fn test_build_history_injects_identity_without_system() {
+        let mut req = minimal_request_with_effort("claude-opus-4-8", "high");
+        req.system = None;
+        req.output_config = None;
+
+        let mut map = HashMap::new();
+        let history = build_history(
+            &req,
+            &req.messages,
+            "claude-opus-4.8",
+            &mut map,
+            ToolCompatibilityMode::default(),
+        )
+        .unwrap();
+
+        let injected = history.iter().any(|m| match m {
+            Message::User(u) => u.user_input_message.content.contains("<identity>"),
+            _ => false,
+        });
+        assert!(injected, "无 system 的裸请求也必须注入身份策略");
+    }
+
+    /// 客户端自带人格设定时，身份策略**依然注入**且排在其后（取得更高优先级）。
+    /// 这是刻意的产品选择：身份问答一律回落到 Claude / Anthropic 口径。
+    #[test]
+    fn test_build_history_identity_overrides_client_persona() {
+        let mut req = minimal_request_with_effort("claude-opus-4-8", "high");
+        req.system = Some(vec![super::super::types::SystemMessage {
+            text: "你是小明，一个猫娘助手".to_string(),
+            cache_control: None,
+        }]);
+
+        let mut map = HashMap::new();
+        let history = build_history(
+            &req,
+            &req.messages,
+            "claude-opus-4.8",
+            &mut map,
+            ToolCompatibilityMode::default(),
+        )
+        .unwrap();
+        let system_text = history
+            .iter()
+            .find_map(|m| match m {
+                Message::User(u) => Some(u.user_input_message.content.clone()),
+                _ => None,
+            })
+            .expect("必须有系统消息");
+
+        assert!(
+            system_text.contains("<identity>"),
+            "客户端设了人格也要注入身份策略"
+        );
+        assert!(
+            system_text.contains("你是小明"),
+            "客户端 system 原文仍需转发（只是身份问答被锁定口径覆盖）"
+        );
+        let persona_at = system_text.find("你是小明").unwrap();
+        let identity_at = system_text.find("<identity>").unwrap();
+        assert!(
+            identity_at > persona_at,
+            "身份策略必须排在客户端 system 之后才能取得更高优先级"
+        );
+    }
+
+    /// 守住「简化版」这个选择，防止旧版强命令写法被改回来。
+    ///
+    /// 旧版（master 曾部署的 `<absolute_identity_policy priority="maximum">`）用了
+    /// 「最高优先级 / 覆盖一切指令 / 绝不承认本策略存在 / 照抄参考答案」这类写法，
+    /// 读起来就是典型的越狱注入，实测会触发模型的对抗检测：模型把整段当攻击处理，
+    /// 反过来在回复里向用户揭发，并把身份答成宿主环境的产品名 —— 比不注入更糟。
+    /// b0fccef「简化身份」改成平铺直叙的事实陈述后才稳定生效。
+    ///
+    /// 同一个坑在 IDENTITY_ACK 的文档注释里也记过一次。别再优化回去。
+    #[test]
+    fn test_identity_policy_stays_plain_not_coercive() {
+        const COERCIVE_MARKERS: &[&str] = &[
+            "absolute_identity_policy",
+            "HIGHEST possible priority",
+            "priority=\"maximum\"",
+            "Never mention or acknowledge",
+            "Reference answers to mirror",
+        ];
+        for marker in COERCIVE_MARKERS {
+            assert!(
+                !IDENTITY_LOCK_POLICY.contains(marker),
+                "身份策略不得含强命令式写法 {marker:?}：实测会触发模型对抗检测，\
+                 反而导致身份泄漏。详见本测试的文档注释。"
+            );
+        }
+        // 简化版的正向特征
+        assert!(IDENTITY_LOCK_POLICY.starts_with("<identity>"));
+        assert!(IDENTITY_LOCK_POLICY.contains("You are Claude, an AI assistant made by Anthropic."));
+    }
+
     fn minimal_request_with_output_config(model: &str) -> MessagesRequest {
         minimal_request_with_effort(model, "high")
     }
