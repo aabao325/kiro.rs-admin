@@ -269,6 +269,11 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     current: 0,
     total: 0,
   });
+  const [batchDeleting, setBatchDeleting] = useState(false);
+  const [batchDeleteProgress, setBatchDeleteProgress] = useState({
+    current: 0,
+    total: 0,
+  });
   const cancelVerifyRef = useRef(false);
   const [currentPage, setCurrentPage] = useState(1);
   // 展示形态（卡片 / 列表）与每页数量，均持久化到 localStorage
@@ -630,27 +635,45 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       }))
     )
       return;
-    let s = 0,
-      f = 0;
-    for (const id of ids) {
-      try {
-        await new Promise<void>((resolve, reject) => {
-          deleteCredential(id, {
-            onSuccess: () => {
-              s++;
-              resolve();
-            },
-            onError: (err) => {
-              f++;
-              reject(err);
-            },
+    let s = 0;
+    const failedIds: number[] = [];
+    setBatchDeleting(true);
+    setBatchDeleteProgress({ current: 0, total: ids.length });
+    try {
+      for (const [index, id] of ids.entries()) {
+        try {
+          await new Promise<void>((resolve, reject) => {
+            deleteCredential(id, {
+              onSuccess: () => {
+                s++;
+                resolve();
+              },
+              onError: (err) => {
+                failedIds.push(id);
+                reject(err);
+              },
+            });
           });
-        });
-      } catch {}
+        } catch {
+          // 单个失败不中断整批：继续删剩下的，最后统一汇报
+        }
+        setBatchDeleteProgress({ current: index + 1, total: ids.length });
+      }
+    } finally {
+      // 放在 finally：异常路径也必须退出"删除中"状态，否则按钮永久禁用
+      setBatchDeleting(false);
     }
-    if (f === 0) toast.success(`成功删除 ${s} 个凭据`);
-    else toast.warning(`删除凭据：成功 ${s} 个，失败 ${f} 个`);
-    deselectAll();
+
+    if (failedIds.length === 0) {
+      toast.success(`成功删除 ${s} 个凭据`);
+      deselectAll();
+    } else {
+      toast.warning(
+        `删除凭据：成功 ${s} 个，失败 ${failedIds.length} 个（失败项仍保持选中，可直接重试）`,
+      );
+      // 只保留失败项的选中态，方便原地重试，不必重新勾一遍
+      setSelectedIds(new Set(failedIds));
+    }
   };
 
   const handleBatchResetFailure = async () => {
@@ -1713,10 +1736,19 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                     size="sm"
                     variant="destructive"
                     className="w-full sm:w-auto"
-                    disabled={selectedIds.size === 0}
+                    disabled={selectedIds.size === 0 || batchDeleting}
+                    title={
+                      batchDeleting
+                        ? `正在删除 ${batchDeleteProgress.current}/${batchDeleteProgress.total}`
+                        : undefined
+                    }
                   >
-                    <Trash2 className="h-3.5 w-3.5" />
-                    删除
+                    <Trash2
+                      className={`h-3.5 w-3.5 ${batchDeleting ? "animate-pulse" : ""}`}
+                    />
+                    {batchDeleting
+                      ? `删除中 ${batchDeleteProgress.current}/${batchDeleteProgress.total}`
+                      : "删除"}
                   </Button>
                   <span className="mx-1 hidden h-5 w-px bg-border/70 sm:inline-block" />
                 </>
