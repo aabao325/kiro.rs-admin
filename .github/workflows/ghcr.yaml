@@ -1,0 +1,188 @@
+name: Build and Push GHCR Images
+
+# 把镜像推到本仓库的 GitHub Packages（ghcr.io），供宝塔面板直接 pull。
+#
+# 与 docker-build.yaml（Docker Hub）并存、互不影响：复用同一个 Dockerfile，
+# 镜像内容一致，只是多一个分发渠道。GHCR 用内置 GITHUB_TOKEN 认证，
+# 不需要配置任何 secret。
+#
+# 标签规则：
+#   - sha-<短哈希>  每次构建都有，可精确回滚到任意一次提交
+#   - <版本号>      仅手动触发且填了 version 时
+#   - latest        仅 master 推送，或手动触发且勾选 latest
+#     （开发分支的构建不会动 latest，避免未完成的改动被宝塔自动拉走）
+#
+# 首次推送后需要手动把包设为 public（仓库 → Packages → 该包 →
+# Package settings → Change visibility），GITHUB_TOKEN 无权修改可见性。
+# 设过一次之后所有后续推送都沿用该设置。
+on:
+  push:
+    branches:
+      - master
+      # 当前正在移植上游功能的工作分支：让镜像在合入 master 之前就能拉到，
+      # 只产出 sha- 标签、不动 latest。分支合并后可以删掉这一行。
+      - merge-upstream-0.7.2
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.gitignore'
+      - '.gitattributes'
+      - 'LICENSE'
+      - 'config.example.json'
+      - '.vscode/**'
+      - '.idea/**'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号（如 0.7.2）。留空则只打 sha- 标签'
+        required: false
+        default: ''
+      latest:
+        description: '同时更新 latest 标签'
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  # 版本号与标签只算一次，build 和 manifest 共用，避免两处逻辑漂移。
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+      sha_tag: ${{ steps.meta.outputs.sha_tag }}
+      version_tag: ${{ steps.meta.outputs.version_tag }}
+      update_latest: ${{ steps.meta.outputs.update_latest }}
+    steps:
+      - name: Resolve image name and tags
+        id: meta
+        env:
+          OWNER: ${{ github.repository_owner }}
+          SHA: ${{ github.sha }}
+          RAW_VERSION: ${{ github.event.inputs.version }}
+          IS_MASTER: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+          WANT_LATEST: ${{ github.event.inputs.latest == 'true' }}
+        run: |
+          set -euo pipefail
+          # 镜像仓库名必须全小写，所有者含大写字母时直接用会被 registry 拒绝。
+          echo "image=ghcr.io/$(echo "${OWNER}" | tr '[:upper:]' '[:lower:]')/kiro-rs-admin" >> "$GITHUB_OUTPUT"
+          echo "sha_tag=sha-$(echo "${SHA}" | cut -c1-7)" >> "$GITHUB_OUTPUT"
+          echo "version_tag=${RAW_VERSION#v}" >> "$GITHUB_OUTPUT"
+          if [ "${IS_MASTER}" = "true" ] || [ "${WANT_LATEST}" = "true" ]; then
+            echo "update_latest=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "update_latest=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            arch: amd64
+          - platform: linux/arm64
+            runner: ubuntu-22.04-arm
+            arch: arm64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 组装本架构的 tag 列表：sha- 必有，版本号可选。
+      - name: Compose tags
+        id: tags
+        env:
+          IMG: ${{ needs.prepare.outputs.image }}
+          SHA_TAG: ${{ needs.prepare.outputs.sha_tag }}
+          VERSION_TAG: ${{ needs.prepare.outputs.version_tag }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          {
+            echo "list<<EOF"
+            echo "${IMG}:${SHA_TAG}-${ARCH}"
+            if [ -n "${VERSION_TAG}" ]; then
+              echo "${IMG}:${VERSION_TAG}-${ARCH}"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          cache-from: type=gha,scope=ghcr-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=ghcr-${{ matrix.arch }}
+          push: true
+          provenance: false
+          tags: ${{ steps.tags.outputs.list }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.description=Kiro.rs Admin (fork) container image
+
+  # 把两个单架构 tag 合成多架构 manifest，客户端 pull 时自动选对应架构。
+  manifest:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and push multi-arch manifests
+        env:
+          IMG: ${{ needs.prepare.outputs.image }}
+          SHA_TAG: ${{ needs.prepare.outputs.sha_tag }}
+          VERSION_TAG: ${{ needs.prepare.outputs.version_tag }}
+          UPDATE_LATEST: ${{ needs.prepare.outputs.update_latest }}
+        run: |
+          set -euo pipefail
+
+          # 单架构源镜像统一用 sha- 标签，版本号是否存在都不影响。
+          push_manifest() {
+            local tag="$1"
+            docker manifest create "${IMG}:${tag}" \
+              "${IMG}:${SHA_TAG}-amd64" \
+              "${IMG}:${SHA_TAG}-arm64"
+            docker manifest push "${IMG}:${tag}"
+            echo "pushed ${IMG}:${tag}"
+          }
+
+          push_manifest "${SHA_TAG}"
+          if [ -n "${VERSION_TAG}" ]; then
+            push_manifest "${VERSION_TAG}"
+          fi
+          if [ "${UPDATE_LATEST}" = "true" ]; then
+            push_manifest "latest"
+          fi
+
+          {
+            echo "### GHCR 镜像已推送"
+            echo ""
+            echo '```'
+            echo "docker pull ${IMG}:${SHA_TAG}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

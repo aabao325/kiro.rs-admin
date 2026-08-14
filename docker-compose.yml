@@ -1,6 +1,11 @@
 services:
   kiro-rs:
-    image: aabao325/kiro-rs-admin:latest
+    # GHCR（GitHub Packages，由 .github/workflows/ghcr.yaml 自动推送）。
+    # 宝塔面板直接 `docker compose pull` 即可拉最新版；需要精确回滚时把标签换成
+    # 对应提交的 sha-<短哈希>（Packages 页面能看到全部可用标签）。
+    image: ghcr.io/aabao325/kiro-rs-admin:latest
+    # Docker Hub 渠道（docker-build.yaml 推送），二者镜像内容一致，按需切换：
+    # image: aabao325/kiro-rs-admin:latest
     build:
       context: .
       dockerfile: Dockerfile
