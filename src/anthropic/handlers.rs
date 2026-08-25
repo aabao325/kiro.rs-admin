@@ -52,6 +52,11 @@ pub(crate) struct UsageRecordHook {
     pub key_id: u64,
     pub model: String,
     pub started_at: Instant,
+    /// `Official` 档真值命中标记，成功路径落账前由调用方填写。
+    ///
+    /// 做成字段而不是 `record` 的入参：20 处调用点里绝大多数是错误路径，
+    /// 那些请求根本没走到上游、无真值可谈，逐个补 `None` 只是噪音。
+    pub official_truth: Option<bool>,
 }
 
 impl UsageRecordHook {
@@ -63,7 +68,15 @@ impl UsageRecordHook {
             key_id,
             model,
             started_at: Instant::now(),
+            official_truth: None,
         }
+    }
+
+    /// 标记本次请求的 `Official` 档真值命中情况（`None` 表示不在该档）。
+    ///
+    /// 记账点普遍只持有 `&UsageRecordHook`，故用 `&mut self` 而非消费式构建器。
+    pub fn set_official_truth(&mut self, hit: Option<bool>) {
+        self.official_truth = hit;
     }
 
     pub fn record(
@@ -90,6 +103,7 @@ impl UsageRecordHook {
             } else {
                 0.0
             },
+            official_truth: self.official_truth,
             duration_ms: self.started_at.elapsed().as_millis() as u64,
             status: status.to_string(),
         };
@@ -654,7 +668,7 @@ pub async fn post_messages(
             "incoming image payload is large; if upstream rejects with CONTENT_LENGTH_EXCEEDS_THRESHOLD, reduce image count or use lower-resolution screenshots"
         );
     }
-    let hook = UsageRecordHook::from_state(&state, key_ctx.key_id, payload.model.clone());
+    let mut hook = UsageRecordHook::from_state(&state, key_ctx.key_id, payload.model.clone());
     // 检查 KiroProvider 是否可用
     let provider = match &state.kiro_provider {
         Some(p) => p.clone(),
@@ -780,8 +794,9 @@ pub async fn post_messages(
 
     // CacheMeter：根据 cache_control 断点查 / 写中转层提示词缓存（Auto 模式使用）。
     // 返回 estimate 口径的覆盖量；真实 input/cache 互斥分摊在拿到 total 真值时进行。
-    // 三档模式（关闭/智能模拟/比例强制）由 cache_force::resolve 统一处理，
-    // Force/Off 模式下不需要哈希链查/写，跳过该 O(会话长度) 的同步工作。
+    // 四档模式（关闭/智能模拟/比例强制/官方真值）由 cache_force::resolve 统一处理。
+    // 仅 Auto 档需要哈希链查/写；Force/Off/Official 跳过该 O(会话长度) 的同步工作
+    // （Official 用服务端真值，本地模拟结果对它无意义）。
     let cache_force_settings = state
         .cache_force
         .as_ref()
@@ -938,7 +953,7 @@ fn create_sse_stream(
 
     let processing_stream = stream::unfold(
         (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), hook, credential_id, tracer, 0u64),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, hook, credential_id, tracer, mut sent_bytes)| async move {
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, mut hook, credential_id, tracer, mut sent_bytes)| async move {
             if finished {
                 return None;
             }
@@ -983,7 +998,7 @@ fn create_sse_stream(
                             tracing::error!("读取响应流失败: {}", e);
                             // 发送最终事件并结束（记为 error）
                             let final_events = ctx.generate_final_events();
-                            record_stream_usage(&hook, &ctx, credential_id, "error");
+                            record_stream_usage(&mut hook, &ctx, credential_id, "error");
                             // 已开始返回内容后上游断流：标记为 interrupted，带已发送字节数
                             tracer.finalize(
                                 "interrupted",
@@ -1005,7 +1020,7 @@ fn create_sse_stream(
                             if let Some(message) = ctx.tool_json_error_message() {
                                 // 工具调用 JSON 半截 / 非法：实时流已回 200，无法改状态码，
                                 // 只能记 error 并让 generate_final_events 补发的 `error` 事件透传给客户端。
-                                record_stream_usage(&hook, &ctx, credential_id, "error");
+                                record_stream_usage(&mut hook, &ctx, credential_id, "error");
                                 tracer.finalize(
                                     "error",
                                     Some(outcome::BAD_REQUEST),
@@ -1014,7 +1029,7 @@ fn create_sse_stream(
                                     stream_trace_usage(&ctx),
                                 );
                             } else {
-                                record_stream_usage(&hook, &ctx, credential_id, "success");
+                                record_stream_usage(&mut hook, &ctx, credential_id, "success");
                                 tracer.finalize(
                                     "success",
                                     None,
@@ -1047,17 +1062,22 @@ fn create_sse_stream(
 
 /// 从 StreamContext 提取最终用量并写入 hook
 fn record_stream_usage(
-    hook: &UsageRecordHook,
+    hook: &mut UsageRecordHook,
     ctx: &StreamContext,
     credential_id: u64,
     status: &str,
 ) {
+    // 覆盖率标记：StreamContext 自己知道本次是否在 Official 档、真值是否到位。
+    hook.set_official_truth(ctx.official_truth_hit());
     // 互斥分摊后的 (input, cache_creation, cache_read)，与 trace 上报口径一致。
     let (input, cache_creation, cache_read) = ctx.resolved_usage();
+    // Official 档下 output 也用服务端真值，保证记账与对客户端上报同源
+    // （否则面板累计量仍是偏小的本地估算，无法与上游账单对齐）。
+    let output_tokens = ctx.resolved_output_tokens(ctx.output_tokens);
     hook.record(
         credential_id,
         input,
-        ctx.output_tokens,
+        output_tokens,
         cache_creation,
         cache_read,
         ctx.credits,
@@ -1068,9 +1088,10 @@ fn record_stream_usage(
 /// 从 StreamContext 提取用量，转成 trace 行用量（与 record_stream_usage 同源）
 fn stream_trace_usage(ctx: &StreamContext) -> TraceUsage {
     let (input, cache_creation, cache_read) = ctx.resolved_usage();
+    let output_tokens = ctx.resolved_output_tokens(ctx.output_tokens);
     TraceUsage {
         input_tokens: input.max(0) as u64,
-        output_tokens: ctx.output_tokens.max(0) as u64,
+        output_tokens: output_tokens.max(0) as u64,
         cache_creation_tokens: cache_creation.max(0) as u64,
         cache_read_tokens: cache_read.max(0) as u64,
         credits: if ctx.credits.is_finite() && ctx.credits > 0.0 { ctx.credits } else { 0.0 },
@@ -1148,6 +1169,8 @@ async fn handle_non_stream_request(
     // meteringEvent 上报的 credit 计费量（上游真实下发）；
     // input/cache_* 的互斥分摊在拿到 total 真值后由 cache_usage 完成。
     let mut credits: f64 = 0.0;
+    // 上游 metadataEvent.tokenUsage 累计真值（Official 档的数据源）。
+    let mut official_usage: Option<crate::kiro::model::events::TokenUsage> = None;
 
     // 工具调用参数 JSON 累积器：按 tool_use_id 缓冲分片，stop 时整体解析。
     // 半截 / 非法 JSON 显式暴露为错误（返回 502），不再静默回退 {} 或丢弃。
@@ -1207,6 +1230,18 @@ async fn handle_non_stream_request(
                             // 上游只下发 credit；token / cache 字段不存在
                             credits += metering.usage;
                             tracing::debug!("metering credits +{:.6}", metering.usage);
+                        }
+                        Event::Metadata(metadata) => {
+                            // token 明细在 metadataEvent；多次 provider 调用累加。
+                            if let Some(usage) = metadata.token_usage {
+                                let usage = usage.sanitized();
+                                if !usage.is_empty() {
+                                    official_usage = Some(match official_usage {
+                                        Some(prev) => prev.saturating_add(usage),
+                                        None => usage,
+                                    });
+                                }
+                            }
                         }
                         Event::Exception { exception_type, .. } => {
                             if exception_type == "ContentLengthExceededException" {
@@ -1284,18 +1319,29 @@ async fn handle_non_stream_request(
     );
     content.extend(tool_uses);
 
-    // 估算输出 tokens（上游不下发 token，全部走估算）
-    let output_tokens = token::estimate_output_tokens(&content);
+    // 估算输出 tokens（Official 档下会被服务端真值覆盖，见下）
+    let estimated_output_tokens = token::estimate_output_tokens(&content);
 
     // 输入 tokens：固定用客户端估算（不含内置提示词，见 resolve_usage_input_tokens 说明）
     let total_input_tokens = resolve_usage_input_tokens(input_tokens);
-    // 互斥分摊：三档模式统一走 cache_force::resolve（Off/Auto/Force）
+    // 互斥分摊：四档模式统一走 cache_force::resolve（Off/Auto/Force/Official）
     let resolved = super::cache_force::resolve(
         &cache_force_settings,
         &cache_usage,
         total_input_tokens,
         cache_ttl_secs,
+        official_usage,
     );
+    // Official 档：output 同样采用服务端真值，缺失则回退本地估算。
+    let official_truth = official_usage
+        .map(|u| u.sanitized())
+        .filter(|u| !u.is_empty());
+    let output_tokens =
+        if cache_force_settings.mode == super::cache_force::CacheMode::Official {
+            official_truth.map_or(estimated_output_tokens, |u| u.output_tokens)
+        } else {
+            estimated_output_tokens
+        };
     let final_input_tokens = resolved.input_tokens;
     let cache_creation_tokens = resolved.cache_creation_input_tokens;
     let cache_read_tokens = resolved.cache_read_input_tokens;
@@ -1333,6 +1379,14 @@ async fn handle_non_stream_request(
         response_body["context_management"] = json!({ "applied_edits": [] });
     }
 
+    // 覆盖率：仅 Official 档写入 Some(..)，其余档位留 None 不计入分母。
+    hook.set_official_truth(
+        if cache_force_settings.mode == super::cache_force::CacheMode::Official {
+            Some(official_truth.is_some())
+        } else {
+            None
+        },
+    );
     hook.record(
         credential_id,
         final_input_tokens,
@@ -1503,7 +1557,7 @@ pub async fn post_messages_cc(
         message_count = %payload.messages.len(),
         "Received POST /cc/v1/messages request"
     );
-    let hook = UsageRecordHook::from_state(&state, key_ctx.key_id, payload.model.clone());
+    let mut hook = UsageRecordHook::from_state(&state, key_ctx.key_id, payload.model.clone());
 
     // 检查 KiroProvider 是否可用
     let provider = match &state.kiro_provider {
@@ -1627,7 +1681,8 @@ pub async fn post_messages_cc(
     let tool_name_map = conversion_result.tool_name_map;
     let known_tool_names = conversion_result.known_tool_names;
 
-    // CacheMeter：根据 cache_control 断点查 / 写中转层提示词缓存（Auto 模式使用，estimate 口径）。
+    // CacheMeter：根据 cache_control 断点查 / 写中转层提示词缓存（仅 Auto 档使用，
+    // estimate 口径）。Official 档走服务端真值，同样跳过哈希链计算。
     let cache_force_settings = state
         .cache_force
         .as_ref()

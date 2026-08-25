@@ -41,9 +41,19 @@ pub struct UsageRecord {
     pub cache_creation_tokens: u64,
     #[serde(default)]
     pub cache_read_tokens: u64,
-    /// 上游 meteringEvent.usage 上报的 credit 计费量（浮点）
+    /// 上游 meteringEvent.usage 上报的 credit 计费量（浮点）。
+    ///
+    /// 仅供管理端内部统计；**不进 API 响应体**——对外 usage 只输出 Anthropic
+    /// 官方字段。
     #[serde(default)]
     pub credits: f64,
+    /// `Official` 档下本次是否真的用上了服务端真值。
+    ///
+    /// `None` = 本次不在 Official 档（面板不计入覆盖率分母）；
+    /// `Some(true)` = 收到并采用了 metadataEvent.tokenUsage；
+    /// `Some(false)` = 在 Official 档但真值缺失，已回退本地估算。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub official_truth: Option<bool>,
     /// 端到端耗时（毫秒）
     #[serde(default)]
     pub duration_ms: u64,
@@ -731,6 +741,7 @@ mod tests {
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
             credits: 0.05,
+            official_truth: None,
             duration_ms: 1500,
             status: "success".to_string(),
         };
@@ -769,6 +780,7 @@ mod tests {
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
             credits: 0.01,
+            official_truth: None,
             duration_ms: 100,
             status: "success".to_string(),
         };
@@ -782,6 +794,7 @@ mod tests {
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
             credits: 0.02,
+            official_truth: None,
             duration_ms: 200,
             status: "error".to_string(),
         };
@@ -836,6 +849,7 @@ mod tests {
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
             credits: 0.01,
+            official_truth: None,
             duration_ms: 100,
             status: "success".to_string(),
         };
@@ -849,6 +863,7 @@ mod tests {
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
             credits: 0.02,
+            official_truth: None,
             duration_ms: 100,
             status: "success".to_string(),
         };
@@ -898,6 +913,7 @@ mod tests {
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
             credits: 0.0,
+            official_truth: None,
             duration_ms: 100,
             status: "error".to_string(),
         };

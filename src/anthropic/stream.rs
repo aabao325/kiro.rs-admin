@@ -1407,6 +1407,11 @@ pub struct StreamContext {
     tool_json_error: Option<ToolJsonAccumulatorError>,
     /// 跨 chunk 过滤混入 assistant 文本的字面 `<tool_use>` XML 泄漏。
     tool_use_xml_filter: ToolUseXmlLeakFilter,
+    /// 上游 `metadataEvent.tokenUsage` 累计真值（`Official` 档的数据源）。
+    ///
+    /// 单次客户端请求可能触发多次 provider 调用（工具多轮、websearch 循环），
+    /// 每次各自下发快照，因此按 `saturating_add` 累加而非覆盖。
+    official_usage: Option<crate::kiro::model::events::TokenUsage>,
 }
 
 impl StreamContext {
@@ -1426,7 +1431,31 @@ impl StreamContext {
             &self.cache_usage,
             total_real,
             self.cache_ttl_secs,
+            self.official_usage,
         )
+    }
+
+    /// `Official` 档下最终上报的 output_tokens：真值优先，缺失回退本地估算。
+    ///
+    /// 其余三档恒用本地估算（保持既有行为一行不变）。
+    pub fn resolved_output_tokens(&self, estimated: i32) -> i32 {
+        if self.cache_force_settings.mode != super::cache_force::CacheMode::Official {
+            return estimated;
+        }
+        match self.official_usage.map(|u| u.sanitized()) {
+            Some(u) if !u.is_empty() => u.output_tokens,
+            _ => estimated,
+        }
+    }
+
+    /// 本次请求 `Official` 档是否真的用上了服务端真值（用于覆盖率统计）。
+    ///
+    /// 仅 `Official` 档有意义：其余档位恒为 `None`，面板不计入分母。
+    pub fn official_truth_hit(&self) -> Option<bool> {
+        if self.cache_force_settings.mode != super::cache_force::CacheMode::Official {
+            return None;
+        }
+        Some(matches!(self.official_usage.map(|u| u.sanitized()), Some(u) if !u.is_empty()))
     }
 
     /// 解析最终上报口径的 `(input_tokens, cache_creation, cache_read)`。
@@ -1490,6 +1519,7 @@ impl StreamContext {
             tool_json_accumulator: ToolJsonAccumulator::new(),
             tool_json_error: None,
             tool_use_xml_filter: ToolUseXmlLeakFilter::default(),
+            official_usage: None,
         }
     }
 
@@ -1595,6 +1625,27 @@ impl StreamContext {
                 // 上游 meteringEvent 只下发 credit；token / cache 字段不存在。
                 self.credits += metering.usage;
                 tracing::debug!("metering credits +{:.6}", metering.usage);
+                Vec::new()
+            }
+            Event::Metadata(metadata) => {
+                // token 明细在 metadataEvent 里（不在 meteringEvent）。多次
+                // provider 调用累加，供 Official 档作为上报与记账的数据源。
+                if let Some(usage) = metadata.token_usage {
+                    let usage = usage.sanitized();
+                    if !usage.is_empty() {
+                        self.official_usage = Some(match self.official_usage {
+                            Some(prev) => prev.saturating_add(usage),
+                            None => usage,
+                        });
+                        tracing::debug!(
+                            "metadataEvent tokenUsage: uncached={} out={} read={} write={}",
+                            usage.uncached_input_tokens,
+                            usage.output_tokens,
+                            usage.cache_read_input_tokens,
+                            usage.cache_write_input_tokens
+                        );
+                    }
+                }
                 Vec::new()
             }
             Event::Error {
@@ -2513,11 +2564,14 @@ impl StreamContext {
 
         // 互斥口径：total 真值（contextUsage 优先）− 缓存覆盖 = 未缓存的 input。
         let resolved = self.resolved_cache_usage_full();
+        // Official 档：message_start 已按估算发过占位，此处 message_delta 用服务端
+        // 真值修正；客户端以最后一份 usage 为准，故成本显示对齐上游计费。
+        let final_output_tokens = self.resolved_output_tokens(self.output_tokens);
 
         // 生成最终事件（message_delta + message_stop）
         events.extend(self.state_manager.generate_final_events(
             resolved.input_tokens,
-            self.output_tokens,
+            final_output_tokens,
             resolved.cache_creation_input_tokens,
             resolved.cache_read_input_tokens,
             resolved.ephemeral_5m_input_tokens,

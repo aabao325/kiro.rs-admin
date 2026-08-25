@@ -14,6 +14,8 @@ pub enum EventType {
     ToolUse,
     /// 计费事件
     Metering,
+    /// 元数据事件（携带服务端真实 token 用量）
+    Metadata,
     /// 上下文使用率事件
     ContextUsage,
     /// 推理内容事件
@@ -29,6 +31,7 @@ impl EventType {
             "assistantResponseEvent" => Self::AssistantResponse,
             "toolUseEvent" => Self::ToolUse,
             "meteringEvent" => Self::Metering,
+            "metadataEvent" => Self::Metadata,
             "contextUsageEvent" => Self::ContextUsage,
             "reasoningContentEvent" => Self::ReasoningContent,
             _ => Self::Unknown,
@@ -41,6 +44,7 @@ impl EventType {
             Self::AssistantResponse => "assistantResponseEvent",
             Self::ToolUse => "toolUseEvent",
             Self::Metering => "meteringEvent",
+            Self::Metadata => "metadataEvent",
             Self::ContextUsage => "contextUsageEvent",
             Self::ReasoningContent => "reasoningContentEvent",
             Self::Unknown => "unknown",
@@ -73,6 +77,8 @@ pub enum Event {
     ToolUse(super::ToolUseEvent),
     /// 计费
     Metering(super::MeteringEvent),
+    /// 元数据（服务端真实 token 用量）
+    Metadata(super::MetadataEvent),
     /// 上下文使用率
     ContextUsage(super::ContextUsageEvent),
     /// 推理内容
@@ -125,6 +131,10 @@ impl Event {
             EventType::Metering => {
                 let payload = super::MeteringEvent::from_frame(&frame)?;
                 Ok(Self::Metering(payload))
+            }
+            EventType::Metadata => {
+                let payload = super::MetadataEvent::from_frame(&frame)?;
+                Ok(Self::Metadata(payload))
             }
             EventType::ContextUsage => {
                 let payload = super::ContextUsageEvent::from_frame(&frame)?;

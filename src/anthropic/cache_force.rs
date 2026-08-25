@@ -7,8 +7,12 @@
 //! 看到"缓存生效"的数字，而不依赖真实的跨轮前缀命中。
 //!
 //! 算法与 `input_tokens` 恒 ≥ 1 的边界处理照搬自 kiro.rs 项目的
-//! `src/model/cache_sim.rs`（同作者、已验证过的实现），只是包装成三档模式
-//! （关闭 / 智能模拟 / 比例强制）而不是简单的开关。
+//! `src/model/cache_sim.rs`（同作者、已验证过的实现），包装成四档模式
+//! （关闭 / 智能模拟 / 比例强制 / 官方真值）而不是简单的开关。
+//!
+//! 第四档 `Official` 与前三档性质不同：前三档都是在对**本地估算**做再分配，
+//! 数字与本次请求真实的缓存命中无关；`Official` 直接采用上游
+//! `metadataEvent.tokenUsage` 下发的服务端计量结果，与上游计费口径一致。
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -26,6 +30,12 @@ pub enum CacheMode {
     Auto,
     /// 不管请求有没有 cache_control，按下面三个比例强制拆分。
     Force,
+    /// 使用上游 `metadataEvent.tokenUsage` 的**服务端真实用量**，与上游计费口径
+    /// 一致。真值缺失时回退到本地估算总量（全部计入 `input_tokens`）。
+    ///
+    /// 与其余三档的根本区别：那三档都在对**本地估算**做再分配，数字与本次请求
+    /// 真实的缓存命中无关；本档直接采用服务端下发的计量结果。
+    Official,
 }
 
 impl Default for CacheMode {
@@ -168,14 +178,19 @@ pub struct ResolvedCacheUsage {
 /// - `Auto`：走 `auto_usage.split_against_total`（`cache_metering.rs` 现有的
 ///   哈希链智能模拟结果），行为与改造前完全一致。
 /// - `Force`：走 `simulate()`，`total <= 0` 时退化为全部计入 input。
+/// - `Official`：采用 `official_usage`（上游 `metadataEvent.tokenUsage`）的服务端
+///   真实用量；缺失时回退为全部计入 `input_tokens`（即本地估算总量）。
 ///
 /// `ttl_secs` 由调用方在拿到真实 total 之前、`payload` 还未被闭包吃掉时
 /// 用 `cache_metering::detect_max_ttl` 探测好并传入。
+///
+/// `official_usage` 仅 `Official` 档使用，其余档位传 `None` 亦可。
 pub fn resolve(
     force_settings: &CacheForceSettings,
     auto_usage: &super::cache_metering::CacheUsage,
     total: i32,
     ttl_secs: i64,
+    official_usage: Option<crate::kiro::model::events::TokenUsage>,
 ) -> ResolvedCacheUsage {
     let total = total.max(0);
     let (input_tokens, cache_creation_input_tokens, cache_read_input_tokens) =
@@ -189,6 +204,15 @@ pub fn resolve(
                     u.cache_read_input_tokens,
                 ),
                 None => (total, 0, 0),
+            },
+            CacheMode::Official => match official_usage.map(|u| u.sanitized()) {
+                // 全零快照视同缺失：当作真值会把本次请求记成 0 用量。
+                Some(u) if !u.is_empty() => (
+                    u.uncached_input_tokens,
+                    u.cache_write_input_tokens,
+                    u.cache_read_input_tokens,
+                ),
+                _ => (total, 0, 0),
             },
         };
 
@@ -360,7 +384,7 @@ mod tests {
             cache_covered_est: 200,
             prompt_total_est: 400,
         };
-        let r = resolve(&s, &auto, 1000, 300);
+        let r = resolve(&s, &auto, 1000, 300, None);
         assert_eq!(r.input_tokens, 1000);
         assert_eq!(r.cache_creation_input_tokens, 0);
         assert_eq!(r.cache_read_input_tokens, 0);
@@ -377,7 +401,7 @@ mod tests {
             prompt_total_est: 400,
         };
         let (expect_input, expect_creation, expect_read) = auto.split_against_total(1000);
-        let r = resolve(&s, &auto, 1000, 300);
+        let r = resolve(&s, &auto, 1000, 300, None);
         assert_eq!(r.input_tokens, expect_input);
         assert_eq!(r.cache_creation_input_tokens, expect_creation);
         assert_eq!(r.cache_read_input_tokens, expect_read);
@@ -391,7 +415,7 @@ mod tests {
     fn resolve_force_mode_uses_simulate() {
         let s = settings(CacheMode::Force, 0.2, 0.7, 1.0);
         let auto = super::super::cache_metering::CacheUsage::default();
-        let r = resolve(&s, &auto, 1000, 300);
+        let r = resolve(&s, &auto, 1000, 300, None);
         assert_eq!(r.cache_creation_input_tokens, 200);
         assert_eq!(r.cache_read_input_tokens, 699);
         assert_eq!(r.input_tokens, 101);
@@ -403,7 +427,7 @@ mod tests {
     fn resolve_force_mode_ttl_1h_buckets_creation_into_1h() {
         let s = settings(CacheMode::Force, 0.2, 0.7, 1.0);
         let auto = super::super::cache_metering::CacheUsage::default();
-        let r = resolve(&s, &auto, 1000, 3600);
+        let r = resolve(&s, &auto, 1000, 3600, None);
         assert_eq!(r.ephemeral_5m_input_tokens, 0);
         assert_eq!(r.ephemeral_1h_input_tokens, r.cache_creation_input_tokens);
     }
@@ -412,7 +436,7 @@ mod tests {
     fn resolve_zero_total_is_safe() {
         let s = settings(CacheMode::Force, 0.5, 0.5, 1.0);
         let auto = super::super::cache_metering::CacheUsage::default();
-        let r = resolve(&s, &auto, 0, 300);
+        let r = resolve(&s, &auto, 0, 300, None);
         assert_eq!(r.input_tokens, 0);
         assert_eq!(r.cache_creation_input_tokens, 0);
         assert_eq!(r.cache_read_input_tokens, 0);
@@ -439,5 +463,131 @@ mod tests {
         assert_eq!(reloaded.snapshot().creation_ratio, 0.3);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+    // ---- Official 档：服务端真值 ----
+
+    fn tu(uncached: i32, out: i32, read: i32, write: i32) -> crate::kiro::model::events::TokenUsage {
+        crate::kiro::model::events::TokenUsage {
+            uncached_input_tokens: uncached,
+            output_tokens: out,
+            cache_read_input_tokens: read,
+            cache_write_input_tokens: write,
+        }
+    }
+
+    /// Official 档直接采用服务端四字段，与本地估算 total 无关。
+    #[test]
+    fn official_mode_uses_server_truth_verbatim() {
+        let s = CacheForceSettings {
+            mode: CacheMode::Official,
+            ..Default::default()
+        };
+        let auto = super::super::cache_metering::CacheUsage::default();
+        // total 传一个与真值完全不同的估算值，验证它不参与计算
+        let r = resolve(&s, &auto, 99_999, 300, Some(tu(101, 23, 300, 40)));
+
+        assert_eq!(r.input_tokens, 101, "input 取 uncachedInputTokens");
+        assert_eq!(r.cache_creation_input_tokens, 40, "creation 取 cacheWrite");
+        assert_eq!(r.cache_read_input_tokens, 300, "read 取 cacheRead");
+    }
+
+    /// 真值缺失 → 回退本地估算总量，全部计入 input（不做百分比反推）。
+    ///
+    /// 刻意不移植上游的 `context_input_tokens` 百分比反推回退：实测那个算法在
+    /// 1M 上下文模型上会把一个几乎不含内容的请求放大成 6000+ token。
+    #[test]
+    fn official_mode_falls_back_to_estimate_when_truth_missing() {
+        let s = CacheForceSettings {
+            mode: CacheMode::Official,
+            ..Default::default()
+        };
+        let auto = super::super::cache_metering::CacheUsage::default();
+        let r = resolve(&s, &auto, 1000, 300, None);
+
+        assert_eq!(r.input_tokens, 1000);
+        assert_eq!(r.cache_creation_input_tokens, 0);
+        assert_eq!(r.cache_read_input_tokens, 0);
+    }
+
+    /// 全零快照视同缺失：当作真值会把本次请求记成 0 用量，记账凭空少一笔。
+    #[test]
+    fn official_mode_treats_all_zero_truth_as_missing() {
+        let s = CacheForceSettings {
+            mode: CacheMode::Official,
+            ..Default::default()
+        };
+        let auto = super::super::cache_metering::CacheUsage::default();
+        let r = resolve(&s, &auto, 777, 300, Some(tu(0, 0, 0, 0)));
+
+        assert_eq!(r.input_tokens, 777, "全零真值应回退估算");
+    }
+
+    /// Official 档同样按 ttl 分 5m/1h 桶（缓存创建量来自服务端 cacheWrite）。
+    #[test]
+    fn official_mode_still_buckets_by_ttl() {
+        let s = CacheForceSettings {
+            mode: CacheMode::Official,
+            ..Default::default()
+        };
+        let auto = super::super::cache_metering::CacheUsage::default();
+
+        let r5m = resolve(&s, &auto, 0, 300, Some(tu(10, 5, 0, 40)));
+        assert_eq!(r5m.ephemeral_5m_input_tokens, 40);
+        assert_eq!(r5m.ephemeral_1h_input_tokens, 0);
+
+        let r1h = resolve(&s, &auto, 0, 3600, Some(tu(10, 5, 0, 40)));
+        assert_eq!(r1h.ephemeral_5m_input_tokens, 0);
+        assert_eq!(r1h.ephemeral_1h_input_tokens, 40);
+    }
+
+    /// 其余三档忽略 official_usage，行为与改造前完全一致。
+    #[test]
+    fn non_official_modes_ignore_server_truth() {
+        let auto = super::super::cache_metering::CacheUsage::default();
+        let truth = Some(tu(101, 23, 300, 40));
+
+        let off = CacheForceSettings { mode: CacheMode::Off, ..Default::default() };
+        let r = resolve(&off, &auto, 1000, 300, truth);
+        assert_eq!(r.input_tokens, 1000, "Off 档仍全部计入 input");
+        assert_eq!(r.cache_read_input_tokens, 0);
+
+        let force = CacheForceSettings {
+            mode: CacheMode::Force,
+            creation_ratio: 0.25,
+            hit_ratio: 0.70,
+            cacheable_ratio: 1.0,
+        };
+        let r = resolve(&force, &auto, 1000, 300, truth);
+        assert_eq!(r.cache_read_input_tokens, 700, "Force 档仍按比例，不受真值影响");
+    }
+
+    /// Official 档可持久化并正确回读（面板切档后重启不丢）。
+    #[test]
+    fn official_mode_persists() {
+        let dir = std::env::temp_dir().join(format!("cache_force_official_{}", fastrand::u64(..)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cache_force.json");
+
+        let store = CacheForceStore::load(Some(path.clone()));
+        store.update(CacheForceSettings {
+            mode: CacheMode::Official,
+            ..Default::default()
+        });
+
+        let reloaded = CacheForceStore::load(Some(path));
+        assert_eq!(reloaded.snapshot().mode, CacheMode::Official);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// CacheMode 的 JSON 取值稳定为小写字面量（面板与磁盘共用该契约）。
+    #[test]
+    fn cache_mode_serializes_lowercase() {
+        assert_eq!(serde_json::to_string(&CacheMode::Official).unwrap(), "\"official\"");
+        assert_eq!(serde_json::to_string(&CacheMode::Auto).unwrap(), "\"auto\"");
+        assert_eq!(
+            serde_json::from_str::<CacheMode>("\"official\"").unwrap(),
+            CacheMode::Official
+        );
     }
 }
