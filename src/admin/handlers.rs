@@ -1201,6 +1201,8 @@ pub async fn stats_overview(State(state): State<AdminState>) -> impl IntoRespons
         "todayOutputTokens": overview.today_output_tokens,
         "todayErrors": overview.today_errors,
         "todayCredits": overview.today_credits,
+        "todayOfficialCalls": overview.today_official_calls,
+        "todayOfficialTruthCalls": overview.today_official_truth_calls,
         "weekCalls": overview.week_calls,
         "weekInputTokens": overview.week_input_tokens,
         "weekOutputTokens": overview.week_output_tokens,

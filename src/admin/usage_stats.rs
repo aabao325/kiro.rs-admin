@@ -190,6 +190,12 @@ pub struct BucketStats {
     pub calls: u64,
     pub errors: u64,
     pub credits: f64,
+    /// `Official` 档下的请求数（覆盖率分母）。其余档位不计入。
+    #[serde(default)]
+    pub official_calls: u64,
+    /// 其中真的用上了服务端真值的请求数（覆盖率分子）。
+    #[serde(default)]
+    pub official_truth_calls: u64,
 }
 
 impl BucketStats {
@@ -203,6 +209,13 @@ impl BucketStats {
         if rec.status != "success" {
             self.errors += 1;
         }
+        // 覆盖率：仅 Official 档的请求计入分母（official_truth 为 Some）
+        if let Some(hit) = rec.official_truth {
+            self.official_calls += 1;
+            if hit {
+                self.official_truth_calls += 1;
+            }
+        }
     }
 
     /// 把另一个 stats 累加到自己上（用于 group 过滤后重新汇总）
@@ -212,6 +225,8 @@ impl BucketStats {
         self.cache_creation_tokens += other.cache_creation_tokens;
         self.cache_read_tokens += other.cache_read_tokens;
         self.credits += other.credits;
+        self.official_calls += other.official_calls;
+        self.official_truth_calls += other.official_truth_calls;
         self.calls += other.calls;
         self.errors += other.errors;
     }
@@ -351,6 +366,10 @@ pub struct OverviewStats {
     pub week_input_tokens: u64,
     pub week_output_tokens: u64,
     pub week_credits: f64,
+    /// 今日 `Official` 档请求数（真值覆盖率分母）；0 表示当天没用过该档。
+    pub today_official_calls: u64,
+    /// 其中真的采用了服务端真值的请求数（分子）。
+    pub today_official_truth_calls: u64,
 }
 
 impl UsageAggregator {
@@ -583,6 +602,8 @@ impl UsageAggregator {
             today.calls += b.overall.calls;
             today.errors += b.overall.errors;
             today.credits += b.overall.credits;
+            today.official_calls += b.overall.official_calls;
+            today.official_truth_calls += b.overall.official_truth_calls;
         }
 
         let week_cutoff = Utc::now().timestamp() - 7 * 24 * 3600;
@@ -600,6 +621,8 @@ impl UsageAggregator {
             today_output_tokens: today.output_tokens,
             today_errors: today.errors,
             today_credits: today.credits,
+            today_official_calls: today.official_calls,
+            today_official_truth_calls: today.official_truth_calls,
             week_calls: week.calls,
             week_input_tokens: week.input_tokens,
             week_output_tokens: week.output_tokens,

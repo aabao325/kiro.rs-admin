@@ -427,6 +427,10 @@ export interface OverviewStats {
   todayOutputTokens: number
   todayErrors: number
   todayCredits: number
+  /** 今日「官方真值」档的请求数（覆盖率分母）；0 表示当天没启用该档 */
+  todayOfficialCalls: number
+  /** 其中真的采用了服务端真值的请求数（分子） */
+  todayOfficialTruthCalls: number
   weekCalls: number
   weekInputTokens: number
   weekOutputTokens: number
@@ -581,7 +585,7 @@ export interface UpdateGroupRequest {
 
 // ============ 缓存强制覆盖（三档模式：关闭/智能模拟/比例强制） ============
 
-export type CacheMode = 'off' | 'auto' | 'force'
+export type CacheMode = 'off' | 'auto' | 'force' | 'official'
 
 export interface CacheForceSettings {
   mode: CacheMode

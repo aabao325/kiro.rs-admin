@@ -10,6 +10,7 @@ import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from '@/components/ui/select'
 import { useCacheForce, useSetCacheForce } from '@/hooks/use-cache-force'
+import { useOverview } from '@/hooks/use-stats'
 import { extractErrorMessage } from '@/lib/utils'
 import type { CacheForceSettings, CacheMode } from '@/types/api'
 
@@ -22,12 +23,15 @@ const MODE_LABEL: Record<CacheMode, string> = {
   off: '关闭',
   auto: '智能模拟',
   force: '比例强制',
+  official: '官方真值',
 }
 
 const MODE_DESCRIPTION: Record<CacheMode, string> = {
   off: '完全不注入缓存字段，响应的 cache_creation / cache_read 恒为 0（模拟官方未使用 cache_control 时的响应）。',
   auto: '现状：按请求里 cache_control 断点做哈希链前缀命中模拟，跨轮命中真实存在的前缀才计入缓存。',
   force: '不管请求是否带 cache_control，直接按下面三个比例把本次估算的输入 token 总数强制拆成 input / cache_creation / cache_read。',
+  official:
+    '采用上游返回的服务端真实用量（metadataEvent.tokenUsage），与上游计费口径一致 —— 缓存创建/命中是真实发生的，不是模拟值。其余三档都是对本地估算做再分配，数字与真实命中无关。上游未下发真值时，本次回退为本地估算（全部计入 input）。',
 }
 
 const DEFAULT_SETTINGS: CacheForceSettings = {
@@ -79,6 +83,7 @@ export function CacheForceDialog({ open, onOpenChange }: CacheForceDialogProps) 
           <DialogDescription>
             控制响应里 <code>cache_creation_input_tokens</code> /{' '}
             <code>cache_read_input_tokens</code> 的生成方式，全局一份设置，对所有 Key 生效。
+            选「官方真值」即采用上游服务端计量、与官方计费口径一致；其余三档均为本地估算的再分配。
           </DialogDescription>
         </DialogHeader>
 
@@ -99,7 +104,7 @@ export function CacheForceDialog({ open, onOpenChange }: CacheForceDialogProps) 
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  {(['off', 'auto', 'force'] as CacheMode[]).map((mode) => (
+                  {(['off', 'auto', 'force', 'official'] as CacheMode[]).map((mode) => (
                     <SelectItem key={mode} value={mode}>
                       {MODE_LABEL[mode]}
                     </SelectItem>
@@ -110,6 +115,8 @@ export function CacheForceDialog({ open, onOpenChange }: CacheForceDialogProps) 
             <p className="rounded-md bg-secondary/40 px-2.5 py-2 text-xs leading-snug text-muted-foreground">
               {MODE_DESCRIPTION[draft.mode]}
             </p>
+
+            {draft.mode === 'official' && <OfficialCoverage />}
 
             <div className={`grid grid-cols-3 gap-2 ${draft.mode === 'force' ? '' : 'opacity-50'}`}>
               <RatioInput
@@ -155,6 +162,49 @@ export function CacheForceDialog({ open, onOpenChange }: CacheForceDialogProps) 
 function clampRatio(value: number) {
   if (!Number.isFinite(value)) return 0
   return Math.min(1, Math.max(0, value))
+}
+
+/**
+ * 「官方真值」档的今日覆盖率。
+ *
+ * 上游的 tokenUsage 是可选字段，并非每次请求都下发。这里如实展示今日有多少
+ * 比例的请求真的用上了服务端真值 —— 覆盖率低意味着大部分请求仍在回退本地估算，
+ * 与官方计费的对齐程度会相应打折。
+ */
+function OfficialCoverage() {
+  const { data, isLoading } = useOverview()
+  const total = data?.todayOfficialCalls ?? 0
+  const hit = data?.todayOfficialTruthCalls ?? 0
+
+  if (isLoading) {
+    return (
+      <p className="text-[11px] text-muted-foreground">真值覆盖率：加载中…</p>
+    )
+  }
+  if (total === 0) {
+    return (
+      <p className="text-[11px] leading-snug text-muted-foreground">
+        真值覆盖率：今日暂无该档请求。切换保存后发起请求即可在此看到实际覆盖率。
+      </p>
+    )
+  }
+
+  const pct = Math.round((hit / total) * 1000) / 10
+  const tone =
+    pct >= 95 ? 'text-emerald-600' : pct >= 70 ? 'text-amber-600' : 'text-red-600'
+
+  return (
+    <div className="rounded-md border px-2.5 py-2 text-[11px] leading-snug">
+      <div className="flex items-baseline justify-between">
+        <span className="text-muted-foreground">今日真值覆盖率</span>
+        <span className={`font-medium ${tone}`}>{pct}%</span>
+      </div>
+      <p className="mt-1 text-muted-foreground">
+        {hit} / {total} 次请求采用了上游服务端真值，其余回退本地估算。
+        覆盖率越高，计费口径与上游越一致。
+      </p>
+    </div>
+  )
 }
 
 function RatioInput({
