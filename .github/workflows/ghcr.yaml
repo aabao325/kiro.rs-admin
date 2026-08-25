@@ -2,9 +2,9 @@ name: Build and Push GHCR Images
 
 # 把镜像推到本仓库的 GitHub Packages（ghcr.io），供宝塔面板直接 pull。
 #
-# 与 docker-build.yaml（Docker Hub）并存、互不影响：复用同一个 Dockerfile，
-# 镜像内容一致，只是多一个分发渠道。GHCR 用内置 GITHUB_TOKEN 认证，
-# 不需要配置任何 secret。
+# 这是本 fork 唯一自动运行的镜像分发渠道。docker-build.yaml（Docker Hub）
+# 已停用自动触发、只保留手动入口，两者复用同一个 Dockerfile、镜像内容一致。
+# GHCR 用内置 GITHUB_TOKEN 认证，不需要配置任何 secret。
 #
 # 标签规则：
 #   - sha-<短哈希>  每次构建都有，可精确回滚到任意一次提交

@@ -1,18 +1,25 @@
 name: Build and Push Docker Hub Images
 
+# 已停用自动触发：本 fork 的镜像分发走 GHCR（见 ghcr.yaml），
+# 且仓库未配置 DOCKERHUB_USERNAME / DOCKERHUB_TOKEN，每次推 master 都会在
+# 登录步骤失败、留下一个与代码质量无关的红叉。
+#
+# 保留手动入口而不是删除文件：补齐上面两个 secret 后即可从 Actions 页面
+# 手动运行，无需重新造一遍 workflow。要恢复自动触发，把下面注释掉的
+# push 段落取消注释即可。
 on:
-  push:
-    branches:
-      - master
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
-      - '.gitignore'
-      - '.gitattributes'
-      - 'LICENSE'
-      - 'config.example.json'
-      - '.vscode/**'
-      - '.idea/**'
+  # push:
+  #   branches:
+  #     - master
+  #   paths-ignore:
+  #     - '**.md'
+  #     - 'docs/**'
+  #     - '.gitignore'
+  #     - '.gitattributes'
+  #     - 'LICENSE'
+  #     - 'config.example.json'
+  #     - '.vscode/**'
+  #     - '.idea/**'
   workflow_dispatch:
     inputs:
       version:
