@@ -558,7 +558,9 @@ mod tests {
             cacheable_ratio: 1.0,
         };
         let r = resolve(&force, &auto, 1000, 300, truth);
-        assert_eq!(r.cache_read_input_tokens, 700, "Force 档仍按比例，不受真值影响");
+        // 699 而非 700：Force 档的可分配基数是 total-1（保证 input_tokens 恒 ≥ 1），
+        // 与既有 basic_split 测试同源。这里要断言的是「真值 300 没有被采纳」。
+        assert_eq!(r.cache_read_input_tokens, 699, "Force 档仍按比例，不受真值影响");
     }
 
     /// Official 档可持久化并正确回读（面板切档后重启不丢）。
