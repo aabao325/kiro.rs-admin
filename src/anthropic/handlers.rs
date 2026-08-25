@@ -668,7 +668,7 @@ pub async fn post_messages(
             "incoming image payload is large; if upstream rejects with CONTENT_LENGTH_EXCEEDS_THRESHOLD, reduce image count or use lower-resolution screenshots"
         );
     }
-    let mut hook = UsageRecordHook::from_state(&state, key_ctx.key_id, payload.model.clone());
+    let hook = UsageRecordHook::from_state(&state, key_ctx.key_id, payload.model.clone());
     // 检查 KiroProvider 是否可用
     let provider = match &state.kiro_provider {
         Some(p) => p.clone(),
@@ -1109,7 +1109,7 @@ async fn handle_non_stream_request(
     // 非流式路径直接处理结构化 Event::ToolUse，不经过 <invoke> 文本嗅探，
     // 因此这里不需要工具表校验；保留参数以对齐调用方签名。
     _known_tool_names: std::collections::HashSet<String>,
-    hook: UsageRecordHook,
+    mut hook: UsageRecordHook,
     cache_usage: super::cache_metering::CacheUsage,
     cache_force_settings: super::cache_force::CacheForceSettings,
     cache_ttl_secs: i64,
@@ -1557,7 +1557,7 @@ pub async fn post_messages_cc(
         message_count = %payload.messages.len(),
         "Received POST /cc/v1/messages request"
     );
-    let mut hook = UsageRecordHook::from_state(&state, key_ctx.key_id, payload.model.clone());
+    let hook = UsageRecordHook::from_state(&state, key_ctx.key_id, payload.model.clone());
 
     // 检查 KiroProvider 是否可用
     let provider = match &state.kiro_provider {
