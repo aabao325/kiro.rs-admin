@@ -399,10 +399,11 @@ pub(super) struct ParsedResponse {
     pub(super) finish_reason: String,
     pub(super) prompt_tokens: i64,
     pub(super) completion_tokens: i64,
-    /// 思考文本（content 里的 thinking 块 + web_search loop 的顶层
-    /// `kiro_thinking` 带外字段）。chat/completions 路径不消费，
-    /// Responses 路径渲染为 reasoning summary item。
+    /// 上游 reasoning 明文；Responses 路径渲染为标准 summary_text。
     pub(super) thinking: String,
+    /// 上游 redacted_thinking 载荷；仅映射为标准 reasoning.encrypted_content。
+    /// 上游 signature 不属于 Responses 标准字段，故不保留。
+    pub(super) encrypted_reasoning: Option<String>,
     /// 内部代答的 web_search 展示（server_tool_use 块）：(id, query)。
     /// Responses 路径渲染为 web_search_call item。
     pub(super) web_searches: Vec<(String, String)>,
@@ -412,6 +413,7 @@ pub(super) fn parse_anthropic_message(anthropic: &Value, model: &str) -> ParsedR
     let mut text = String::new();
     let mut tool_calls = Vec::new();
     let mut thinking = String::new();
+    let mut encrypted_reasoning: Option<String> = None;
     let mut web_searches = Vec::new();
 
     if let Some(blocks) = anthropic.get("content").and_then(|v| v.as_array()) {
@@ -425,6 +427,24 @@ pub(super) fn parse_anthropic_message(anthropic: &Value, model: &str) -> ParsedR
                 Some("thinking") => {
                     if let Some(t) = block.get("thinking").and_then(|v| v.as_str()) {
                         thinking.push_str(t);
+                    }
+                }
+                Some("redacted_thinking") => {
+                    // 上游 redactedContent 是 Responses 标准 reasoning.encrypted_content
+                    // 的唯一合法来源；缺失时保持 None，绝不本地伪造。
+                    if let Some(data) = block.get("data").and_then(|v| v.as_str())
+                        && !data.is_empty()
+                    {
+                        encrypted_reasoning = Some(data.to_string());
+                    }
+                }
+                Some("redacted_thinking") => {
+                    if encrypted_reasoning.is_none() {
+                        encrypted_reasoning = block
+                            .get("data")
+                            .and_then(|v| v.as_str())
+                            .filter(|v| !v.is_empty())
+                            .map(str::to_string);
                     }
                 }
                 Some("server_tool_use") => {
@@ -503,6 +523,7 @@ pub(super) fn parse_anthropic_message(anthropic: &Value, model: &str) -> ParsedR
         prompt_tokens,
         completion_tokens,
         thinking,
+        encrypted_reasoning,
         web_searches,
     }
 }

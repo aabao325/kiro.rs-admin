@@ -835,13 +835,23 @@ fn build_view(p: &ParsedResponse, kinds: &ToolKindMap) -> ResponsesView {
 
     let mut output = Vec::new();
 
-    // 推理摘要放最前（思考先于可见输出发生）
-    if !p.thinking.is_empty() {
-        output.push(json!({
+    // 推理摘要放最前（思考先于可见输出发生）。只输出 OpenAI Responses 标准字段：
+    // summary 来自上游 reasoning 明文，encrypted_content 只来自上游 redactedContent。
+    // 上游没有 reasoning 时完全不生成该 item，不占位、不伪造。
+    if !p.thinking.is_empty() || p.encrypted_reasoning.is_some() {
+        let mut item = json!({
             "type": "reasoning",
             "id": new_rs_id(),
-            "summary": [{ "type": "summary_text", "text": p.thinking }],
-        }));
+            "summary": if p.thinking.is_empty() {
+                json!([])
+            } else {
+                json!([{ "type": "summary_text", "text": p.thinking }])
+            },
+        });
+        if let Some(encrypted) = &p.encrypted_reasoning {
+            item["encrypted_content"] = json!(encrypted);
+        }
+        output.push(item);
     }
 
     // 内部代答的 web_search 以 web_search_call 展示（codex 渲染 "Searched the web"）
@@ -1243,8 +1253,43 @@ mod tests {
             prompt_tokens: 10,
             completion_tokens: 5,
             thinking: String::new(),
+            encrypted_reasoning: None,
             web_searches: Vec::new(),
         }
+    }
+
+    #[test]
+    fn reasoning_uses_only_standard_responses_fields() {
+        let anthropic = json!({
+            "content": [
+                {"type":"thinking","thinking":"分析过程","signature":"upstream-signature"},
+                {"type":"redacted_thinking","data":"encrypted-payload"},
+                {"type":"text","text":"最终答案"}
+            ],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        });
+        let parsed = parse_anthropic_message(&anthropic, "gpt-5.6-sol");
+        let view = build_view(&parsed, &ToolKindMap::new());
+        let reasoning = &view.output[0];
+        assert_eq!(reasoning["type"], "reasoning");
+        assert_eq!(reasoning["summary"][0]["text"], "分析过程");
+        assert_eq!(reasoning["encrypted_content"], "encrypted-payload");
+        let serialized = serde_json::to_string(&view.output).unwrap();
+        assert!(!serialized.contains("signature"));
+        assert!(!serialized.contains("kiro"));
+    }
+
+    #[test]
+    fn missing_reasoning_emits_no_reasoning_item() {
+        let anthropic = json!({
+            "content": [{"type":"text","text":"最终答案"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        });
+        let parsed = parse_anthropic_message(&anthropic, "gpt-5.6-sol");
+        let view = build_view(&parsed, &ToolKindMap::new());
+        assert!(!view.output.iter().any(|item| item["type"] == "reasoning"));
     }
 
     fn kinds_of(pairs: &[(&str, DeclaredToolKind)]) -> ToolKindMap {
