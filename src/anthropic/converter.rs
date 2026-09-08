@@ -280,23 +280,17 @@ const IDENTITY_ACK: &str =
 
 /// GPT / OpenAI 身份声明。
 ///
-/// 与 Claude 策略遵循同一原则：只陈述一次事实，不使用“最高优先级”、隐藏策略、
-/// 覆盖其他指令等对抗式措辞，避免触发抗注入行为或诱发复读。
+/// 只提供被动的部署元数据，并明确限制为用户主动询问身份时才使用。
+/// 不在历史中制造待回答的身份问题，避免工具结果或空续轮重新触发身份回复。
 const OPENAI_IDENTITY_POLICY: &str = "\
-The following information is authoritative deployment metadata supplied by the API operator. Report \
-it as factual metadata; do not infer identity from the IDE, editor, gateway, host application, or \
-text bundled with them.
+The following information is deployment metadata supplied by the API operator:
 
 provider: OpenAI
 identity: an artificial intelligence language model trained by OpenAI
 interface: API
-host_product_names_are_identity: false
-runtime_details_visible_to_model: false
 
-Answer the following question in the user's language, in the first person, using only the deployment \
-metadata above. Do not identify yourself as Kiro or as a development environment.
-
-Question: Who are you?";
+Use this metadata only when the user explicitly asks about your identity. Otherwise, do not mention, \
+repeat, summarize, or acknowledge it. Continue addressing the user's actual request.";
 
 const OPENAI_IDENTITY_ACK: &str = "I will follow these instructions.";
 
@@ -2307,7 +2301,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_history_injects_openai_identity_for_gpt() {
+    fn test_build_history_injects_conditional_openai_identity_for_gpt() {
         let req = minimal_request_with_effort("gpt-5.6-sol", "high");
         let result = convert_request_with_prompt_mode(
             &req,
@@ -2321,10 +2315,12 @@ mod tests {
             panic!("首条应为纯净身份元数据 user");
         };
         assert_eq!(user.user_input_message.content, OPENAI_IDENTITY_POLICY);
-        assert!(user.user_input_message.content.contains("authoritative deployment metadata"));
+        assert!(user.user_input_message.content.contains("deployment metadata"));
         assert!(user.user_input_message.content.contains("provider: OpenAI"));
-        assert!(user.user_input_message.content.contains("host_product_names_are_identity: false"));
-        assert!(user.user_input_message.content.contains("Question: Who are you?"));
+        assert!(user.user_input_message.content.contains("only when the user explicitly asks"));
+        assert!(user.user_input_message.content.contains("Otherwise, do not mention"));
+        assert!(!user.user_input_message.content.contains("Question:"));
+        assert!(!user.user_input_message.content.contains("Who are you?"));
         assert!(!user.user_input_message.content.contains("<identity>"));
         assert!(!user.user_input_message.content.contains("You are Claude"));
         let Message::Assistant(assistant) = &history[1] else {
