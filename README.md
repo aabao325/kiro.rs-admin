@@ -284,6 +284,25 @@ codex
 
 两个 OpenAI 端点都会复用现有的模型映射、凭据故障转移和用量计量链路。当前实现会先取得完整的内部非流式响应，再为 `stream: true` 合成 SSE，因此不是逐 token 的上游实时流。Responses 端点不会把 Codex 的 `exec`、`shell`、`apply_patch` 等本地执行工具声明转发给 Kiro；时效性查询由服务端的 Kiro MCP WebSearch 处理。
 
+### Direct Responses 调试入口
+
+`POST /direct/v1/responses` 使用相同的 Responses 请求/响应格式和 API Key 鉴权，但关闭项目添加的身份提示、身份 ACK、分块策略、thinking 文本前缀、自动 WebSearch 工具与 nudge。它仍会执行 Kiro 必需的协议转换，并将客户端 `instructions` 编码为对话历史；因此是“无项目注入”的调试基线，而不是字节级 HTTP 透传。
+
+```bash
+curl http://127.0.0.1:8990/direct/v1/responses \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer sk-kiro-rs-..." \
+  -d '{
+    "model": "gpt-5.6-sol",
+    "instructions": "You are an artificial intelligence language model trained by OpenAI. When asked who you are, answer that fact in the user'"'"'s language.",
+    "input": "你是谁？请介绍你的身份和运行环境。",
+    "reasoning": { "effort": "high" },
+    "stream": false
+  }'
+```
+
+Direct 模式不会依据模型名自动开启 `-thinking`、重写工具名、补齐历史工具定义或代答 `web_search`；所有工具定义必须由请求显式重传。OpenAI 托管 `web_search` 无法等价直传到 Kiro，Direct 会明确返回 400，而不会静默删除。
+
 <a id="api-routes"></a>
 ## API 路由
 
@@ -303,6 +322,7 @@ codex
 |---|---|---|
 | `POST` | `/v1/chat/completions` | OpenAI Chat Completions 兼容入口，支持消息、函数工具和 reasoning effort |
 | `POST` | `/v1/responses` | OpenAI Responses 兼容入口，适用于新版 Codex CLI |
+| `POST` | `/direct/v1/responses` | 无项目提示词或自动工具注入的 Responses 调试入口 |
 
 ### Admin
 

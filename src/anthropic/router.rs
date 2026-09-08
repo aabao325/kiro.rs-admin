@@ -17,7 +17,7 @@ use super::{
     handlers::{count_tokens, get_models, post_messages, post_messages_cc},
     middleware::{AppState, auth_middleware, cors_layer},
     openai::post_chat_completions,
-    responses::post_responses,
+    responses::{post_responses, post_responses_direct},
     cache_force::SharedCacheForceStore,
     cache_metering::SharedCacheMeter,
 };
@@ -91,9 +91,18 @@ pub fn create_router(
             auth_middleware,
         ));
 
+    // Direct Responses 调试路由：认证与普通 API 相同，但关闭项目提示词和自动工具注入。
+    let direct_v1_routes = Router::new()
+        .route("/responses", post(post_responses_direct))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
+
     Router::new()
         .nest("/v1", v1_routes)
         .nest("/cc/v1", cc_v1_routes)
+        .nest("/direct/v1", direct_v1_routes)
         .layer(cors_layer())
         .layer(DefaultBodyLimit::max(MAX_BODY_SIZE))
         .with_state(state)

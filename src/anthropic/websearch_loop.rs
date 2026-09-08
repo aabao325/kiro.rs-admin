@@ -26,7 +26,9 @@ use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::provider::KiroProvider;
 use crate::token;
 
-use super::converter::{ConversionError, convert_request_with_mode};
+use super::converter::{
+    ConversionError, PromptInjectionMode, convert_request_with_prompt_mode,
+};
 use crate::model::config::ToolCompatibilityMode;
 use super::handlers::{UsageRecordHook, map_provider_error};
 use super::stream::{CompletedToolUse, SseEvent};
@@ -254,8 +256,13 @@ async fn run_round(
     fallback_input_tokens: i32,
     group: Option<&str>,
     tool_compatibility_mode: ToolCompatibilityMode,
+    prompt_injection_mode: PromptInjectionMode,
 ) -> Result<(RoundOutcome, u64), Response> {
-    let conversion = match convert_request_with_mode(payload, tool_compatibility_mode) {
+    let conversion = match convert_request_with_prompt_mode(
+        payload,
+        tool_compatibility_mode,
+        prompt_injection_mode,
+    ) {
         Ok(c) => c,
         Err(e) => {
             let (et, msg) = match &e {
@@ -574,6 +581,7 @@ pub(super) async fn run_web_search_loop(
     stream_client: bool,
     group: Option<String>,
     tool_compatibility_mode: ToolCompatibilityMode,
+    prompt_injection_mode: PromptInjectionMode,
 ) -> Response {
     let fallback_input_tokens = token::count_all_tokens(
         payload.model.clone(),
@@ -613,6 +621,7 @@ pub(super) async fn run_web_search_loop(
                     fallback_input_tokens,
                     group.as_deref(),
                     tool_compatibility_mode,
+                    prompt_injection_mode,
                 )
                 .await
                 {

@@ -28,7 +28,9 @@ use std::time::Duration;
 use tokio::time::interval;
 use uuid::Uuid;
 
-use super::converter::{ConversionError, convert_request_with_mode};
+use super::converter::{
+    ConversionError, PromptInjectionMode, convert_request_with_prompt_mode,
+};
 use super::middleware::{AppState, KeyContext};
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
 use super::types::{
@@ -646,7 +648,40 @@ pub async fn post_messages(
     State(state): State<AppState>,
     Extension(key_ctx): Extension<KeyContext>,
     headers: HeaderMap,
-    JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
+    JsonExtractor(payload): JsonExtractor<MessagesRequest>,
+) -> Response {
+    post_messages_with_prompt_mode(
+        state,
+        key_ctx,
+        headers,
+        payload,
+        PromptInjectionMode::Standard,
+    )
+    .await
+}
+
+pub(crate) async fn post_messages_direct(
+    State(state): State<AppState>,
+    Extension(key_ctx): Extension<KeyContext>,
+    headers: HeaderMap,
+    JsonExtractor(payload): JsonExtractor<MessagesRequest>,
+) -> Response {
+    post_messages_with_prompt_mode(
+        state,
+        key_ctx,
+        headers,
+        payload,
+        PromptInjectionMode::Direct,
+    )
+    .await
+}
+
+async fn post_messages_with_prompt_mode(
+    state: AppState,
+    key_ctx: KeyContext,
+    headers: HeaderMap,
+    mut payload: MessagesRequest,
+    prompt_injection_mode: PromptInjectionMode,
 ) -> Response {
     let context_management_enabled = context_management_requested(&headers);
     // Count the image budget on inbound to provide precise diagnostics for later context-window-full errors
@@ -686,11 +721,15 @@ pub async fn post_messages(
         }
     };
 
-    // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
-    override_thinking_from_model_name(&mut payload);
+    // Standard 模式保留模型名 `-thinking` 的便捷覆写；Direct 只接受客户端显式字段。
+    if prompt_injection_mode == PromptInjectionMode::Standard {
+        override_thinking_from_model_name(&mut payload);
+    }
 
-    // 检查是否为 WebSearch 请求
-    if websearch::has_web_search_tool(&payload) {
+    // Direct 不拦截或代答工具；客户端声明的工具只走下方协议转换。
+    if prompt_injection_mode == PromptInjectionMode::Standard
+        && websearch::has_web_search_tool(&payload)
+    {
         tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
 
         // 估算输入 tokens
@@ -717,14 +756,34 @@ pub async fn post_messages(
     let payload_stream = payload.stream;
     // Mixed-tools (web_search + exec...) case: web_search coexists with other tools and falls onto the normal chat path,
     // where the upstream may return a tool_use with name=web_search. Take the internal agentic loop: search internally and feed the results back.
-    if websearch::has_web_search_among_tools(&payload) {
+    if prompt_injection_mode == PromptInjectionMode::Standard
+        && websearch::has_web_search_among_tools(&payload)
+    {
         tracing::info!("detected mixed tools containing web_search, entering the web_search agentic loop");
-        return super::websearch_loop::run_web_search_loop(provider, payload, hook, payload_stream, key_ctx.group.clone(), state.tool_compatibility_mode)
-            .await;
+        return super::websearch_loop::run_web_search_loop(
+            provider,
+            payload,
+            hook,
+            payload_stream,
+            key_ctx.group.clone(),
+            state.tool_compatibility_mode,
+            prompt_injection_mode,
+        )
+        .await;
     }
 
+    let tool_compatibility_mode = if prompt_injection_mode == PromptInjectionMode::Direct {
+        crate::model::config::ToolCompatibilityMode::Raw
+    } else {
+        state.tool_compatibility_mode
+    };
+
     // 转换请求
-    let conversion_result = match convert_request_with_mode(&payload, state.tool_compatibility_mode) {
+    let conversion_result = match convert_request_with_prompt_mode(
+        &payload,
+        tool_compatibility_mode,
+        prompt_injection_mode,
+    ) {
         Ok(result) => result,
         Err(e) => {
             let (error_type, message) = match &e {
@@ -1608,12 +1667,24 @@ pub async fn post_messages_cc(
     // where the upstream may return a tool_use with name=web_search. Take the internal agentic loop: search internally and feed the results back.
     if websearch::has_web_search_among_tools(&payload) {
         tracing::info!("detected mixed tools containing web_search, entering the web_search agentic loop");
-        return super::websearch_loop::run_web_search_loop(provider, payload, hook, payload_stream, key_ctx.group.clone(), state.tool_compatibility_mode)
-            .await;
+        return super::websearch_loop::run_web_search_loop(
+            provider,
+            payload,
+            hook,
+            payload_stream,
+            key_ctx.group.clone(),
+            state.tool_compatibility_mode,
+            PromptInjectionMode::Standard,
+        )
+        .await;
     }
 
     // 转换请求
-    let conversion_result = match convert_request_with_mode(&payload, state.tool_compatibility_mode) {
+    let conversion_result = match convert_request_with_prompt_mode(
+        &payload,
+        state.tool_compatibility_mode,
+        PromptInjectionMode::Standard,
+    ) {
         Ok(result) => result,
         Err(e) => {
             let (error_type, message) = match &e {
