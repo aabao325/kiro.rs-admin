@@ -848,6 +848,7 @@ async fn post_messages_with_prompt_mode(
         .map(|t| t.is_enabled())
         .unwrap_or(false);
 
+    let identity_injection_tokens = conversion_result.identity_injection_tokens;
     let tool_name_map = conversion_result.tool_name_map;
     let known_tool_names = conversion_result.known_tool_names;
 
@@ -887,6 +888,7 @@ async fn post_messages_with_prompt_mode(
             &request_body,
             &payload.model,
             total_input_tokens,
+            identity_injection_tokens,
             thinking_enabled,
             tool_name_map,
             known_tool_names,
@@ -915,6 +917,7 @@ async fn post_messages_with_prompt_mode(
             &request_body,
             &payload.model,
             total_input_tokens,
+            identity_injection_tokens,
             extract_thinking,
             tool_name_map,
             known_tool_names,
@@ -936,6 +939,7 @@ async fn handle_stream_request(
     request_body: &str,
     model: &str,
     input_tokens: i32,
+    identity_injection_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     known_tool_names: std::collections::HashSet<String>,
@@ -962,6 +966,9 @@ async fn handle_stream_request(
 
     // 创建流处理上下文
     let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map, known_tool_names);
+    ctx.internal_token_adjustment = super::cache_force::InternalTokenAdjustment {
+        identity_injection_tokens,
+    };
     ctx.cache_usage = cache_usage;
     ctx.cache_force_settings = cache_force_settings;
     ctx.cache_ttl_secs = cache_ttl_secs;
@@ -1163,6 +1170,7 @@ async fn handle_non_stream_request(
     request_body: &str,
     model: &str,
     input_tokens: i32,
+    identity_injection_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     // 非流式路径直接处理结构化 Event::ToolUse，不经过 <invoke> 文本嗅探，
@@ -1290,15 +1298,12 @@ async fn handle_non_stream_request(
                             credits += metering.usage;
                             tracing::debug!("metering credits +{:.6}", metering.usage);
                         }
+                        // tokenUsage 是本次上游调用的最终快照，不是增量；保留最后一份。
                         Event::Metadata(metadata) => {
-                            // token 明细在 metadataEvent；多次 provider 调用累加。
                             if let Some(usage) = metadata.token_usage {
                                 let usage = usage.sanitized();
                                 if !usage.is_empty() {
-                                    official_usage = Some(match official_usage {
-                                        Some(prev) => prev.saturating_add(usage),
-                                        None => usage,
-                                    });
+                                    official_usage = Some(usage);
                                 }
                             }
                         }
@@ -1384,12 +1389,16 @@ async fn handle_non_stream_request(
     // 输入 tokens：固定用客户端估算（不含内置提示词，见 resolve_usage_input_tokens 说明）
     let total_input_tokens = resolve_usage_input_tokens(input_tokens);
     // 互斥分摊：四档模式统一走 cache_force::resolve（Off/Auto/Force/Official）
+    let adjusted_official_usage = super::cache_force::InternalTokenAdjustment {
+        identity_injection_tokens,
+    }
+    .apply_to_official(official_usage);
     let resolved = super::cache_force::resolve(
         &cache_force_settings,
         &cache_usage,
         total_input_tokens,
         cache_ttl_secs,
-        official_usage,
+        adjusted_official_usage,
     );
     // Official 档：output 同样采用服务端真值，缺失则回退本地估算。
     let official_truth = official_usage
@@ -1749,6 +1758,7 @@ pub async fn post_messages_cc(
         .map(|t| t.is_enabled())
         .unwrap_or(false);
 
+    let identity_injection_tokens = conversion_result.identity_injection_tokens;
     let tool_name_map = conversion_result.tool_name_map;
     let known_tool_names = conversion_result.known_tool_names;
 
@@ -1789,6 +1799,7 @@ pub async fn post_messages_cc(
             known_tool_names,
             hook,
             total_input_tokens,
+            identity_injection_tokens,
             cache_usage,
             cache_force_settings,
             cache_ttl_secs,
@@ -1813,6 +1824,7 @@ pub async fn post_messages_cc(
             &request_body,
             &payload.model,
             total_input_tokens,
+            identity_injection_tokens,
             extract_thinking,
             tool_name_map,
             known_tool_names,
@@ -1841,6 +1853,7 @@ async fn handle_stream_request_buffered(
     known_tool_names: std::collections::HashSet<String>,
     hook: UsageRecordHook,
     fallback_input_tokens: i32,
+    identity_injection_tokens: i32,
     cache_usage: super::cache_metering::CacheUsage,
     cache_force_settings: super::cache_force::CacheForceSettings,
     cache_ttl_secs: i64,
@@ -1870,6 +1883,9 @@ async fn handle_stream_request_buffered(
     );
     ctx.set_cache_usage(cache_usage);
     ctx.set_cache_force(cache_force_settings, cache_ttl_secs);
+    ctx.set_internal_token_adjustment(super::cache_force::InternalTokenAdjustment {
+        identity_injection_tokens,
+    });
     ctx.set_context_management_enabled(context_management_enabled);
 
     // 创建缓冲 SSE 流
@@ -1913,7 +1929,7 @@ fn create_buffered_sse_stream(
             tracer,
             0u64,
         ),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, hook, credential_id, tracer, mut sent_bytes)| async move {
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, mut hook, credential_id, tracer, mut sent_bytes)| async move {
             if finished {
                 return None;
             }
@@ -1962,6 +1978,7 @@ fn create_buffered_sse_stream(
                                 // 发生错误，完成处理并返回所有事件
                                 let all_events = ctx.finish_and_get_all_events();
                                 let (i, o, cc, cr, credits) = ctx.final_usage();
+                                hook.set_official_truth(ctx.official_truth_hit());
                                 hook.record(credential_id, i, o, cc, cr, credits, "error");
                                 // 缓冲模式 chunk 读取失败：上游中途断流
                                 tracer.finalize(
@@ -1989,6 +2006,7 @@ fn create_buffered_sse_stream(
                                 // 非法工具调用 JSON，error 事件已随缓冲发出，这里据此记 error。
                                 let all_events = ctx.finish_and_get_all_events();
                                 let (i, o, cc, cr, credits) = ctx.final_usage();
+                                hook.set_official_truth(ctx.official_truth_hit());
                                 let trace_usage = TraceUsage {
                                     input_tokens: i.max(0) as u64,
                                     output_tokens: o.max(0) as u64,

@@ -1412,6 +1412,8 @@ pub struct StreamContext {
     /// 单次客户端请求可能触发多次 provider 调用（工具多轮、websearch 循环），
     /// 每次各自下发快照，因此按 `saturating_add` 累加而非覆盖。
     official_usage: Option<crate::kiro::model::events::TokenUsage>,
+    /// 中转层内置身份历史的 token 估算；仅从 Official 服务端真值中扣除。
+    pub internal_token_adjustment: super::cache_force::InternalTokenAdjustment,
 }
 
 impl StreamContext {
@@ -1426,12 +1428,15 @@ impl StreamContext {
         // cache_metering 的 prompt_total_est / cache_covered_est 本来就用同一套
         // 本地估算口径，对齐后比例分摊也自洽，不会因为两套口径混用而错位。
         let total_real = self.input_tokens;
+        let official_usage = self
+            .internal_token_adjustment
+            .apply_to_official(self.official_usage);
         super::cache_force::resolve(
             &self.cache_force_settings,
             &self.cache_usage,
             total_real,
             self.cache_ttl_secs,
-            self.official_usage,
+            official_usage,
         )
     }
 
@@ -1520,6 +1525,7 @@ impl StreamContext {
             tool_json_error: None,
             tool_use_xml_filter: ToolUseXmlLeakFilter::default(),
             official_usage: None,
+            internal_token_adjustment: super::cache_force::InternalTokenAdjustment::default(),
         }
     }
 
@@ -1628,15 +1634,12 @@ impl StreamContext {
                 Vec::new()
             }
             Event::Metadata(metadata) => {
-                // token 明细在 metadataEvent 里（不在 meteringEvent）。多次
-                // provider 调用累加，供 Official 档作为上报与记账的数据源。
+                // tokenUsage 是本次上游调用的最终快照，不是增量；同一响应流如出现
+                // 多份 metadataEvent，应保留最后一份，不能累加重复计量。
                 if let Some(usage) = metadata.token_usage {
                     let usage = usage.sanitized();
                     if !usage.is_empty() {
-                        self.official_usage = Some(match self.official_usage {
-                            Some(prev) => prev.saturating_add(usage),
-                            None => usage,
-                        });
+                        self.official_usage = Some(usage);
                         tracing::debug!(
                             "metadataEvent tokenUsage: uncached={} out={} read={} write={}",
                             usage.uncached_input_tokens,
@@ -2655,6 +2658,14 @@ impl BufferedStreamContext {
         self.inner.cache_ttl_secs = ttl_secs;
     }
 
+    /// 注入本次请求的内置提示词 token 调整，仅用于 Official 真值。
+    pub fn set_internal_token_adjustment(
+        &mut self,
+        adjustment: super::cache_force::InternalTokenAdjustment,
+    ) {
+        self.inner.internal_token_adjustment = adjustment;
+    }
+
     /// 注入本次请求是否带 context-management beta header，决定响应里是否
     /// 出现 `context_management` 字段。
     pub fn set_context_management_enabled(&mut self, enabled: bool) {
@@ -2725,13 +2736,15 @@ impl BufferedStreamContext {
     /// 返回顺序：(input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, credits)
     pub fn final_usage(&self) -> (i32, i32, i32, i32, f64) {
         let (input, creation, read) = self.inner.resolved_usage();
-        (
-            input,
-            self.inner.output_tokens,
-            creation,
-            read,
-            self.inner.credits,
-        )
+        let output = self
+            .inner
+            .resolved_output_tokens(self.inner.output_tokens);
+        (input, output, creation, read, self.inner.credits)
+    }
+
+    /// 转发 Official 真值覆盖率，供缓冲流落账前写入 hook。
+    pub fn official_truth_hit(&self) -> Option<bool> {
+        self.inner.official_truth_hit()
     }
 
     /// 工具调用 JSON 错误信息（转发内部 StreamContext）。缓冲流据此记 error。

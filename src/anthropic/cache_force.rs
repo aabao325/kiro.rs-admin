@@ -171,6 +171,24 @@ pub struct ResolvedCacheUsage {
     pub ephemeral_1h_input_tokens: i32,
 }
 
+/// Token 口径：不含中转层自行注入的 identity 历史（policy + ACK）。
+///
+/// 本地估算路径本来就基于原始客户端 payload，因此无需调整；仅 Official 模式采纳
+/// 上游服务端真值时传入该值，从真值输入三段中扣除。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct InternalTokenAdjustment {
+    pub identity_injection_tokens: i32,
+}
+
+impl InternalTokenAdjustment {
+    pub fn apply_to_official(
+        self,
+        usage: Option<crate::kiro::model::events::TokenUsage>,
+    ) -> Option<crate::kiro::model::events::TokenUsage> {
+        usage.map(|u| u.subtract_injected_input(self.identity_injection_tokens))
+    }
+}
+
 /// 统一入口：按当前生效模式（`force_settings.mode`）把 `total` 拆成最终三段，
 /// 再按 `ttl_secs` 把 `cache_creation` 分进 5m/1h 桶。
 ///

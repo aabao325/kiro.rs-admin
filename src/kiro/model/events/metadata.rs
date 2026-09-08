@@ -43,6 +43,31 @@ impl TokenUsage {
         }
     }
 
+    /// 从服务端真值的输入三段中扣除中转层内置提示词。
+    ///
+    /// 上游不提供内置前缀落在哪个缓存桶的分段归属；身份历史是稳定的首段前缀，
+    /// 因此按 cache read → cache write → uncached 的顺序做归属估算。总输入扣减是确定的，
+    /// 三桶归属是保守估算。最多扣到总输入仍剩 1，避免 tokenizer 估算略高时误吞
+    /// 真实用户输入。output_tokens 不受影响。
+    pub fn subtract_injected_input(self, injected_tokens: i32) -> Self {
+        let mut usage = self.sanitized();
+        let max_deduct = usage.total_input_tokens().saturating_sub(1).max(0);
+        let mut remaining = injected_tokens.max(0).min(max_deduct);
+
+        let from_read = remaining.min(usage.cache_read_input_tokens);
+        usage.cache_read_input_tokens -= from_read;
+        remaining -= from_read;
+
+        let from_write = remaining.min(usage.cache_write_input_tokens);
+        usage.cache_write_input_tokens -= from_write;
+        remaining -= from_write;
+
+        let from_uncached = remaining.min(usage.uncached_input_tokens);
+        usage.uncached_input_tokens -= from_uncached;
+
+        usage
+    }
+
     /// 合并多次真实 provider 调用的用量。
     ///
     /// websearch 循环、工具多轮会在一次客户端请求内打上游多次，每次都下发
@@ -189,6 +214,55 @@ mod tests {
                 cache_write_input_tokens: 6,
             }
         );
+    }
+
+    #[test]
+    fn subtracts_injected_tokens_across_input_buckets_only() {
+        let usage = TokenUsage {
+            uncached_input_tokens: 100,
+            output_tokens: 23,
+            cache_read_input_tokens: 300,
+            cache_write_input_tokens: 40,
+        };
+
+        assert_eq!(
+            usage.subtract_injected_input(125),
+            TokenUsage {
+                uncached_input_tokens: 100,
+                output_tokens: 23,
+                cache_read_input_tokens: 175,
+                cache_write_input_tokens: 40,
+            }
+        );
+    }
+
+    #[test]
+    fn injected_token_subtraction_keeps_one_real_input_token() {
+        let usage = TokenUsage {
+            uncached_input_tokens: 2,
+            output_tokens: 7,
+            cache_read_input_tokens: 3,
+            cache_write_input_tokens: 4,
+        };
+        let adjusted = usage.subtract_injected_input(i32::MAX);
+
+        assert_eq!(adjusted.total_input_tokens(), 1);
+        assert_eq!(adjusted.output_tokens, 7);
+        assert_eq!(adjusted.uncached_input_tokens, 1);
+        assert_eq!(adjusted.cache_write_input_tokens, 0);
+        assert_eq!(adjusted.cache_read_input_tokens, 0);
+    }
+
+    #[test]
+    fn non_positive_injected_tokens_do_nothing() {
+        let usage = TokenUsage {
+            uncached_input_tokens: 5,
+            output_tokens: 2,
+            cache_read_input_tokens: 3,
+            cache_write_input_tokens: 1,
+        };
+        assert_eq!(usage.subtract_injected_input(0), usage);
+        assert_eq!(usage.subtract_injected_input(-10), usage);
     }
 
     /// 全零快照视同缺失：否则本次请求的 usage 会变成 0，记账凭空少一笔。
