@@ -1171,6 +1171,7 @@ mod tests {
             thinking: String::new(),
             tool_uses,
             credits: 0.0,
+            official_usage: None,
             stop_reason_override: None,
             stream_error: false,
             known_tool_names: std::collections::HashSet::new(),
