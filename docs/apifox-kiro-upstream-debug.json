@@ -1,0 +1,225 @@
+{
+  "apifoxProject": "1.0.0",
+  "info": {
+    "name": "Kiro 上游直连调试（reasoning / signature）",
+    "description": "用 refreshToken 直连 AWS CodeWhisperer / Kiro 上游，观察 reasoningContentEvent 的思考明文与 signature。\n\n所有凭据均使用环境变量，不含任何真实 token。\n\n=== 使用步骤 ===\n1. 在 Apifox 环境变量中填入：client_id / client_secret / refresh_token / profile_arn / machine_id / region\n   这些值来自 Kiro 账号管理器导出的 JSON：\n     credentials.clientId      -> client_id\n     credentials.clientSecret  -> client_secret\n     credentials.refreshToken  -> refresh_token\n     profileArn                -> profile_arn\n     machineId                 -> machine_id\n     credentials.region        -> region（通常 us-east-1）\n2. 先跑「1. 刷新 AccessToken」，它会自动把 accessToken 写入环境变量 access_token。\n3. 再跑「2. 列出可用模型」确认账号支持哪些 modelId。\n4. 然后跑「3. 直连推理」系列，观察 reasoningContentEvent。\n\n=== 实测结论（2026-09，BuilderId 账号）===\n- gpt-5.6-sol / terra / luna：返回 reasoningContentEvent，\n  text 固定为字面 '...'（上游隐藏思考链），signature 约 1500 字符（真实值）。\n- minimax-m2.5：返回 7 个 reasoningContentEvent，含 676 字符真实推理文本，无 signature。\n- deepseek-3.2：不发 reasoningContentEvent，把 <thinking> 写进正文。\n- glm-5 / qwen3-coder-next：不发 reasoningContentEvent。\n- GPT 完全不接受 additionalModelRequestFields，以下写法全部 400：\n  output_config / reasoning_config / reasoningConfig / reasoning_effort / thinking\n\n=== 响应格式说明 ===\n推理接口返回的是 AWS Event Stream 二进制帧（application/vnd.amazon.eventstream），\nApifox 会显示为乱码/二进制。每帧结构：\n  [4B totalLen][4B headerLen][4B preludeCRC][headers][payload JSON][4B msgCRC]\n关注 headers 里的 :event-type，值可能是：\n  assistantResponseEvent / reasoningContentEvent / contextUsageEvent / meteringEvent / metadataEvent\nreasoningContentEvent 的 payload 字段：text / signature / redactedContent",
+    "schema": "v1"
+  },
+  "environments": [
+    {
+      "name": "Kiro 上游直连",
+      "variables": [
+        { "key": "region", "value": "us-east-1" },
+        { "key": "client_id", "value": "" },
+        { "key": "client_secret", "value": "" },
+        { "key": "refresh_token", "value": "" },
+        { "key": "profile_arn", "value": "" },
+        { "key": "machine_id", "value": "" },
+        { "key": "access_token", "value": "" }
+      ]
+    }
+  ],
+  "apiCollection": [
+    {
+      "name": "Kiro 上游直连调试",
+      "items": [
+        {
+          "name": "1. 刷新 AccessToken",
+          "api": {
+            "method": "POST",
+            "path": "https://oidc.{{region}}.amazonaws.com/token",
+            "description": "用 refreshToken 换取短期 accessToken。IdC / BuilderId 账号使用此端点。\n\n注意：部分账号刷新时会轮换 refreshToken，返回体里若带 refreshToken 请自行更新环境变量，否则旧的可能失效。",
+            "requestBody": {
+              "type": "application/json",
+              "jsonSchema": {},
+              "example": "{\n  \"clientId\": \"{{client_id}}\",\n  \"clientSecret\": \"{{client_secret}}\",\n  \"refreshToken\": \"{{refresh_token}}\",\n  \"grantType\": \"refresh_token\"\n}"
+            },
+            "headers": [
+              { "name": "content-type", "value": "application/json" }
+            ],
+            "postProcessors": [
+              {
+                "type": "script",
+                "data": {
+                  "type": "javascript",
+                  "content": "const body = pm.response.json();\nif (body.accessToken) {\n  pm.environment.set('access_token', body.accessToken);\n  console.log('access_token 已写入，长度', body.accessToken.length);\n}\nif (body.refreshToken) {\n  console.log('注意：上游轮换了 refreshToken，请更新环境变量');\n}"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "name": "2. 列出可用模型",
+          "api": {
+            "method": "GET",
+            "path": "https://q.{{region}}.amazonaws.com/ListAvailableModels",
+            "description": "列出该账号当前可用的 modelId。Claude 模型若已被下架，这里不会出现。\n\n必须使用 KiroIDE-0.9.2 版本号：新版 IDE 会强制要求 profileArn，对 BuilderId / Enterprise 账号会失败。",
+            "parameters": {
+              "query": [
+                { "name": "origin", "value": "AI_EDITOR" }
+              ]
+            },
+            "headers": [
+              { "name": "authorization", "value": "Bearer {{access_token}}" },
+              { "name": "host", "value": "q.{{region}}.amazonaws.com" },
+              { "name": "x-amz-user-agent", "value": "aws-sdk-js/1.0.0 KiroIDE-0.9.2-{{machine_id}}" },
+              { "name": "user-agent", "value": "aws-sdk-js/1.0.0 ua/2.1 os/windows lang/js md/nodejs#22 api/codewhispererruntime#1.0.0 m/N,E KiroIDE-0.9.2-{{machine_id}}" }
+            ]
+          }
+        },
+        {
+          "name": "3a. 直连推理 - GPT（有 signature，思考为 ...）",
+          "api": {
+            "method": "POST",
+            "path": "https://q.{{region}}.amazonaws.com/generateAssistantResponse",
+            "description": "GPT-5.6 系列。实测会返回 1 个 reasoningContentEvent：\n  text = '...'（上游隐藏思考链，仅 3 字符）\n  signature = 约 1500 字符真实值\n  redactedContent = 无\n\n把 modelId 换成 gpt-5.6-terra / gpt-5.6-luna 结果相同。\n\n切勿添加 additionalModelRequestFields：GPT 的 schema 不允许任何附加属性，会直接 400。",
+            "requestBody": {
+              "type": "application/json",
+              "jsonSchema": {},
+              "example": "{\n  \"conversationState\": {\n    \"agentContinuationId\": \"00000000-0000-4000-8000-000000000001\",\n    \"agentTaskType\": \"vibe\",\n    \"chatTriggerType\": \"MANUAL\",\n    \"conversationId\": \"00000000-0000-4000-8000-000000000002\",\n    \"currentMessage\": {\n      \"userInputMessage\": {\n        \"content\": \"请先简要推理，再用一句话解释为什么天空通常呈蓝色。\",\n        \"modelId\": \"gpt-5.6-sol\",\n        \"origin\": \"AI_EDITOR\",\n        \"userInputMessageContext\": {\n          \"envState\": {\n            \"operatingSystem\": \"macos\",\n            \"currentWorkingDirectory\": \"/workspace\"\n          }\n        }\n      }\n    }\n  },\n  \"profileArn\": \"{{profile_arn}}\"\n}"
+            },
+            "headers": [
+              { "name": "content-type", "value": "application/json" },
+              { "name": "accept", "value": "application/vnd.amazon.eventstream" },
+              { "name": "authorization", "value": "Bearer {{access_token}}" },
+              { "name": "host", "value": "q.{{region}}.amazonaws.com" },
+              { "name": "x-amzn-codewhisperer-optout", "value": "true" },
+              { "name": "x-amzn-kiro-agent-mode", "value": "vibe" },
+              { "name": "x-amz-user-agent", "value": "aws-sdk-js/1.0.34 KiroIDE-0.9.2-{{machine_id}}" },
+              { "name": "user-agent", "value": "aws-sdk-js/1.0.34 ua/2.1 os/windows lang/js md/nodejs#22 api/codewhispererstreaming#1.0.34 m/E KiroIDE-0.9.2-{{machine_id}}" },
+              { "name": "amz-sdk-invocation-id", "value": "00000000-0000-4000-8000-000000000003" },
+              { "name": "amz-sdk-request", "value": "attempt=1; max=1" }
+            ]
+          }
+        },
+        {
+          "name": "3b. 直连推理 - MiniMax（有真实思考文本，无 signature）",
+          "api": {
+            "method": "POST",
+            "path": "https://q.{{region}}.amazonaws.com/generateAssistantResponse",
+            "description": "对照组。实测返回 7 个 reasoningContentEvent，含 676 字符真实英文推理，signature 为空。\n\n用它验证解码器和字段读取是否正确：如果这里能看到思考文本，说明请求形态没问题，GPT 的 '...' 是上游行为，不是解析错误。",
+            "requestBody": {
+              "type": "application/json",
+              "jsonSchema": {},
+              "example": "{\n  \"conversationState\": {\n    \"agentContinuationId\": \"00000000-0000-4000-8000-000000000011\",\n    \"agentTaskType\": \"vibe\",\n    \"chatTriggerType\": \"MANUAL\",\n    \"conversationId\": \"00000000-0000-4000-8000-000000000012\",\n    \"currentMessage\": {\n      \"userInputMessage\": {\n        \"content\": \"请先简要推理，再用一句话解释为什么天空通常呈蓝色。\",\n        \"modelId\": \"minimax-m2.5\",\n        \"origin\": \"AI_EDITOR\",\n        \"userInputMessageContext\": {\n          \"envState\": {\n            \"operatingSystem\": \"macos\",\n            \"currentWorkingDirectory\": \"/workspace\"\n          }\n        }\n      }\n    }\n  },\n  \"profileArn\": \"{{profile_arn}}\"\n}"
+            },
+            "headers": [
+              { "name": "content-type", "value": "application/json" },
+              { "name": "accept", "value": "application/vnd.amazon.eventstream" },
+              { "name": "authorization", "value": "Bearer {{access_token}}" },
+              { "name": "host", "value": "q.{{region}}.amazonaws.com" },
+              { "name": "x-amzn-codewhisperer-optout", "value": "true" },
+              { "name": "x-amzn-kiro-agent-mode", "value": "vibe" },
+              { "name": "x-amz-user-agent", "value": "aws-sdk-js/1.0.34 KiroIDE-0.9.2-{{machine_id}}" },
+              { "name": "user-agent", "value": "aws-sdk-js/1.0.34 ua/2.1 os/windows lang/js md/nodejs#22 api/codewhispererstreaming#1.0.34 m/E KiroIDE-0.9.2-{{machine_id}}" },
+              { "name": "amz-sdk-invocation-id", "value": "00000000-0000-4000-8000-000000000013" },
+              { "name": "amz-sdk-request", "value": "attempt=1; max=1" }
+            ]
+          }
+        },
+        {
+          "name": "3c. 直连推理 - 带 thinking 前缀历史",
+          "api": {
+            "method": "POST",
+            "path": "https://q.{{region}}.amazonaws.com/generateAssistantResponse",
+            "description": "复刻 kiro-rs 在 /v1/messages 路径上生成的 thinking 系统前缀：\n  <thinking_mode>adaptive</thinking_mode><thinking_effort>high</thinking_effort>\n它被编码为 history 首轮 user + assistant OK。\n\n实测：对 GPT 而言加不加这个前缀，reasoning 结果都是 text='...' + signature。",
+            "requestBody": {
+              "type": "application/json",
+              "jsonSchema": {},
+              "example": "{\n  \"conversationState\": {\n    \"agentContinuationId\": \"00000000-0000-4000-8000-000000000021\",\n    \"agentTaskType\": \"vibe\",\n    \"chatTriggerType\": \"MANUAL\",\n    \"conversationId\": \"00000000-0000-4000-8000-000000000022\",\n    \"history\": [\n      {\n        \"userInputMessage\": {\n          \"content\": \"<thinking_mode>adaptive</thinking_mode><thinking_effort>high</thinking_effort>\",\n          \"modelId\": \"gpt-5.6-sol\",\n          \"origin\": \"AI_EDITOR\",\n          \"userInputMessageContext\": {\n            \"envState\": {\n              \"operatingSystem\": \"macos\",\n              \"currentWorkingDirectory\": \"/workspace\"\n            }\n          }\n        }\n      },\n      {\n        \"assistantResponseMessage\": {\n          \"content\": \"OK\"\n        }\n      }\n    ],\n    \"currentMessage\": {\n      \"userInputMessage\": {\n        \"content\": \"请先简要推理，再用一句话解释为什么天空通常呈蓝色。\",\n        \"modelId\": \"gpt-5.6-sol\",\n        \"origin\": \"AI_EDITOR\",\n        \"userInputMessageContext\": {\n          \"envState\": {\n            \"operatingSystem\": \"macos\",\n            \"currentWorkingDirectory\": \"/workspace\"\n          }\n        }\n      }\n    }\n  },\n  \"profileArn\": \"{{profile_arn}}\"\n}"
+            },
+            "headers": [
+              { "name": "content-type", "value": "application/json" },
+              { "name": "accept", "value": "application/vnd.amazon.eventstream" },
+              { "name": "authorization", "value": "Bearer {{access_token}}" },
+              { "name": "host", "value": "q.{{region}}.amazonaws.com" },
+              { "name": "x-amzn-codewhisperer-optout", "value": "true" },
+              { "name": "x-amzn-kiro-agent-mode", "value": "vibe" },
+              { "name": "x-amz-user-agent", "value": "aws-sdk-js/1.0.34 KiroIDE-0.9.2-{{machine_id}}" },
+              { "name": "user-agent", "value": "aws-sdk-js/1.0.34 ua/2.1 os/windows lang/js md/nodejs#22 api/codewhispererstreaming#1.0.34 m/E KiroIDE-0.9.2-{{machine_id}}" },
+              { "name": "amz-sdk-invocation-id", "value": "00000000-0000-4000-8000-000000000023" },
+              { "name": "amz-sdk-request", "value": "attempt=1; max=1" }
+            ]
+          }
+        },
+        {
+          "name": "3d. 反例 - GPT 加 output_config 会 400",
+          "api": {
+            "method": "POST",
+            "path": "https://q.{{region}}.amazonaws.com/generateAssistantResponse",
+            "description": "记录用反例。GPT 的 additionalModelRequestFields schema 不允许任何附加属性。\n\n预期响应：\n  400 {\"message\":\"Invalid additionalModelRequestFields: property 'output_config' is not defined in the schema and the schema does not allow additional properties\",\"reason\":\"REQUEST_BODY_INVALID\"}\n\n把 output_config 换成 reasoning_config / reasoningConfig / reasoning_effort / thinking，报错相同。\n这就是 kiro-rs 不把 GPT 列入 model_supports_native_reasoning 白名单的原因。",
+            "requestBody": {
+              "type": "application/json",
+              "jsonSchema": {},
+              "example": "{\n  \"conversationState\": {\n    \"agentTaskType\": \"vibe\",\n    \"chatTriggerType\": \"MANUAL\",\n    \"conversationId\": \"00000000-0000-4000-8000-000000000032\",\n    \"currentMessage\": {\n      \"userInputMessage\": {\n        \"content\": \"你好\",\n        \"modelId\": \"gpt-5.6-sol\",\n        \"origin\": \"AI_EDITOR\",\n        \"userInputMessageContext\": {\n          \"envState\": {\n            \"operatingSystem\": \"macos\",\n            \"currentWorkingDirectory\": \"/workspace\"\n          }\n        }\n      }\n    }\n  },\n  \"additionalModelRequestFields\": {\n    \"output_config\": {\n      \"effort\": \"high\"\n    }\n  },\n  \"profileArn\": \"{{profile_arn}}\"\n}"
+            },
+            "headers": [
+              { "name": "content-type", "value": "application/json" },
+              { "name": "accept", "value": "application/vnd.amazon.eventstream" },
+              { "name": "authorization", "value": "Bearer {{access_token}}" },
+              { "name": "host", "value": "q.{{region}}.amazonaws.com" },
+              { "name": "x-amzn-codewhisperer-optout", "value": "true" },
+              { "name": "x-amzn-kiro-agent-mode", "value": "vibe" },
+              { "name": "x-amz-user-agent", "value": "aws-sdk-js/1.0.34 KiroIDE-0.9.2-{{machine_id}}" },
+              { "name": "user-agent", "value": "aws-sdk-js/1.0.34 ua/2.1 os/windows lang/js md/nodejs#22 api/codewhispererstreaming#1.0.34 m/E KiroIDE-0.9.2-{{machine_id}}" },
+              { "name": "amz-sdk-invocation-id", "value": "00000000-0000-4000-8000-000000000033" },
+              { "name": "amz-sdk-request", "value": "attempt=1; max=1" }
+            ]
+          }
+        },
+        {
+          "name": "4a. 经 kiro-rs - Anthropic Messages（可见 signature）",
+          "api": {
+            "method": "POST",
+            "path": "{{kiro_rs_base}}/v1/messages",
+            "description": "经过 kiro-rs 转换后的 Anthropic 格式。thinking 块的 signature 会原样透传上游真值。\n\n需要额外环境变量：\n  kiro_rs_base   例如 http://127.0.0.1:8990\n  kiro_rs_key    kiro-rs 的客户端 API Key",
+            "requestBody": {
+              "type": "application/json",
+              "jsonSchema": {},
+              "example": "{\n  \"model\": \"gpt-5.6-sol\",\n  \"max_tokens\": 4096,\n  \"stream\": false,\n  \"thinking\": {\n    \"type\": \"adaptive\"\n  },\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"请先简要推理，再用一句话解释为什么天空通常呈蓝色。\"\n    }\n  ]\n}"
+            },
+            "headers": [
+              { "name": "content-type", "value": "application/json" },
+              { "name": "x-api-key", "value": "{{kiro_rs_key}}" },
+              { "name": "anthropic-version", "value": "2023-06-01" }
+            ]
+          }
+        },
+        {
+          "name": "4b. 经 kiro-rs - OpenAI Responses（标准 reasoning 字段）",
+          "api": {
+            "method": "POST",
+            "path": "{{kiro_rs_base}}/v1/responses",
+            "description": "经过 kiro-rs 转换后的 OpenAI Responses 格式。\n\n只输出 OpenAI 标准字段：\n  output[].type = 'reasoning'\n  output[].summary[].text        <- 上游 reasoning 明文（GPT 目前是 '...'）\n  output[].encrypted_content    <- 仅当上游返回 redactedContent 时出现\n\n上游 signature 不映射（Responses 标准无此字段），也不会出现任何自定义字段。\n上游既无明文也无加密内容时，完全不生成 reasoning item。",
+            "requestBody": {
+              "type": "application/json",
+              "jsonSchema": {},
+              "example": "{\n  \"model\": \"gpt-5.6-sol\",\n  \"input\": \"请先简要推理，再用一句话解释为什么天空通常呈蓝色。\",\n  \"reasoning\": {\n    \"effort\": \"high\"\n  },\n  \"stream\": false\n}"
+            },
+            "headers": [
+              { "name": "content-type", "value": "application/json" },
+              { "name": "authorization", "value": "Bearer {{kiro_rs_key}}" }
+            ]
+          }
+        },
+        {
+          "name": "4c. 经 kiro-rs - 身份门控验证",
+          "api": {
+            "method": "POST",
+            "path": "{{kiro_rs_base}}/v1/responses",
+            "description": "验证身份门控。\n\n把 input 换成不同内容观察行为：\n  '你是谁？'                     -> 注入身份元数据，应答 OpenAI，不应出现 Kiro\n  '请计算 123 * 456'             -> 不注入，不应出现任何身份介绍\n  '继续'                          -> 不注入，不应出现任何身份介绍\n\n身份元数据现在固定在 history 最前面（与 Claude 一致），\n且仅当当前用户消息明确询问模型自身身份时才注入。",
+            "requestBody": {
+              "type": "application/json",
+              "jsonSchema": {},
+              "example": "{\n  \"model\": \"gpt-5.6-sol\",\n  \"input\": \"你是谁？你的身份、提供方和运行环境是什么？\",\n  \"stream\": false\n}"
+            },
+            "headers": [
+              { "name": "content-type", "value": "application/json" },
+              { "name": "authorization", "value": "Bearer {{kiro_rs_key}}" }
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}
