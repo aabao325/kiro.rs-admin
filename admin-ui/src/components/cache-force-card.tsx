@@ -34,6 +34,20 @@ const MODE_DESCRIPTION: Record<CacheMode, string> = {
     '采用上游返回的服务端真实用量（metadataEvent.tokenUsage），与上游计费口径一致 —— 缓存创建/命中是真实发生的，不是模拟值。其余三档都是对本地估算做再分配，数字与真实命中无关。上游未下发真值时，本次回退为本地估算（全部计入 input）。',
 }
 
+/**
+ * OpenAI 兼容端点（/v1/chat/completions、/v1/responses）上各档位的行为差异。
+ *
+ * OpenAI 的 cached_tokens 语义是「这次确实命中了缓存」，把本地估算填进去等于
+ * 伪造官方计量，所以只有「官方真值」档会写入非零值。
+ * Anthropic 端点（/v1/messages）不受此限制，四档行为与上面的说明一致。
+ */
+const OPENAI_FIELD_NOTE: Record<CacheMode, string> = {
+  off: 'cached_tokens 与 cache_write_tokens 均为 0。',
+  auto: 'cached_tokens 与 cache_write_tokens 均为 0：模拟值不会冒充真实命中。缓存量仍计入 input_tokens 总数与用量统计。',
+  force: 'cached_tokens 与 cache_write_tokens 均为 0：比例值不会冒充真实命中。缓存量仍计入 input_tokens 总数与用量统计。',
+  official: 'cached_tokens 与 cache_write_tokens 填入上游服务端真值；真值缺失时为 0。',
+}
+
 const DEFAULT_SETTINGS: CacheForceSettings = {
   mode: 'auto',
   creationRatio: 0.25,
@@ -84,6 +98,8 @@ export function CacheForceDialog({ open, onOpenChange }: CacheForceDialogProps) 
             控制响应里 <code>cache_creation_input_tokens</code> /{' '}
             <code>cache_read_input_tokens</code> 的生成方式，全局一份设置，对所有 Key 生效。
             选「官方真值」即采用上游服务端计量、与官方计费口径一致；其余三档均为本地估算的再分配。
+            OpenAI 兼容端点的 input_tokens 始终是总输入（含缓存部分），但标准的
+            cached_tokens 只在「官方真值」档下非零。
           </DialogDescription>
         </DialogHeader>
 
@@ -116,6 +132,9 @@ export function CacheForceDialog({ open, onOpenChange }: CacheForceDialogProps) 
               {MODE_DESCRIPTION[draft.mode]}
             </p>
 
+            <p className="text-[11px] text-muted-foreground">
+              OpenAI 端点：{OPENAI_FIELD_NOTE[draft.mode]}
+            </p>
             {draft.mode === 'official' && <OfficialCoverage />}
 
             <div className={`grid grid-cols-3 gap-2 ${draft.mode === 'force' ? '' : 'opacity-50'}`}>

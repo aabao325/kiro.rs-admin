@@ -719,6 +719,28 @@ data/
 - `cache_read_input_tokens`
 - `output_tokens`
 
+### 缓存统计的四档模式
+
+Admin UI 的「缓存统计」卡片提供四档：
+
+| 档位 | 数据来源 | Anthropic `/v1/messages` | OpenAI 端点的 `cached_tokens` |
+|---|---|---|---|
+| 关闭 | — | 缓存字段恒为 0 | 0 |
+| 智能模拟 | 本地哈希链前缀命中 | 模拟拆分 | **0** |
+| 比例强制 | 管理员配置的比例 | 比例拆分 | **0** |
+| 官方真值 | 上游 `metadataEvent.tokenUsage` | 服务端真值 | **上游 `cacheRead`** |
+
+OpenAI 的 `cached_tokens` 语义是「本次确实命中了缓存」。智能模拟和比例强制都是对本地估算做再分配，写进标准字段等于伪造官方计量，因此这两档在 OpenAI 端点上保持 0；缓存量仍然计入 `input_tokens` 总数和 Admin 用量统计，不会丢账。
+
+两套 API 的字段名不同、语义相同：
+
+- `/v1/responses` → `usage.input_tokens_details.{cached_tokens, cache_write_tokens}`
+- `/v1/chat/completions` → `usage.prompt_tokens_details.{cached_tokens, cache_write_tokens}`
+
+注意 `input_tokens` 的口径差异：Anthropic 的 `usage.input_tokens` 只是**未缓存余量**，而 OpenAI 的 `input_tokens` / `prompt_tokens` 是**总输入**。OpenAI 端点会把三个桶相加后输出，因此命中缓存时总量不会少算。
+
+「官方真值」档若上游未下发 `tokenUsage`，本次回退为本地估算总量（全部计入 `input_tokens`），缓存字段为 0，不会猜测命中量。面板会显示当日真值覆盖率，便于判断有多少请求真的用上了服务端计量。
+
 <a id="admin-ui"></a>
 ## 🖥️ Admin UI
 
