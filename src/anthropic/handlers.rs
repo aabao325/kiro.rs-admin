@@ -1437,6 +1437,14 @@ async fn handle_non_stream_request(
     if context_management_enabled {
         response_body["context_management"] = json!({ "applied_edits": [] });
     }
+    // 标注缓存数字的来源，供 OpenAI 兼容端点判断能否写进标准 cached_tokens。
+    // 该字段只在内部自调用链路上被消费，公共 Anthropic 响应出口会剥掉它
+    // （见 strip_internal_usage_markers）。
+    super::openai::mark_cache_provenance(
+        &mut response_body,
+        cache_force_settings.mode == super::cache_force::CacheMode::Official
+            && official_truth.is_some(),
+    );
 
     // 覆盖率：仅 Official 档写入 Some(..)，其余档位留 None 不计入分母。
     hook.set_official_truth(
@@ -1468,6 +1476,7 @@ async fn handle_non_stream_request(
             credits: if credits.is_finite() && credits > 0.0 { credits } else { 0.0 },
         },
     );
+    super::openai::strip_internal_usage_markers(&mut response_body);
     (StatusCode::OK, Json(response_body)).into_response()
 }
 

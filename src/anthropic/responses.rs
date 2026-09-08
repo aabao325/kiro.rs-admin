@@ -47,7 +47,8 @@ use uuid::Uuid;
 use super::handlers::{post_messages, post_messages_direct};
 use super::middleware::{AppState, KeyContext};
 use super::openai::{
-    ParsedResponse, collect_text_strings, now_ts, parse_anthropic_message, push_merged,
+    CacheProvenance, ParsedResponse, collect_text_strings, now_ts, parse_anthropic_message,
+    push_merged,
 };
 use super::types::{Message, MessagesRequest, OutputConfig, SystemMessage, Tool};
 
@@ -909,12 +910,19 @@ fn build_view(p: &ParsedResponse, kinds: &ToolKindMap) -> ResponsesView {
         }
     }
 
+    // OpenAI 口径：input_tokens 是总输入（含缓存部分）。
+    // cached_tokens / cache_write_tokens 只在「官方真值」档下非零，
+    // 智能模拟与比例强制的估算值不得冒充真实命中。
+    let input_tokens = p.total_input_tokens();
     let usage = json!({
-        "input_tokens": p.prompt_tokens,
-        "input_tokens_details": { "cached_tokens": 0 },
+        "input_tokens": input_tokens,
+        "input_tokens_details": {
+            "cached_tokens": p.official_cache_read_tokens(),
+            "cache_write_tokens": p.official_cache_write_tokens(),
+        },
         "output_tokens": p.completion_tokens,
         "output_tokens_details": { "reasoning_tokens": 0 },
-        "total_tokens": p.prompt_tokens + p.completion_tokens,
+        "total_tokens": input_tokens + p.completion_tokens,
     });
 
     ResponsesView {
@@ -1225,6 +1233,9 @@ mod tests {
             finish_reason: "tool_calls".to_string(),
             prompt_tokens: 10,
             completion_tokens: 5,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            cache_provenance: CacheProvenance::Estimated,
             thinking: String::new(),
             encrypted_reasoning: None,
             web_searches: Vec::new(),
@@ -1251,6 +1262,88 @@ mod tests {
         let serialized = serde_json::to_string(&view.output).unwrap();
         assert!(!serialized.contains("signature"));
         assert!(!serialized.contains("kiro"));
+    }
+
+    /// Official 档：上游真值经 Anthropic 三桶传到 OpenAI 标准字段。
+    ///
+    /// OpenAI 的 `input_tokens` 是**总输入**，Anthropic 的 `input_tokens` 只是
+    /// **未缓存余量**，所以必须把三桶相加，否则 Official 档下总量会少算。
+    #[test]
+    fn official_cache_usage_maps_to_standard_openai_fields() {
+        let anthropic = json!({
+            "content": [{"type": "text", "text": "answer"}],
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 120,
+                "cache_creation_input_tokens": 300,
+                "cache_read_input_tokens": 1500,
+                "output_tokens": 42,
+                "kiro_cache_provenance": "official"
+            }
+        });
+        let parsed = parse_anthropic_message(&anthropic, "gpt-5.6-sol");
+        let view = build_view(&parsed, &ToolKindMap::new());
+
+        assert_eq!(view.usage["input_tokens"], 1920, "总输入 = 120 + 300 + 1500");
+        assert_eq!(view.usage["input_tokens_details"]["cached_tokens"], 1500);
+        assert_eq!(view.usage["input_tokens_details"]["cache_write_tokens"], 300);
+        assert_eq!(view.usage["output_tokens"], 42);
+        assert_eq!(view.usage["total_tokens"], 1962);
+
+        let serialized = serde_json::to_string(&view.usage).unwrap();
+        assert!(!serialized.contains("kiro"), "对外响应不得出现内部字段");
+    }
+
+    /// Auto（智能模拟）/ Force（比例强制）都是本地估算，
+    /// 不得写进 OpenAI 标准 cached_tokens 冒充真实命中。
+    #[test]
+    fn estimated_cache_usage_never_claims_openai_cache_hit() {
+        for provenance in ["auto", "force", "off"] {
+            let anthropic = json!({
+                "content": [{"type": "text", "text": "answer"}],
+                "stop_reason": "end_turn",
+                "usage": {
+                    "input_tokens": 120,
+                    "cache_creation_input_tokens": 300,
+                    "cache_read_input_tokens": 1500,
+                    "output_tokens": 42,
+                    "kiro_cache_provenance": provenance
+                }
+            });
+            let parsed = parse_anthropic_message(&anthropic, "gpt-5.6-sol");
+            let view = build_view(&parsed, &ToolKindMap::new());
+
+            assert_eq!(
+                view.usage["input_tokens"], 1920,
+                "{provenance}: 总输入仍需守恒"
+            );
+            assert_eq!(
+                view.usage["input_tokens_details"]["cached_tokens"], 0,
+                "{provenance}: 估算值不得计入标准 cached_tokens"
+            );
+            assert_eq!(
+                view.usage["input_tokens_details"]["cache_write_tokens"], 0,
+                "{provenance}: 估算值不得计入标准 cache_write_tokens"
+            );
+        }
+    }
+
+    /// 没有 provenance 标记（例如 web_search loop 自建响应）时按估算处理。
+    #[test]
+    fn missing_provenance_is_treated_as_estimate() {
+        let anthropic = json!({
+            "content": [{"type": "text", "text": "answer"}],
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 100,
+                "cache_read_input_tokens": 900,
+                "output_tokens": 10
+            }
+        });
+        let parsed = parse_anthropic_message(&anthropic, "gpt-5.6-sol");
+        let view = build_view(&parsed, &ToolKindMap::new());
+        assert_eq!(view.usage["input_tokens"], 1000);
+        assert_eq!(view.usage["input_tokens_details"]["cached_tokens"], 0);
     }
 
     #[test]

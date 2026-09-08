@@ -392,13 +392,64 @@ fn convert_tool_choice(tc: &Value) -> Option<Value> {
 
 // ============================ 响应翻译 ============================
 
+/// 缓存数字的来源，决定能否写进 OpenAI 标准缓存字段。
+///
+/// 面板的四档缓存模式里，只有「官方真值」拿到的是上游
+/// `metadataEvent.tokenUsage`；「智能模拟」和「比例强制」都是对本地估算做
+/// 再分配。OpenAI 的 `cached_tokens` 语义是「这次确实命中了缓存」，
+/// 把估算值填进去等于伪造官方计量，所以按来源区分。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CacheProvenance {
+    /// 上游服务端真值（面板「官方真值」档且本次真拿到了 tokenUsage）。
+    Official,
+    /// 本地估算：关闭 / 智能模拟 / 比例强制，或来源未标记。
+    Estimated,
+}
+
+impl CacheProvenance {
+    /// 内部 Anthropic 响应里携带来源标记的字段名。
+    ///
+    /// 只出现在 kiro-rs 内部自调用的响应体上（OpenAI 兼容端点会先调
+    /// 内部 Anthropic handler），对外的公共 Anthropic 响应会剥掉该字段。
+    pub(super) const MARKER_FIELD: &str = "kiro_cache_provenance";
+    pub(super) const OFFICIAL: &str = "official";
+    pub(super) const ESTIMATED: &str = "estimated";
+
+    fn from_usage(usage: Option<&Value>) -> Self {
+        let marker = usage
+            .and_then(|u| u.get(Self::MARKER_FIELD))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if marker == Self::OFFICIAL {
+            Self::Official
+        } else {
+            Self::Estimated
+        }
+    }
+
+    fn is_official(self) -> bool {
+        matches!(self, Self::Official)
+    }
+}
+
 pub(super) struct ParsedResponse {
     pub(super) model: String,
     pub(super) text: String,
     pub(super) tool_calls: Vec<Value>, // OpenAI tool_calls
     pub(super) finish_reason: String,
+    /// 未缓存输入 token（Anthropic `usage.input_tokens` 的语义）。
+    /// 注意：OpenAI 的 `input_tokens` / `prompt_tokens` 是**总输入**，
+    /// 需要用 [`ParsedResponse::total_input_tokens`] 把三桶相加。
     pub(super) prompt_tokens: i64,
     pub(super) completion_tokens: i64,
+    /// 本次写入缓存的 token（Anthropic `cache_creation_input_tokens`）。
+    pub(super) cache_creation_tokens: i64,
+    /// 本次从缓存读取的 token（Anthropic `cache_read_input_tokens`）。
+    pub(super) cache_read_tokens: i64,
+    /// 上述缓存数字的来源。只有 `Official` 是上游服务端真值，
+    /// 才允许写进 OpenAI 标准的 `cached_tokens` / `cache_write_tokens`；
+    /// 智能模拟 / 比例强制都是本地估算，标准字段必须留 0。
+    pub(super) cache_provenance: CacheProvenance,
     /// 上游 reasoning 明文；Responses 路径渲染为标准 summary_text。
     pub(super) thinking: String,
     /// 上游 redacted_thinking 载荷；仅映射为标准 reasoning.encrypted_content。
@@ -407,6 +458,39 @@ pub(super) struct ParsedResponse {
     /// 内部代答的 web_search 展示（server_tool_use 块）：(id, query)。
     /// Responses 路径渲染为 web_search_call item。
     pub(super) web_searches: Vec<(String, String)>,
+}
+
+/// 在内部 Anthropic 响应的 `usage` 上标注缓存数字来源。
+///
+/// OpenAI 兼容端点（chat/completions、responses）会先调用内部的 Anthropic
+/// handler，再翻译回 OpenAI 格式。缓存来源信息只存在于 handler 里，需要顺着
+/// 这条内部链路传下来，否则 Responses 无法判断 `cached_tokens` 该不该填。
+///
+/// 该字段绝不出现在对外响应里：公共 Anthropic 端点在出口调用
+/// [`strip_internal_usage_markers`]，OpenAI 端点则自行构造 usage。
+pub(super) fn mark_cache_provenance(response_body: &mut Value, official: bool) {
+    if let Some(usage) = response_body.get_mut("usage").and_then(|v| v.as_object_mut()) {
+        usage.insert(
+            CacheProvenance::MARKER_FIELD.to_string(),
+            Value::String(
+                if official {
+                    CacheProvenance::OFFICIAL
+                } else {
+                    CacheProvenance::ESTIMATED
+                }
+                .to_string(),
+            ),
+        );
+    }
+}
+
+/// 从对外响应里剥掉内部标记字段。
+///
+/// 公共端点必须调用，避免把 kiro-rs 内部字段暴露给客户端。
+pub(super) fn strip_internal_usage_markers(response_body: &mut Value) {
+    if let Some(usage) = response_body.get_mut("usage").and_then(|v| v.as_object_mut()) {
+        usage.remove(CacheProvenance::MARKER_FIELD);
+    }
 }
 
 pub(super) fn parse_anthropic_message(anthropic: &Value, model: &str) -> ParsedResponse {
@@ -506,14 +590,18 @@ pub(super) fn parse_anthropic_message(anthropic: &Value, model: &str) -> ParsedR
     let finish_reason = map_finish_reason(stop_reason, !tool_calls.is_empty()).to_string();
 
     let usage = anthropic.get("usage");
-    let prompt_tokens = usage
-        .and_then(|u| u.get("input_tokens"))
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    let completion_tokens = usage
-        .and_then(|u| u.get("output_tokens"))
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
+    let usage_i64 = |field: &str| -> i64 {
+        usage
+            .and_then(|u| u.get(field))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0)
+            .max(0)
+    };
+    let prompt_tokens = usage_i64("input_tokens");
+    let completion_tokens = usage_i64("output_tokens");
+    let cache_creation_tokens = usage_i64("cache_creation_input_tokens");
+    let cache_read_tokens = usage_i64("cache_read_input_tokens");
+    let cache_provenance = CacheProvenance::from_usage(usage);
 
     ParsedResponse {
         model: model.to_string(),
@@ -522,9 +610,42 @@ pub(super) fn parse_anthropic_message(anthropic: &Value, model: &str) -> ParsedR
         finish_reason,
         prompt_tokens,
         completion_tokens,
+        cache_creation_tokens,
+        cache_read_tokens,
+        cache_provenance,
         thinking,
         encrypted_reasoning,
         web_searches,
+    }
+}
+
+impl ParsedResponse {
+    /// OpenAI 口径的总输入 token：未缓存余量 + 缓存写入 + 缓存读取。
+    ///
+    /// Anthropic 的 `usage.input_tokens` 只是未缓存部分，直接当成
+    /// OpenAI 的 `prompt_tokens` 会在缓存命中时严重少算总量。
+    pub(super) fn total_input_tokens(&self) -> i64 {
+        self.prompt_tokens
+            .saturating_add(self.cache_creation_tokens)
+            .saturating_add(self.cache_read_tokens)
+    }
+
+    /// 可写进 OpenAI 标准 `cached_tokens` 的值：仅官方真值。
+    pub(super) fn official_cache_read_tokens(&self) -> i64 {
+        if self.cache_provenance.is_official() {
+            self.cache_read_tokens
+        } else {
+            0
+        }
+    }
+
+    /// 可写进 OpenAI 标准 `cache_write_tokens` 的值：仅官方真值。
+    pub(super) fn official_cache_write_tokens(&self) -> i64 {
+        if self.cache_provenance.is_official() {
+            self.cache_creation_tokens
+        } else {
+            0
+        }
     }
 }
 
@@ -567,11 +688,22 @@ fn build_completion_json(p: &ParsedResponse) -> Value {
             "message": message,
             "finish_reason": p.finish_reason,
         }],
-        "usage": {
-            "prompt_tokens": p.prompt_tokens,
-            "completion_tokens": p.completion_tokens,
-            "total_tokens": p.prompt_tokens + p.completion_tokens,
-        }
+        "usage": chat_usage(p),
+    })
+}
+
+/// Chat Completions 的 usage。缓存明细在该 API 里叫 `prompt_tokens_details`
+/// （Responses 用 `input_tokens_details`），字段名不同、语义相同。
+fn chat_usage(p: &ParsedResponse) -> Value {
+    let prompt_tokens = p.total_input_tokens();
+    json!({
+        "prompt_tokens": prompt_tokens,
+        "prompt_tokens_details": {
+            "cached_tokens": p.official_cache_read_tokens(),
+            "cache_write_tokens": p.official_cache_write_tokens(),
+        },
+        "completion_tokens": p.completion_tokens,
+        "total_tokens": prompt_tokens + p.completion_tokens,
     })
 }
 
@@ -630,11 +762,7 @@ fn build_stream_sse(p: &ParsedResponse) -> String {
             "delta": {},
             "finish_reason": p.finish_reason,
         }],
-        "usage": {
-            "prompt_tokens": p.prompt_tokens,
-            "completion_tokens": p.completion_tokens,
-            "total_tokens": p.prompt_tokens + p.completion_tokens,
-        }
+        "usage": chat_usage(p),
     });
     out.push_str("data: ");
     out.push_str(&final_chunk.to_string());
