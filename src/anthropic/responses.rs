@@ -1310,16 +1310,17 @@ mod tests {
         };
 
         let (anth, _) = responses_to_anthropic(make()).unwrap();
-        assert_eq!(system_texts(&anth)[0], "CLIENT_INSTRUCTIONS");
-        let tools = anth.tools.unwrap();
+        let systems = system_texts(&anth);
+        assert_eq!(systems[0], "CLIENT_INSTRUCTIONS");
+        assert!(
+            systems.iter().any(|t| t.contains("web_search tool")),
+            "direct 也要保留 web_search nudge"
+        );
+        let tools = anth.tools.as_ref().unwrap();
         assert!(tools.iter().any(|t| t.name == "client_tool"));
         assert!(
             tools.iter().any(|t| t.name == "web_search"),
             "direct 也要拿到 web_search，否则时效性查询无人代答"
-        );
-        assert!(
-            system_texts(&anth).iter().any(|t| t.contains("web_search tool")),
-            "direct 也要保留 web_search nudge"
         );
     }
 
@@ -1344,7 +1345,7 @@ mod tests {
             .unwrap();
             let (anth, _) = responses_to_anthropic(req)
                 .expect("managed web_search must no longer be rejected");
-            let tools = anth.tools.unwrap();
+            let tools = anth.tools.as_ref().unwrap();
             assert!(tools.iter().any(|t| t.name == "web_search"));
         }
     }
