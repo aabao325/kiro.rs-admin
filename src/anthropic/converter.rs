@@ -2428,9 +2428,11 @@ mod tests {
         assert!(IDENTITY_LOCK_POLICY.starts_with("<identity>"));
         assert!(IDENTITY_LOCK_POLICY.contains("You are Claude, an AI assistant made by Anthropic."));
         assert!(OPENAI_IDENTITY_POLICY.starts_with(
-            "The following information is authoritative deployment metadata"
+            "The following information is deployment metadata"
         ));
         assert!(OPENAI_IDENTITY_POLICY.contains("trained by OpenAI"));
+        assert!(OPENAI_IDENTITY_POLICY.contains("only when the user explicitly asks"));
+        assert!(!OPENAI_IDENTITY_POLICY.contains("Question:"));
         assert!(!OPENAI_IDENTITY_POLICY.contains("<identity>"));
         for marker in COERCIVE_MARKERS {
             assert!(
