@@ -35,17 +35,20 @@ const MODE_DESCRIPTION: Record<CacheMode, string> = {
 }
 
 /**
- * OpenAI 兼容端点（/v1/chat/completions、/v1/responses）上各档位的行为差异。
+ * 各档位在 OpenAI 兼容端点（/v1/chat/completions、/v1/responses）上报的数字来源。
  *
- * OpenAI 的 cached_tokens 语义是「这次确实命中了缓存」，把本地估算填进去等于
- * 伪造官方计量，所以只有「官方真值」档会写入非零值。
- * Anthropic 端点（/v1/messages）不受此限制，四档行为与上面的说明一致。
+ * 四档在两种协议上口径一致：当前档位算出的缓存量会同时写入 Anthropic 的
+ * cache_creation/cache_read 和 OpenAI 的 cached_tokens/cache_write_tokens，
+ * 避免同一次请求在两个协议上给出互相矛盾的两份账。
+ *
+ * 字段名按各 API 官方规范：Responses 用 input_tokens_details，
+ * Chat Completions 用 prompt_tokens_details，两者语义相同。
  */
 const OPENAI_FIELD_NOTE: Record<CacheMode, string> = {
-  off: 'cached_tokens 与 cache_write_tokens 均为 0。',
-  auto: 'cached_tokens 与 cache_write_tokens 均为 0：模拟值不会冒充真实命中。缓存量仍计入 input_tokens 总数与用量统计。',
-  force: 'cached_tokens 与 cache_write_tokens 均为 0：比例值不会冒充真实命中。缓存量仍计入 input_tokens 总数与用量统计。',
-  official: 'cached_tokens 与 cache_write_tokens 填入上游服务端真值；真值缺失时为 0。',
+  off: 'cached_tokens 与 cache_write_tokens 均为 0，等同上游未启用缓存。',
+  auto: '上报哈希链模拟出的命中量。下游计费系统会按此打折，数字来自本地模拟而非上游计量。',
+  force: '上报按比例强制拆分出的命中量。下游计费系统会按此打折，数字与真实命中无关。',
+  official: '上报上游服务端真值，与上游计费口径一致；真值缺失时为 0。',
 }
 
 const DEFAULT_SETTINGS: CacheForceSettings = {
@@ -98,8 +101,8 @@ export function CacheForceDialog({ open, onOpenChange }: CacheForceDialogProps) 
             控制响应里 <code>cache_creation_input_tokens</code> /{' '}
             <code>cache_read_input_tokens</code> 的生成方式，全局一份设置，对所有 Key 生效。
             选「官方真值」即采用上游服务端计量、与官方计费口径一致；其余三档均为本地估算的再分配。
-            OpenAI 兼容端点的 input_tokens 始终是总输入（含缓存部分），但标准的
-            cached_tokens 只在「官方真值」档下非零。
+            四档在 Anthropic 与 OpenAI 两种协议上口径一致。若下游接了 new-api
+            这类按 cached_tokens 打折的计费系统，请选「官方真值」，否则账单会依据本地模拟值计算。
           </DialogDescription>
         </DialogHeader>
 
