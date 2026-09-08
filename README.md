@@ -286,7 +286,9 @@ codex
 
 ### Direct Responses 调试入口
 
-`POST /direct/v1/responses` 使用相同的 Responses 请求/响应格式和 API Key 鉴权，但关闭项目添加的身份提示、身份 ACK、分块策略、thinking 文本前缀、自动 WebSearch 工具与 nudge。它仍会执行 Kiro 必需的协议转换，并将客户端 `instructions` 编码为对话历史；因此是“无项目注入”的调试基线，而不是字节级 HTTP 透传。
+`POST /direct/v1/responses` 与 `/v1/responses` 行为完全一致，**唯一区别是不注入中转层身份提示词**（身份元数据 + 身份 ACK）。分块策略、thinking 文本前缀、工具描述后缀、工具名兼容适配、历史工具占位符补齐、自动 WebSearch 工具与 nudge 全部保留，因此直连路径的工具调用行为与正常路径相同。
+
+早期版本的 Direct 还会额外关闭上述各项，实测会改变工具调用表现，已收窄为仅跳过身份注入。
 
 ```bash
 curl http://127.0.0.1:8990/direct/v1/responses \
@@ -301,7 +303,7 @@ curl http://127.0.0.1:8990/direct/v1/responses \
   }'
 ```
 
-Direct 模式不会依据模型名自动开启 `-thinking`、重写工具名、补齐历史工具定义或代答 `web_search`；所有工具定义必须由请求显式重传。OpenAI 托管 `web_search` 无法等价直传到 Kiro，Direct 会明确返回 400，而不会静默删除。
+Direct 模式同样支持模型名 `-thinking` 覆写、工具名重写、历史工具定义补齐和 `web_search` 内部代答；OpenAI 托管 `web_search` 也与正常路径一样由 kiro-rs 代答，不再返回 400。
 
 <a id="api-routes"></a>
 ## API 路由

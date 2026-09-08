@@ -721,15 +721,11 @@ async fn post_messages_with_prompt_mode(
         }
     };
 
-    // Standard 模式保留模型名 `-thinking` 的便捷覆写；Direct 只接受客户端显式字段。
-    if prompt_injection_mode == PromptInjectionMode::Standard {
-        override_thinking_from_model_name(&mut payload);
-    }
+    // 模型名 `-thinking` 覆写属于模型路由便利，与身份注入无关，两种模式一致。
+    override_thinking_from_model_name(&mut payload);
 
-    // Direct 不拦截或代答工具；客户端声明的工具只走下方协议转换。
-    if prompt_injection_mode == PromptInjectionMode::Standard
-        && websearch::has_web_search_tool(&payload)
-    {
+    // WebSearch 代答是工具能力，Direct 同样需要，否则直连路径的 web_search 无人执行。
+    if websearch::has_web_search_tool(&payload) {
         tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
 
         // 估算输入 tokens
@@ -756,9 +752,7 @@ async fn post_messages_with_prompt_mode(
     let payload_stream = payload.stream;
     // Mixed-tools (web_search + exec...) case: web_search coexists with other tools and falls onto the normal chat path,
     // where the upstream may return a tool_use with name=web_search. Take the internal agentic loop: search internally and feed the results back.
-    if prompt_injection_mode == PromptInjectionMode::Standard
-        && websearch::has_web_search_among_tools(&payload)
-    {
+    if websearch::has_web_search_among_tools(&payload) {
         tracing::info!("detected mixed tools containing web_search, entering the web_search agentic loop");
         return super::websearch_loop::run_web_search_loop(
             provider,
@@ -772,11 +766,8 @@ async fn post_messages_with_prompt_mode(
         .await;
     }
 
-    let tool_compatibility_mode = if prompt_injection_mode == PromptInjectionMode::Direct {
-        crate::model::config::ToolCompatibilityMode::Raw
-    } else {
-        state.tool_compatibility_mode
-    };
+    // 工具名/入参兼容适配决定工具能否被上游正确执行，Direct 沿用同一配置。
+    let tool_compatibility_mode = state.tool_compatibility_mode;
 
     // 转换请求
     let conversion_result = match convert_request_with_prompt_mode(

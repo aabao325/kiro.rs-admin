@@ -891,12 +891,7 @@ pub fn convert_request_with_prompt_mode(
 
     // 6. 转换工具定义（超长名称自动缩短并记录映射；ClaudeCode 模式做内置工具适配）
     let mut tool_name_map = HashMap::new();
-    let mut tools = convert_tools(
-        &req.tools,
-        &mut tool_name_map,
-        tool_compatibility_mode,
-        prompt_injection_mode,
-    )?;
+    let mut tools = convert_tools(&req.tools, &mut tool_name_map, tool_compatibility_mode)?;
 
     // 收集本次请求声明的所有工具名（原始 client 名），供 `<invoke>` 容错的工具表校验。
     let mut known_tool_names: std::collections::HashSet<String> = req
@@ -917,7 +912,6 @@ pub fn convert_request_with_prompt_mode(
         &model_id,
         &mut tool_name_map,
         tool_compatibility_mode,
-        prompt_injection_mode,
         identity,
     )?;
 
@@ -941,11 +935,8 @@ pub fn convert_request_with_prompt_mode(
 
     for tool_name in history_tool_names {
         if !existing_tool_names.contains(&tool_name.to_lowercase()) {
-            if prompt_injection_mode == PromptInjectionMode::Direct {
-                return Err(ConversionError::UnsupportedToolMapping(format!(
-                    "Direct 模式要求显式重传历史工具定义: {tool_name}"
-                )));
-            }
+            // Kiro 要求历史里引用过的工具必须有定义，否则整轮请求被拒。
+            // 这是协议必需项而非提示词注入，Direct 同样补齐。
             tools.push(create_placeholder_tool(&tool_name));
         }
     }
@@ -1680,7 +1671,6 @@ fn convert_tools(
     tools: &Option<Vec<super::types::Tool>>,
     tool_name_map: &mut HashMap<String, String>,
     mode: ToolCompatibilityMode,
-    prompt_injection_mode: PromptInjectionMode,
 ) -> Result<Vec<Tool>, ConversionError> {
     let Some(tools) = tools else {
         return Ok(Vec::new());
@@ -1711,15 +1701,11 @@ fn convert_tools(
         } else {
             let mut description = t.description.clone();
             // 非内置（或 Raw 模式）：保留旧的 Write/Edit/Bash 后缀（按原始名匹配）。
-            let suffix = if prompt_injection_mode == PromptInjectionMode::Standard {
-                match t.name.as_str() {
-                    "Write" => WRITE_TOOL_DESCRIPTION_SUFFIX,
-                    "Edit" => EDIT_TOOL_DESCRIPTION_SUFFIX,
-                    "Bash" => BASH_TOOL_DESCRIPTION_SUFFIX,
-                    _ => "",
-                }
-            } else {
-                ""
+            let suffix = match t.name.as_str() {
+                "Write" => WRITE_TOOL_DESCRIPTION_SUFFIX,
+                "Edit" => EDIT_TOOL_DESCRIPTION_SUFFIX,
+                "Bash" => BASH_TOOL_DESCRIPTION_SUFFIX,
+                _ => "",
             };
             if !suffix.is_empty() {
                 description.push('\n');
@@ -1817,18 +1803,21 @@ fn build_history(
         model_id,
         tool_name_map,
         mode,
-        PromptInjectionMode::Standard,
         identity,
     )
 }
 
+/// 构建 Kiro history。
+///
+/// `identity` 已由调用方按「模型族 + 注入模式 + 当前用户是否问身份」决定，
+/// 因此这里不再关心 `PromptInjectionMode`：/direct 与正常路径的唯一差别
+/// 就是调用方传进来的 `identity` 是否为 `None`。
 fn build_history_with_prompt_mode(
     req: &MessagesRequest,
     messages: &[super::types::Message],
     model_id: &str,
     tool_name_map: &mut HashMap<String, String>,
     mode: ToolCompatibilityMode,
-    prompt_injection_mode: PromptInjectionMode,
     identity: Option<(&'static str, &'static str)>,
 ) -> Result<Vec<Message>, ConversionError> {
     let mut history = Vec::new();
@@ -1843,12 +1832,9 @@ fn build_history_with_prompt_mode(
         history.push(Message::Assistant(HistoryAssistantMessage::new(ack)));
     }
 
-    // Direct 模式只做协议转换，不添加中转层 thinking 前缀。
-    let thinking_prefix = if prompt_injection_mode == PromptInjectionMode::Standard {
-        generate_thinking_prefix(req, model_id)
-    } else {
-        None
-    };
+    // thinking 前缀承载 reasoning 行为，Direct 同样生成，
+    // 否则直连路径的思考表现与正常路径不一致。
+    let thinking_prefix = generate_thinking_prefix(req, model_id);
 
     // 1. 处理系统消息。Kiro 没有独立 system 字段，只能编码成历史消息。
     let client_system: String = req
@@ -1863,14 +1849,14 @@ fn build_history_with_prompt_mode(
         })
         .unwrap_or_default();
 
-    // Standard 保留既有分块策略；Direct 只保留客户端原文。
+    // 分块策略约束的是工具写入行为，不是身份，Direct 同样附加。
     let mut system_body = client_system.clone();
-    if prompt_injection_mode == PromptInjectionMode::Standard && !client_system.is_empty() {
+    if !client_system.is_empty() {
         system_body.push('\n');
         system_body.push_str(SYSTEM_CHUNKED_POLICY);
     }
 
-    // thinking 前缀放最前（Direct 已在上方禁用）。
+    // thinking 前缀放最前。
     let mut final_content = if let Some(ref prefix) = thinking_prefix {
         if system_body.is_empty() {
             prefix.clone()
@@ -2538,10 +2524,13 @@ mod tests {
     }
 
     #[test]
-    fn test_direct_mode_preserves_only_client_system() {
+    fn test_direct_mode_only_skips_identity_injection() {
+        // /direct 唯一的差别是不注入身份提示词：thinking 前缀、分块策略、
+        // 工具描述后缀等一律与 Standard 保持一致，避免影响工具调用行为。
         let mut req = minimal_request_with_effort("gpt-5.6-sol", "high");
+        req.messages[0].content = serde_json::json!("你是谁？");
         req.system = Some(vec![super::super::types::SystemMessage {
-            text: "DIRECT_IDENTITY_TEST".to_string(),
+            text: "CLIENT_INSTRUCTIONS".to_string(),
             cache_control: None,
         }]);
         req.thinking = Some(super::super::types::Thinking {
@@ -2551,7 +2540,7 @@ mod tests {
 
         let result = convert_request_with_prompt_mode(
             &req,
-            ToolCompatibilityMode::Raw,
+            ToolCompatibilityMode::default(),
             PromptInjectionMode::Direct,
         )
         .unwrap();
@@ -2560,7 +2549,20 @@ mod tests {
         let Message::User(user) = &history[0] else {
             panic!("客户端 instructions 应编码为 user 历史消息");
         };
-        assert_eq!(user.user_input_message.content, "DIRECT_IDENTITY_TEST");
+        let content = &user.user_input_message.content;
+        assert!(content.contains("CLIENT_INSTRUCTIONS"));
+        assert!(
+            content.contains("<thinking_mode>adaptive</thinking_mode>"),
+            "Direct 也要保留 thinking 前缀"
+        );
+        assert!(
+            content.contains(SYSTEM_CHUNKED_POLICY),
+            "Direct 也要保留分块策略"
+        );
+        assert!(
+            !content.contains(OPENAI_IDENTITY_POLICY),
+            "Direct 即使被明确问身份也不得注入身份元数据"
+        );
         let Message::Assistant(assistant) = &history[1] else {
             panic!("Kiro 协议要求 system 历史后有 assistant 配对");
         };
@@ -2569,7 +2571,8 @@ mod tests {
     }
 
     #[test]
-    fn test_direct_mode_does_not_modify_tool_description() {
+    fn test_direct_mode_keeps_tool_description_suffix() {
+        // 工具描述后缀约束的是工具写入行为，Direct 同样需要。
         let req: MessagesRequest = serde_json::from_value(serde_json::json!({
             "model": "gpt-5.6-sol",
             "max_tokens": 1024,
@@ -2594,7 +2597,9 @@ mod tests {
             .user_input_message_context
             .tools;
         assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].tool_specification.description, "CLIENT_DESCRIPTION");
+        let description = &tools[0].tool_specification.description;
+        assert!(description.contains("CLIENT_DESCRIPTION"));
+        assert!(description.contains(WRITE_TOOL_DESCRIPTION_SUFFIX));
     }
 
     fn minimal_request_with_output_config(model: &str) -> MessagesRequest {
@@ -3108,7 +3113,6 @@ mod tests {
             &tools,
             &mut map,
             ToolCompatibilityMode::ClaudeCode,
-            PromptInjectionMode::Standard,
         )
         .unwrap();
         let names: Vec<&str> = out
@@ -3133,7 +3137,6 @@ mod tests {
             &Some(vec![cc_tool("Write")]),
             &mut map,
             ToolCompatibilityMode::ClaudeCode,
-            PromptInjectionMode::Standard,
         )
         .unwrap();
         // 硬编码 fs_write schema：包含 path/text。
@@ -3149,7 +3152,6 @@ mod tests {
             &Some(vec![cc_tool("Write")]),
             &mut map,
             ToolCompatibilityMode::Raw,
-            PromptInjectionMode::Standard,
         )
         .unwrap();
         assert_eq!(out[0].tool_specification.name, "Write", "Raw 模式不改名");

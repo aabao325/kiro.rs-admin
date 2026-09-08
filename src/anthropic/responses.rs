@@ -104,19 +104,6 @@ fn flat_tool_name(namespace: Option<&str>, name: &str) -> String {
     }
 }
 
-fn contains_managed_web_search(entries: &[Value]) -> bool {
-    entries.iter().any(|entry| {
-        match entry.get("type").and_then(|v| v.as_str()).unwrap_or("") {
-            "web_search" | "web_search_preview" => true,
-            "namespace" => entry
-                .get("tools")
-                .and_then(|v| v.as_array())
-                .is_some_and(|nested| contains_managed_web_search(nested)),
-            _ => false,
-        }
-    })
-}
-
 // ============================ 请求类型 ============================
 
 #[derive(Debug, Deserialize)]
@@ -158,8 +145,8 @@ pub async fn post_responses(
     post_responses_impl(state, key_ctx, req, false).await
 }
 
-/// `POST /direct/v1/responses`：仅做 Responses ↔ Kiro 必需的协议转换，
-/// 不添加中转层身份、行为提示或自动工具。
+/// `POST /direct/v1/responses`：与 `/v1/responses` 完全一致，
+/// 唯一区别是不注入中转层身份提示词。
 pub async fn post_responses_direct(
     State(state): State<AppState>,
     Extension(key_ctx): Extension<KeyContext>,
@@ -184,7 +171,7 @@ async fn post_responses_impl(
     );
 
     // 1. Responses -> Anthropic 请求翻译（同时得到工具声明类型表）
-    let (anthropic_req, tool_kinds) = match responses_to_anthropic_with_mode(req, direct) {
+    let (anthropic_req, tool_kinds) = match responses_to_anthropic(req) {
         Ok(r) => r,
         Err(msg) => {
             return responses_error(StatusCode::BAD_REQUEST, "invalid_request_error", &msg);
@@ -262,15 +249,13 @@ async fn post_responses_impl(
 
 // ============================ 请求翻译 ============================
 
+/// Responses -> Anthropic 请求翻译。
+///
+/// 与 `/direct` 无关：直连路径唯一的差别是不注入身份提示词，
+/// 工具声明、WebSearch 代答、nudge、分块策略等一律保持一致，
+/// 否则直连路径的工具调用行为会与正常路径不同。
 fn responses_to_anthropic(
     req: ResponsesRequest,
-) -> Result<(MessagesRequest, ToolKindMap), String> {
-    responses_to_anthropic_with_mode(req, false)
-}
-
-fn responses_to_anthropic_with_mode(
-    req: ResponsesRequest,
-    direct: bool,
 ) -> Result<(MessagesRequest, ToolKindMap), String> {
     let max_tokens = req
         .max_output_tokens
@@ -319,16 +304,6 @@ fn responses_to_anthropic_with_mode(
         _ => {}
     }
 
-    // Direct 模式不支持 OpenAI 托管工具：Kiro 没有可等价原样转发的协议，
-    // 明确报错比静默删除更适合作为调试基线。此处放在 additional_tools 收集之后，
-    // 同时覆盖顶层 tools 和 input 内声明。
-    if direct && contains_managed_web_search(&declared_entries) {
-        return Err(
-            "direct responses does not support managed web_search; omit it or declare a function tool"
-                .to_string(),
-        );
-    }
-
     let messages: Vec<Message> = merged
         .into_iter()
         .filter(|(_, blocks)| !blocks.is_empty())
@@ -346,9 +321,7 @@ fn responses_to_anthropic_with_mode(
     let mut tool_kinds: ToolKindMap = HashMap::new();
     let mut tool_list = convert_responses_tools(&declared_entries, &mut tool_kinds, None);
 
-    if direct {
-        // Direct 模式不添加任何项目工具或提示；仅转换客户端明确提交的 tools。
-    } else if tool_list.is_empty() {
+    if tool_list.is_empty() {
         // 无 codex 工具（纯聊天流）：保持既有已验证行为——noop 占位 +
         // 原生 web_search（占位保证 tool_count > 1，走 agentic loop 而非
         // 单工具 fast-path）+ 严格提示。
@@ -1318,56 +1291,44 @@ mod tests {
     // ---- 请求方向：工具声明转换 ----
 
     #[test]
-    fn direct_mode_keeps_only_client_instructions_and_tools() {
-        let req: ResponsesRequest = serde_json::from_value(json!({
-            "model": "gpt-5.6-sol",
-            "instructions": "DIRECT_IDENTITY_TEST",
-            "input": "你是谁？",
-            "tools": [{
-                "type": "function",
-                "name": "client_tool",
-                "description": "Client supplied tool",
-                "parameters": {"type": "object", "properties": {}}
-            }]
-        }))
-        .unwrap();
+    fn direct_path_keeps_the_same_tool_surface_as_standard() {
+        // /direct 只跳过身份提示词；工具声明、WebSearch 注入与 nudge 必须与
+        // 正常路径完全一致，否则直连调试会改变工具调用行为。
+        let make = || {
+            serde_json::from_value::<ResponsesRequest>(json!({
+                "model": "gpt-5.6-sol",
+                "instructions": "CLIENT_INSTRUCTIONS",
+                "input": "列出当前目录",
+                "tools": [{
+                    "type": "function",
+                    "name": "client_tool",
+                    "description": "Client supplied tool",
+                    "parameters": {"type": "object", "properties": {}}
+                }]
+            }))
+            .unwrap()
+        };
 
-        let (anth, _) = responses_to_anthropic_with_mode(req, true).unwrap();
-        assert_eq!(system_texts(&anth), vec!["DIRECT_IDENTITY_TEST"]);
+        let (anth, _) = responses_to_anthropic(make()).unwrap();
+        assert_eq!(system_texts(&anth)[0], "CLIENT_INSTRUCTIONS");
         let tools = anth.tools.unwrap();
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].name, "client_tool");
-        assert!(!tools.iter().any(|t| t.name == "web_search" || t.name == "noop"));
+        assert!(tools.iter().any(|t| t.name == "client_tool"));
+        assert!(
+            tools.iter().any(|t| t.name == "web_search"),
+            "direct 也要拿到 web_search，否则时效性查询无人代答"
+        );
+        assert!(
+            system_texts(&anth).iter().any(|t| t.contains("web_search tool")),
+            "direct 也要保留 web_search nudge"
+        );
     }
 
     #[test]
-    fn direct_mode_with_no_tools_injects_none() {
-        let req: ResponsesRequest = serde_json::from_value(json!({
-            "model": "gpt-5.6-sol",
-            "instructions": "DIRECT_IDENTITY_TEST",
-            "input": "你是谁？"
-        }))
-        .unwrap();
-        let (anth, _) = responses_to_anthropic_with_mode(req, true).unwrap();
-        assert_eq!(system_texts(&anth), vec!["DIRECT_IDENTITY_TEST"]);
-        assert!(anth.tools.as_ref().is_some_and(Vec::is_empty));
-    }
-
-    #[test]
-    fn direct_mode_rejects_managed_web_search_instead_of_dropping_it() {
-        let req: ResponsesRequest = serde_json::from_value(json!({
-            "model": "gpt-5.6-sol",
-            "input": "最新消息是什么？",
-            "tools": [{"type": "web_search"}]
-        }))
-        .unwrap();
-        let err = responses_to_anthropic_with_mode(req, true).unwrap_err();
-        assert!(err.contains("does not support managed web_search"));
-    }
-
-    #[test]
-    fn direct_mode_rejects_nested_and_preview_web_search() {
+    fn managed_web_search_is_accepted_and_answered_internally() {
+        // 收窄 direct 之后，托管 web_search 不再被拒绝：
+        // 两条路径都由 kiro-rs 内部代答。
         for tool in [
+            json!({"type": "web_search"}),
             json!({"type": "web_search_preview"}),
             json!({
                 "type": "namespace",
@@ -1381,8 +1342,10 @@ mod tests {
                 "tools": [tool]
             }))
             .unwrap();
-            let err = responses_to_anthropic_with_mode(req, true).unwrap_err();
-            assert!(err.contains("does not support managed web_search"));
+            let (anth, _) = responses_to_anthropic(req)
+                .expect("managed web_search must no longer be rejected");
+            let tools = anth.tools.unwrap();
+            assert!(tools.iter().any(|t| t.name == "web_search"));
         }
     }
 
