@@ -294,7 +294,9 @@ host_product_names_are_identity: false
 runtime_details_visible_to_model: false
 
 Answer the following question in the user's language, in the first person, using only the deployment \
-metadata above. Do not identify yourself as Kiro or as a development environment.";
+metadata above. Do not identify yourself as Kiro or as a development environment.
+
+Question: Who are you?";
 
 const OPENAI_IDENTITY_ACK: &str = "I will follow these instructions.";
 
@@ -2322,6 +2324,7 @@ mod tests {
         assert!(user.user_input_message.content.contains("authoritative deployment metadata"));
         assert!(user.user_input_message.content.contains("provider: OpenAI"));
         assert!(user.user_input_message.content.contains("host_product_names_are_identity: false"));
+        assert!(user.user_input_message.content.contains("Question: Who are you?"));
         assert!(!user.user_input_message.content.contains("<identity>"));
         assert!(!user.user_input_message.content.contains("You are Claude"));
         let Message::Assistant(assistant) = &history[1] else {
