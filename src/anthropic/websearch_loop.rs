@@ -63,6 +63,9 @@ struct RoundOutcome {
     tool_uses: Vec<CompletedToolUse>,
     /// Cumulative credits from meteringEvent
     credits: f64,
+    /// Upstream `metadataEvent.tokenUsage` for this round, when present.
+    /// Feeds the Official cache mode; None means the upstream sent no snapshot.
+    official_usage: Option<crate::kiro::model::events::TokenUsage>,
     /// stop_reason override (max_tokens / model_context_window_exceeded)
     stop_reason_override: Option<String>,
     /// True if the upstream stream ended due to a read error, so the decoded
@@ -152,6 +155,9 @@ async fn decode_round(
     let mut credits = 0.0;
     let mut stop_reason_override: Option<String> = None;
     let mut stream_error = false;
+    // 上游 metadataEvent.tokenUsage：Official 档的唯一数据源。
+    // 多轮 loop 里每轮各有一份快照，保留最后一份非空值（与非流式路径同口径）。
+    let mut official_usage: Option<crate::kiro::model::events::TokenUsage> = None;
 
     while let Some(chunk) = body_stream.next().await {
         let chunk = match chunk {
@@ -203,6 +209,14 @@ async fn decode_round(
                     }
                 }
                 Event::Metering(m) => credits += m.usage,
+                Event::Metadata(metadata) => {
+                    if let Some(usage) = metadata.token_usage {
+                        let usage = usage.sanitized();
+                        if !usage.is_empty() {
+                            official_usage = Some(usage);
+                        }
+                    }
+                }
                 Event::Exception { exception_type, .. } => {
                     if exception_type == "ContentLengthExceededException" {
                         stop_reason_override = Some("max_tokens".to_string());
@@ -237,6 +251,7 @@ async fn decode_round(
         thinking,
         tool_uses,
         credits,
+        official_usage,
         stop_reason_override,
         stream_error,
         // Populated by the caller (run_round), which holds ConversionResult::known_tool_names.
@@ -249,6 +264,7 @@ async fn decode_round(
 /// Run one upstream round (convert + streaming request + buffer decode)
 ///
 /// On upstream/conversion failure, returns Err(an already-constructed pass-through error Response)
+#[allow(clippy::too_many_arguments)]
 async fn run_round(
     provider: &Arc<KiroProvider>,
     payload: &MessagesRequest,
@@ -257,6 +273,7 @@ async fn run_round(
     group: Option<&str>,
     tool_compatibility_mode: ToolCompatibilityMode,
     prompt_injection_mode: PromptInjectionMode,
+    tracer: &Arc<super::handlers::RequestTracer>,
 ) -> Result<(RoundOutcome, u64), Response> {
     let conversion = match convert_request_with_prompt_mode(
         payload,
@@ -278,6 +295,13 @@ async fn run_round(
                 ),
             };
             hook.record(0, 0, 0, 0, 0, 0.0, "error");
+            tracer.finalize(
+                "error",
+                Some(et),
+                Some(&msg),
+                None,
+                super::handlers::TraceUsage::zero(),
+            );
             return Err((StatusCode::BAD_REQUEST, Json(ErrorResponse::new(et, msg))).into_response());
         }
     };
@@ -291,9 +315,17 @@ async fn run_round(
         Ok(b) => b,
         Err(e) => {
             hook.record(0, 0, 0, 0, 0, 0.0, "error");
+            let msg = format!("failed to serialize request: {}", e);
+            tracer.finalize(
+                "error",
+                Some("internal_error"),
+                Some(&msg),
+                None,
+                super::handlers::TraceUsage::zero(),
+            );
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse::new("internal_error", format!("failed to serialize request: {}", e))),
+                Json(ErrorResponse::new("internal_error", msg)),
             )
                 .into_response());
         }
@@ -303,6 +335,14 @@ async fn run_round(
         Ok(r) => r,
         Err(e) => {
             hook.record(0, fallback_input_tokens, 0, 0, 0, 0.0, "error");
+            let msg = e.to_string();
+            tracer.finalize(
+                "error",
+                Some("upstream_error"),
+                Some(&msg),
+                None,
+                super::handlers::TraceUsage::zero(),
+            );
             return Err(map_provider_error(e));
         }
     };
@@ -318,12 +358,17 @@ async fn run_round(
         // The upstream stream was cut off mid-round; the decoded content is partial,
         // so fail the round instead of feeding truncated text/tool_use back into the loop.
         hook.record(0, fallback_input_tokens, 0, 0, 0, 0.0, "error");
+        let msg = "Upstream response stream ended unexpectedly during the web_search loop.";
+        tracer.finalize(
+            "interrupted",
+            Some("upstream_error"),
+            Some(msg),
+            None,
+            super::handlers::TraceUsage::zero(),
+        );
         return Err((
             StatusCode::BAD_GATEWAY,
-            Json(ErrorResponse::new(
-                "upstream_error",
-                "Upstream response stream ended unexpectedly during the web_search loop.".to_string(),
-            )),
+            Json(ErrorResponse::new("upstream_error", msg.to_string())),
         )
             .into_response());
     }
@@ -577,11 +622,15 @@ fn build_flush_content(
 pub(super) async fn run_web_search_loop(
     provider: Arc<KiroProvider>,
     mut payload: MessagesRequest,
-    hook: UsageRecordHook,
+    mut hook: UsageRecordHook,
     stream_client: bool,
     group: Option<String>,
     tool_compatibility_mode: ToolCompatibilityMode,
     prompt_injection_mode: PromptInjectionMode,
+    cache_usage: super::cache_metering::CacheUsage,
+    cache_force_settings: super::cache_force::CacheForceSettings,
+    cache_ttl_secs: i64,
+    tracer: Arc<super::handlers::RequestTracer>,
 ) -> Response {
     let fallback_input_tokens = token::count_all_tokens(
         payload.model.clone(),
@@ -609,6 +658,9 @@ pub(super) async fn run_web_search_loop(
     let mut last_credential_id: u64 = 0;
     let mut total_credits = 0.0;
     let mut all_thinking = String::new();
+    // 上游真值取最后一轮的非空快照：tokenUsage 是「本次上游调用」的最终结果，
+    // 不是增量，累加会重复计量。
+    let mut official_usage: Option<crate::kiro::model::events::TokenUsage> = None;
 
     for round_idx in 0..=MAX_WEB_SEARCH_ROUNDS {
         let mut empty_retries = 0usize;
@@ -622,6 +674,7 @@ pub(super) async fn run_web_search_loop(
                     group.as_deref(),
                     tool_compatibility_mode,
                     prompt_injection_mode,
+                    &tracer,
                 )
                 .await
                 {
@@ -653,6 +706,13 @@ pub(super) async fn run_web_search_loop(
                         total_credits,
                         "error",
                     );
+                    tracer.finalize(
+                        "error",
+                        Some("upstream_error"),
+                        Some("upstream repeated an empty assistant turn after tool_result"),
+                        None,
+                        super::handlers::TraceUsage::zero(),
+                    );
                     tracing::error!(
                         round = round_idx,
                         "upstream repeated an empty assistant turn after tool_result"
@@ -667,6 +727,10 @@ pub(super) async fn run_web_search_loop(
                     )
                         .into_response();
                 }
+            }
+
+            if round.official_usage.is_some() {
+                official_usage = round.official_usage;
             }
 
             // Only surface reasoning from the accepted attempt. An empty attempt is
@@ -699,6 +763,14 @@ pub(super) async fn run_web_search_loop(
                             0,
                             total_credits,
                             "error",
+                        );
+                        let msg = e.to_string();
+                        tracer.finalize(
+                            "error",
+                            Some("upstream_error"),
+                            Some(&msg),
+                            None,
+                            super::handlers::TraceUsage::zero(),
                         );
                         return map_provider_error(e);
                     }
@@ -741,6 +813,14 @@ pub(super) async fn run_web_search_loop(
                             total_credits,
                             "error",
                         );
+                        let msg = e.to_string();
+                        tracer.finalize(
+                            "error",
+                            Some("upstream_error"),
+                            Some(&msg),
+                            None,
+                            super::handlers::TraceUsage::zero(),
+                        );
                         return map_provider_error(e);
                     }
                 }
@@ -766,26 +846,86 @@ pub(super) async fn run_web_search_loop(
             &content,
         );
 
-        let output_tokens = token::estimate_output_tokens(&content);
+        let estimated_output_tokens = token::estimate_output_tokens(&content);
+
+        // 缓存计量：与普通聊天路径同口径走 cache_force::resolve 的四档模式。
+        // 这条 loop 以前把缓存参数硬编码为 0，导致 Responses 端点（它的每个请求
+        // 都会被注入 web_search 而进入本 loop）在任何档位下都看不到缓存。
+        let official_truth = official_usage
+            .map(|u| u.sanitized())
+            .filter(|u| !u.is_empty());
+        let resolved = super::cache_force::resolve(
+            &cache_force_settings,
+            &cache_usage,
+            final_input,
+            cache_ttl_secs,
+            official_usage,
+        );
+        // Official 档的 output 同样采用服务端真值，缺失则回退本地估算。
+        let output_tokens =
+            if cache_force_settings.mode == super::cache_force::CacheMode::Official {
+                official_truth.map_or(estimated_output_tokens, |u| u.output_tokens)
+            } else {
+                estimated_output_tokens
+            };
+        let final_input_tokens = resolved.input_tokens;
+        let cache_creation_tokens = resolved.cache_creation_input_tokens;
+        let cache_read_tokens = resolved.cache_read_input_tokens;
+
+        // 覆盖率：仅 Official 档写入 Some(..)，其余档位留 None 不计入分母。
+        hook.set_official_truth(
+            if cache_force_settings.mode == super::cache_force::CacheMode::Official {
+                Some(official_truth.is_some())
+            } else {
+                None
+            },
+        );
         hook.record(
             last_credential_id,
-            final_input,
+            final_input_tokens,
             output_tokens,
-            0,
-            0,
+            cache_creation_tokens,
+            cache_read_tokens,
             total_credits,
             "success",
         );
+        tracer.finalize(
+            "success",
+            None,
+            None,
+            None,
+            super::handlers::TraceUsage {
+                input_tokens: final_input_tokens.max(0) as u64,
+                output_tokens: output_tokens.max(0) as u64,
+                cache_creation_tokens: cache_creation_tokens.max(0) as u64,
+                cache_read_tokens: cache_read_tokens.max(0) as u64,
+                credits: if total_credits.is_finite() && total_credits > 0.0 {
+                    total_credits
+                } else {
+                    0.0
+                },
+            },
+        );
 
         return if stream_client {
-            render_sse(&payload.model, content, &stop_reason, final_input, output_tokens)
+            render_sse(
+                &payload.model,
+                content,
+                &stop_reason,
+                final_input_tokens,
+                output_tokens,
+                cache_creation_tokens,
+                cache_read_tokens,
+            )
         } else {
             render_json(
                 &payload.model,
                 content,
                 &stop_reason,
-                final_input,
+                final_input_tokens,
                 output_tokens,
+                cache_creation_tokens,
+                cache_read_tokens,
                 &all_thinking,
             )
         };
@@ -793,6 +933,13 @@ pub(super) async fn run_web_search_loop(
 
     // Theoretically unreachable (the loop always returns)
     hook.record(last_credential_id, fallback_input_tokens, 0, 0, 0, total_credits, "error");
+    tracer.finalize(
+        "error",
+        Some("internal_error"),
+        Some("web_search loop exited unexpectedly"),
+        None,
+        super::handlers::TraceUsage::zero(),
+    );
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(ErrorResponse::new("internal_error", "web_search loop exited unexpectedly")),
@@ -807,12 +954,15 @@ pub(super) async fn run_web_search_loop(
 /// unknown top-level fields and thus never replay an unsigned thinking block
 /// upstream, while the Responses translator picks it up for codex's
 /// reasoning-summary display.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn render_json(
     model: &str,
     content: Vec<Value>,
     stop_reason: &str,
     input_tokens: i32,
     output_tokens: i32,
+    cache_creation_tokens: i32,
+    cache_read_tokens: i32,
     thinking: &str,
 ) -> Response {
     let mut body = json!({
@@ -826,8 +976,8 @@ pub(crate) fn render_json(
         "usage": {
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
-            "cache_creation_input_tokens": 0,
-            "cache_read_input_tokens": 0
+            "cache_creation_input_tokens": cache_creation_tokens,
+            "cache_read_input_tokens": cache_read_tokens
         }
     });
     if !thinking.is_empty() {
@@ -843,8 +993,18 @@ pub(crate) fn render_sse(
     stop_reason: &str,
     input_tokens: i32,
     output_tokens: i32,
+    cache_creation_tokens: i32,
+    cache_read_tokens: i32,
 ) -> Response {
-    let events = build_sse_events(model, content, stop_reason, input_tokens, output_tokens);
+    let events = build_sse_events(
+        model,
+        content,
+        stop_reason,
+        input_tokens,
+        output_tokens,
+        cache_creation_tokens,
+        cache_read_tokens,
+    );
     let stream = stream::iter(
         events
             .into_iter()
@@ -866,6 +1026,8 @@ fn build_sse_events(
     stop_reason: &str,
     input_tokens: i32,
     output_tokens: i32,
+    cache_creation_tokens: i32,
+    cache_read_tokens: i32,
 ) -> Vec<SseEvent> {
     let mut events = Vec::new();
     let message_id = format!(
@@ -888,8 +1050,8 @@ fn build_sse_events(
                 "usage": {
                     "input_tokens": input_tokens,
                     "output_tokens": 0,
-                    "cache_creation_input_tokens": 0,
-                    "cache_read_input_tokens": 0
+                    "cache_creation_input_tokens": cache_creation_tokens,
+                    "cache_read_input_tokens": cache_read_tokens
                 }
             }
         }),
@@ -1196,7 +1358,7 @@ mod tests {
             json!({"type": "text", "text": "done"}),
             json!({"type": "tool_use", "id": "toolu_exec", "name": "exec", "input": {"cmd": "ls"}}),
         ];
-        let events = build_sse_events("claude-sonnet-4-8", content, "tool_use", 10, 5);
+        let events = build_sse_events("claude-sonnet-4-8", content, "tool_use", 10, 5, 0, 0);
 
         // Must contain message_start / message_delta(stop_reason) / message_stop
         assert_eq!(events.first().unwrap().event, "message_start");

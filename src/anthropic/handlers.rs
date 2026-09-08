@@ -724,6 +724,27 @@ async fn post_messages_with_prompt_mode(
     // 模型名 `-thinking` 覆写属于模型路由便利，与身份注入无关，两种模式一致。
     override_thinking_from_model_name(&mut payload);
 
+    // 缓存计量参数必须在 WebSearch 分支之前算好：那两条分支会直接 return，
+    // 而 web_search agentic loop 同样需要按四档模式统计缓存。
+    // （Responses 端点的每个请求都会被注入 web_search 而走进该 loop，
+    //   参数只在正常聊天路径准备的话，那里就永远看不到缓存。）
+    let cache_force_settings = state
+        .cache_force
+        .as_ref()
+        .map(|s| s.snapshot())
+        .unwrap_or_default();
+    let cache_ttl_secs = super::cache_metering::detect_max_ttl(&payload);
+    // 仅 Auto 档需要哈希链查/写；其余档位跳过这份 O(会话长度) 的同步工作。
+    let cache_usage = if cache_force_settings.mode == super::cache_force::CacheMode::Auto {
+        state
+            .cache_meter
+            .as_ref()
+            .map(|cache| super::cache_metering::compute_cache_usage(cache, &payload, key_ctx.key_id))
+            .unwrap_or_default()
+    } else {
+        super::cache_metering::CacheUsage::default()
+    };
+
     // WebSearch 代答是工具能力，Direct 同样需要，否则直连路径的 web_search 无人执行。
     if websearch::has_web_search_tool(&payload) {
         tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
@@ -754,6 +775,14 @@ async fn post_messages_with_prompt_mode(
     // where the upstream may return a tool_use with name=web_search. Take the internal agentic loop: search internally and feed the results back.
     if websearch::has_web_search_among_tools(&payload) {
         tracing::info!("detected mixed tools containing web_search, entering the web_search agentic loop");
+        let tracer = std::sync::Arc::new(RequestTracer::new(
+            &state,
+            RequestTraceOptions {
+                key_ctx: key_ctx.clone(),
+                model: payload.model.clone(),
+                is_stream: payload_stream,
+            },
+        ));
         return super::websearch_loop::run_web_search_loop(
             provider,
             payload,
@@ -762,6 +791,10 @@ async fn post_messages_with_prompt_mode(
             key_ctx.group.clone(),
             state.tool_compatibility_mode,
             prompt_injection_mode,
+            cache_usage,
+            cache_force_settings,
+            cache_ttl_secs,
+            tracer,
         )
         .await;
     }
@@ -842,27 +875,6 @@ async fn post_messages_with_prompt_mode(
     let identity_injection_tokens = conversion_result.identity_injection_tokens;
     let tool_name_map = conversion_result.tool_name_map;
     let known_tool_names = conversion_result.known_tool_names;
-
-    // CacheMeter：根据 cache_control 断点查 / 写中转层提示词缓存（Auto 模式使用）。
-    // 返回 estimate 口径的覆盖量；真实 input/cache 互斥分摊在拿到 total 真值时进行。
-    // 四档模式（关闭/智能模拟/比例强制/官方真值）由 cache_force::resolve 统一处理。
-    // 仅 Auto 档需要哈希链查/写；Force/Off/Official 跳过该 O(会话长度) 的同步工作
-    // （Official 用服务端真值，本地模拟结果对它无意义）。
-    let cache_force_settings = state
-        .cache_force
-        .as_ref()
-        .map(|s| s.snapshot())
-        .unwrap_or_default();
-    let cache_ttl_secs = super::cache_metering::detect_max_ttl(&payload);
-    let cache_usage = if cache_force_settings.mode == super::cache_force::CacheMode::Auto {
-        state
-            .cache_meter
-            .as_ref()
-            .map(|cache| super::cache_metering::compute_cache_usage(cache, &payload, key_ctx.key_id))
-            .unwrap_or_default()
-    } else {
-        super::cache_metering::CacheUsage::default()
-    };
 
     if payload.stream {
         // 流式响应
@@ -1662,10 +1674,38 @@ pub async fn post_messages_cc(
     }
 
     let payload_stream = payload.stream;
+    // 缓存计量参数要在 WebSearch 分支之前算好：该分支直接 return，
+    // 而 web_search agentic loop 同样需要按四档模式统计缓存。
+    // CacheMeter：根据 cache_control 断点查 / 写中转层提示词缓存（仅 Auto 档使用，
+    // estimate 口径）。Official 档走服务端真值，同样跳过哈希链计算。
+    let cache_force_settings = state
+        .cache_force
+        .as_ref()
+        .map(|s| s.snapshot())
+        .unwrap_or_default();
+    let cache_ttl_secs = super::cache_metering::detect_max_ttl(&payload);
+    let cache_usage = if cache_force_settings.mode == super::cache_force::CacheMode::Auto {
+        state
+            .cache_meter
+            .as_ref()
+            .map(|cache| super::cache_metering::compute_cache_usage(cache, &payload, key_ctx.key_id))
+            .unwrap_or_default()
+    } else {
+        super::cache_metering::CacheUsage::default()
+    };
+
     // Mixed-tools (web_search + exec...) case: web_search coexists with other tools and falls onto the normal chat path,
     // where the upstream may return a tool_use with name=web_search. Take the internal agentic loop: search internally and feed the results back.
     if websearch::has_web_search_among_tools(&payload) {
         tracing::info!("detected mixed tools containing web_search, entering the web_search agentic loop");
+        let tracer = std::sync::Arc::new(RequestTracer::new(
+            &state,
+            RequestTraceOptions {
+                key_ctx: key_ctx.clone(),
+                model: payload.model.clone(),
+                is_stream: payload_stream,
+            },
+        ));
         return super::websearch_loop::run_web_search_loop(
             provider,
             payload,
@@ -1674,6 +1714,10 @@ pub async fn post_messages_cc(
             key_ctx.group.clone(),
             state.tool_compatibility_mode,
             PromptInjectionMode::Standard,
+            cache_usage,
+            cache_force_settings,
+            cache_ttl_secs,
+            tracer,
         )
         .await;
     }
@@ -1751,24 +1795,6 @@ pub async fn post_messages_cc(
     let identity_injection_tokens = conversion_result.identity_injection_tokens;
     let tool_name_map = conversion_result.tool_name_map;
     let known_tool_names = conversion_result.known_tool_names;
-
-    // CacheMeter：根据 cache_control 断点查 / 写中转层提示词缓存（仅 Auto 档使用，
-    // estimate 口径）。Official 档走服务端真值，同样跳过哈希链计算。
-    let cache_force_settings = state
-        .cache_force
-        .as_ref()
-        .map(|s| s.snapshot())
-        .unwrap_or_default();
-    let cache_ttl_secs = super::cache_metering::detect_max_ttl(&payload);
-    let cache_usage = if cache_force_settings.mode == super::cache_force::CacheMode::Auto {
-        state
-            .cache_meter
-            .as_ref()
-            .map(|cache| super::cache_metering::compute_cache_usage(cache, &payload, key_ctx.key_id))
-            .unwrap_or_default()
-    } else {
-        super::cache_metering::CacheUsage::default()
-    };
 
     if payload.stream {
         // 流式响应（缓冲模式）
