@@ -47,9 +47,10 @@ use uuid::Uuid;
 use super::handlers::{post_messages, post_messages_direct};
 use super::middleware::{AppState, KeyContext};
 use super::openai::{
-    CacheProvenance, ParsedResponse, collect_text_strings, now_ts, parse_anthropic_message,
-    push_merged,
+    ParsedResponse, collect_text_strings, now_ts, parse_anthropic_message, push_merged,
 };
+#[cfg(test)]
+use super::openai::build_completion_json;
 use super::types::{Message, MessagesRequest, OutputConfig, SystemMessage, Tool};
 
 /// 读取内部响应体时的上限（64MB，与请求体上限对齐）
@@ -910,16 +911,13 @@ fn build_view(p: &ParsedResponse, kinds: &ToolKindMap) -> ResponsesView {
         }
     }
 
-    // OpenAI 口径：input_tokens 是总输入（含缓存部分）。
-    // cached_tokens / cache_write_tokens 只在「官方真值」档下非零，
-    // 智能模拟与比例强制的估算值不得冒充真实命中。
+    // OpenAI 口径：input_tokens 是总输入（含缓存部分），
+    // 缓存明细放在 input_tokens_details（Chat Completions 那边叫
+    // prompt_tokens_details，字段名不同、语义相同）。
     let input_tokens = p.total_input_tokens();
     let usage = json!({
         "input_tokens": input_tokens,
-        "input_tokens_details": {
-            "cached_tokens": p.official_cache_read_tokens(),
-            "cache_write_tokens": p.official_cache_write_tokens(),
-        },
+        "input_tokens_details": p.cache_token_details(),
         "output_tokens": p.completion_tokens,
         "output_tokens_details": { "reasoning_tokens": 0 },
         "total_tokens": input_tokens + p.completion_tokens,
@@ -1235,7 +1233,6 @@ mod tests {
             completion_tokens: 5,
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
-            cache_provenance: CacheProvenance::Estimated,
             thinking: String::new(),
             encrypted_reasoning: None,
             web_searches: Vec::new(),
@@ -1264,12 +1261,12 @@ mod tests {
         assert!(!serialized.contains("kiro"));
     }
 
-    /// Official 档：上游真值经 Anthropic 三桶传到 OpenAI 标准字段。
+    /// Anthropic 三桶 -> OpenAI 标准字段。
     ///
     /// OpenAI 的 `input_tokens` 是**总输入**，Anthropic 的 `input_tokens` 只是
-    /// **未缓存余量**，所以必须把三桶相加，否则 Official 档下总量会少算。
+    /// **未缓存余量**，所以必须把三桶相加，否则命中缓存时总量会少算。
     #[test]
-    fn official_cache_usage_maps_to_standard_openai_fields() {
+    fn cache_usage_maps_to_standard_openai_fields() {
         let anthropic = json!({
             "content": [{"type": "text", "text": "answer"}],
             "stop_reason": "end_turn",
@@ -1277,8 +1274,7 @@ mod tests {
                 "input_tokens": 120,
                 "cache_creation_input_tokens": 300,
                 "cache_read_input_tokens": 1500,
-                "output_tokens": 42,
-                "kiro_cache_provenance": "official"
+                "output_tokens": 42
             }
         });
         let parsed = parse_anthropic_message(&anthropic, "gpt-5.6-sol");
@@ -1294,56 +1290,72 @@ mod tests {
         assert!(!serialized.contains("kiro"), "对外响应不得出现内部字段");
     }
 
-    /// Auto（智能模拟）/ Force（比例强制）都是本地估算，
-    /// 不得写进 OpenAI 标准 cached_tokens 冒充真实命中。
+    /// 端到端：Anthropic handler 的真实响应体形状 -> OpenAI usage。
+    ///
+    /// 这条用例存在的原因：早先的实现靠一个内部 `usage` 标记字段把「缓存来源」
+    /// 从 handler 传到这里，但标记的写入与剥离都在同一个函数内，OpenAI 端点
+    /// 永远读不到它，缓存字段恒为 0。当时的单测直接构造带标记的 JSON 喂给
+    /// parser，绕过了 handler，因此没能发现。
+    ///
+    /// 这里改为复刻 handler 真实输出的完整 usage 形状（含 cache_creation 分桶、
+    /// service_tier 等字段），确保任何依赖额外内部字段的方案都会在此暴露。
     #[test]
-    fn estimated_cache_usage_never_claims_openai_cache_hit() {
-        for provenance in ["auto", "force", "off"] {
-            let anthropic = json!({
-                "content": [{"type": "text", "text": "answer"}],
-                "stop_reason": "end_turn",
-                "usage": {
-                    "input_tokens": 120,
-                    "cache_creation_input_tokens": 300,
-                    "cache_read_input_tokens": 1500,
-                    "output_tokens": 42,
-                    "kiro_cache_provenance": provenance
-                }
-            });
-            let parsed = parse_anthropic_message(&anthropic, "gpt-5.6-sol");
-            let view = build_view(&parsed, &ToolKindMap::new());
+    fn handler_shaped_response_reports_cache_to_openai_clients() {
+        let handler_response = json!({
+            "model": "gpt-5.6-sol",
+            "id": "msg_0123456789abcdef",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "answer"}],
+            "stop_reason": "end_turn",
+            "stop_sequence": null,
+            "stop_details": null,
+            "usage": {
+                "input_tokens": 120,
+                "cache_creation_input_tokens": 300,
+                "cache_read_input_tokens": 1500,
+                "cache_creation": {
+                    "ephemeral_5m_input_tokens": 300,
+                    "ephemeral_1h_input_tokens": 0
+                },
+                "output_tokens": 42,
+                "output_tokens_details": {"thinking_tokens": 0},
+                "service_tier": "standard",
+                "inference_geo": "not_available"
+            }
+        });
 
-            assert_eq!(
-                view.usage["input_tokens"], 1920,
-                "{provenance}: 总输入仍需守恒"
-            );
-            assert_eq!(
-                view.usage["input_tokens_details"]["cached_tokens"], 0,
-                "{provenance}: 估算值不得计入标准 cached_tokens"
-            );
-            assert_eq!(
-                view.usage["input_tokens_details"]["cache_write_tokens"], 0,
-                "{provenance}: 估算值不得计入标准 cache_write_tokens"
-            );
-        }
+        let parsed = parse_anthropic_message(&handler_response, "gpt-5.6-sol");
+        let view = build_view(&parsed, &ToolKindMap::new());
+        assert_eq!(
+            view.usage["input_tokens_details"]["cached_tokens"], 1500,
+            "handler 已给出缓存命中，OpenAI 端点必须如实上报，否则下游按全价计费"
+        );
+        assert_eq!(view.usage["input_tokens_details"]["cache_write_tokens"], 300);
+        assert_eq!(view.usage["input_tokens"], 1920);
+
+        // Chat Completions 用另一套键名，同一份数字。
+        let chat = build_completion_json(&parsed);
+        assert_eq!(chat["usage"]["prompt_tokens"], 1920);
+        assert_eq!(chat["usage"]["prompt_tokens_details"]["cached_tokens"], 1500);
+        assert_eq!(chat["usage"]["prompt_tokens_details"]["cache_write_tokens"], 300);
+        assert_eq!(chat["usage"]["total_tokens"], 1962);
     }
 
-    /// 没有 provenance 标记（例如 web_search loop 自建响应）时按估算处理。
+    /// 没有缓存时三桶退化为纯 input，总量不受影响。
     #[test]
-    fn missing_provenance_is_treated_as_estimate() {
+    fn absent_cache_buckets_keep_input_total_intact() {
         let anthropic = json!({
             "content": [{"type": "text", "text": "answer"}],
             "stop_reason": "end_turn",
-            "usage": {
-                "input_tokens": 100,
-                "cache_read_input_tokens": 900,
-                "output_tokens": 10
-            }
+            "usage": {"input_tokens": 1000, "output_tokens": 10}
         });
         let parsed = parse_anthropic_message(&anthropic, "gpt-5.6-sol");
         let view = build_view(&parsed, &ToolKindMap::new());
         assert_eq!(view.usage["input_tokens"], 1000);
         assert_eq!(view.usage["input_tokens_details"]["cached_tokens"], 0);
+        assert_eq!(view.usage["input_tokens_details"]["cache_write_tokens"], 0);
+        assert_eq!(view.usage["total_tokens"], 1010);
     }
 
     #[test]
