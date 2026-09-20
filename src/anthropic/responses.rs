@@ -1397,8 +1397,8 @@ mod tests {
 
     #[test]
     fn direct_path_keeps_the_same_tool_surface_as_standard() {
-        // /direct 只跳过身份提示词；工具声明、WebSearch 注入与 nudge 必须与
-        // 正常路径完全一致，否则直连调试会改变工具调用行为。
+        // /direct 只跳过中转层提示词（身份策略、分块策略）；工具声明、WebSearch
+        // 注入与 nudge 必须与正常路径完全一致，否则直连会改变工具调用行为。
         let make = || {
             serde_json::from_value::<ResponsesRequest>(json!({
                 "model": "gpt-5.6-sol",

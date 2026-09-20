@@ -14,7 +14,7 @@ use crate::kiro::provider::KiroProvider;
 use crate::model::config::ToolCompatibilityMode;
 
 use super::{
-    handlers::{count_tokens, get_models, post_messages, post_messages_cc},
+    handlers::{count_tokens, get_models, post_messages, post_messages_cc, post_messages_direct},
     middleware::{AppState, auth_middleware, cors_layer},
     openai::post_chat_completions,
     responses::{post_responses, post_responses_direct},
@@ -91,8 +91,12 @@ pub fn create_router(
             auth_middleware,
         ));
 
-    // Direct Responses 调试路由：认证与普通 API 相同，但关闭项目提示词和自动工具注入。
+    // Direct 直连路由：认证与普通 API 相同，但不注入中转层自己的提示词
+    // （身份策略、分块策略），客户端 system 原样转发。
+    // 工具声明、WebSearch 代答、工具名兼容适配等功能性处理与 /v1 一致。
     let direct_v1_routes = Router::new()
+        .route("/messages", post(post_messages_direct))
+        .route("/messages/count_tokens", post(count_tokens))
         .route("/responses", post(post_responses_direct))
         .layer(middleware::from_fn_with_state(
             state.clone(),

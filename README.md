@@ -284,11 +284,25 @@ codex
 
 两个 OpenAI 端点都会复用现有的模型映射、凭据故障转移和用量计量链路。当前实现会先取得完整的内部非流式响应，再为 `stream: true` 合成 SSE，因此不是逐 token 的上游实时流。Responses 端点不会把 Codex 的 `exec`、`shell`、`apply_patch` 等本地执行工具声明转发给 Kiro；时效性查询由服务端的 Kiro MCP WebSearch 处理。
 
-### Direct Responses 调试入口
+### Direct 直连入口
 
-`POST /direct/v1/responses` 与 `/v1/responses` 行为完全一致，**唯一区别是不注入中转层身份提示词**（身份元数据 + 身份 ACK）。分块策略、thinking 文本前缀、工具描述后缀、工具名兼容适配、历史工具占位符补齐、自动 WebSearch 工具与 nudge 全部保留，因此直连路径的工具调用行为与正常路径相同。
+`/direct/v1` 下的端点与 `/v1` 对应端点行为一致，**唯一区别是不注入中转层自己的提示词**：身份策略（身份元数据 + 身份 ACK）和分块策略都不附加，客户端 `system` / `instructions` 原样转发给上游。
 
-早期版本的 Direct 还会额外关闭上述各项，实测会改变工具调用表现，已收窄为仅跳过身份注入。
+| 方法 | 路径 | 对应的正常端点 |
+|---|---|---|
+| `POST` | `/direct/v1/messages` | `/v1/messages` |
+| `POST` | `/direct/v1/messages/count_tokens` | `/v1/messages/count_tokens` |
+| `POST` | `/direct/v1/responses` | `/v1/responses` |
+
+功能性处理一律保留，因此直连路径的工具调用行为与正常路径相同：thinking 文本前缀、**工具 description 后缀**、工具名兼容适配、历史工具占位符补齐、自动 WebSearch 工具与 nudge。
+
+注意区分「提示词」和「功能性适配」这条界线，它是踩过坑划出来的：
+
+- 早期 Direct 把上面这些统统关掉，实测改变了工具调用表现，于是收窄。
+- 工具 description 后缀（`Write` 超 150 行须分块、`Edit` 单次 ≤50 行、`Bash` 不发超大命令）适配的是上游真实的截断行为，删掉会让大文件写入直接失败，因此归入功能性处理，Direct 仍然附加。
+- 系统提示词里那段分块策略（要求模型静默遵守限制、不要建议绕过、不要反问用户）只约束模型的**措辞**，属于中转层的提示词，Direct 不再附加。代价是直连路径下模型可能会主动评论工具限制或建议换用别的工具，这是预期行为。
+
+Direct 的 system 轮回执为中性的 `I will follow these instructions.`，与 GPT 身份策略的回执一致，不含任何身份信息。
 
 ```bash
 curl http://127.0.0.1:8990/direct/v1/responses \
@@ -317,6 +331,8 @@ Direct 模式同样支持模型名 `-thinking` 覆写、工具名重写、历史
 | `POST` | `/v1/messages/count_tokens` | Anthropic count_tokens 兼容入口 |
 | `POST` | `/cc/v1/messages` | Claude Code 兼容入口，流式事件顺序针对 Claude Code 调整 |
 | `POST` | `/cc/v1/messages/count_tokens` | Claude Code 兼容 count_tokens |
+| `POST` | `/direct/v1/messages` | 同 `/v1/messages`，但不注入中转层提示词 |
+| `POST` | `/direct/v1/messages/count_tokens` | 同 `/v1/messages/count_tokens` |
 
 ### OpenAI 兼容
 
@@ -324,7 +340,7 @@ Direct 模式同样支持模型名 `-thinking` 覆写、工具名重写、历史
 |---|---|---|
 | `POST` | `/v1/chat/completions` | OpenAI Chat Completions 兼容入口，支持消息、函数工具和 reasoning effort |
 | `POST` | `/v1/responses` | OpenAI Responses 兼容入口，适用于新版 Codex CLI |
-| `POST` | `/direct/v1/responses` | 无项目提示词或自动工具注入的 Responses 调试入口 |
+| `POST` | `/direct/v1/responses` | 同 `/v1/responses`，但不注入中转层提示词 |
 
 ### Admin
 
