@@ -8,17 +8,26 @@ name: Build and Push GHCR Images
 #
 # 标签规则：
 #   - sha-<短哈希>  每次构建都有，可精确回滚到任意一次提交
+#   - <分支名>      每次构建都有，始终指向该分支最新一次构建
+#                   （非法字符换成 `-`，如 feat/foo → feat-foo）
+#   - edge          每次构建都有，始终指向**全仓库**最新一次构建；日常拉取用它
 #   - <版本号>      仅手动触发且填了 version 时
 #   - latest        仅 master 推送，或手动触发且勾选 latest
-#     （开发分支的构建不会动 latest，避免未完成的改动被宝塔自动拉走）
+#     （开发分支不动 latest，保留一个不会被未完成改动打扰的稳定通道）
+#
+# 已知取舍：edge 是"最后一次推送者胜出"。同时往两个分支推会产生两个并发 run，
+# 两者都推 edge，谁最后完成谁说话。要确定性就用 sha- 或分支名标签。
 #
 # 首次推送后需要手动把包设为 public（仓库 → Packages → 该包 →
 # Package settings → Change visibility），GITHUB_TOKEN 无权修改可见性。
 # 设过一次之后所有后续推送都沿用该设置。
 on:
   push:
+    # `'**'` = 所有分支（含 feat/foo 这种带斜杠的）。必须显式写：
+    # 省略 branches 会连 tag 推送一起触发，那时 ref_name 是 tag 名，
+    # 会被当成分支名打标签、还去覆盖 edge。tag 的发布由 release.yaml 负责。
     branches:
-      - master
+      - '**'
     paths-ignore:
       - '**.md'
       - 'docs/**'
@@ -44,6 +53,13 @@ permissions:
   contents: read
   packages: write
 
+# 同一分支连续推两次时，旧 run 会把分支标签指回旧提交（它可能后完成）。
+# 按 ref 分组并取消进行中的旧 run，保证分支标签＝该分支最新提交。
+# master 不取消：那是稳定通道，每次提交都该留下自己的镜像。
+concurrency:
+  group: ghcr-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
 jobs:
   # 版本号与标签只算一次，build 和 manifest 共用，避免两处逻辑漂移。
   prepare:
@@ -51,6 +67,7 @@ jobs:
     outputs:
       image: ${{ steps.meta.outputs.image }}
       sha_tag: ${{ steps.meta.outputs.sha_tag }}
+      branch_tag: ${{ steps.meta.outputs.branch_tag }}
       version_tag: ${{ steps.meta.outputs.version_tag }}
       update_latest: ${{ steps.meta.outputs.update_latest }}
     steps:
@@ -59,6 +76,7 @@ jobs:
         env:
           OWNER: ${{ github.repository_owner }}
           SHA: ${{ github.sha }}
+          REF_NAME: ${{ github.ref_name }}
           RAW_VERSION: ${{ github.event.inputs.version }}
           IS_MASTER: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
           WANT_LATEST: ${{ github.event.inputs.latest == 'true' }}
@@ -68,6 +86,15 @@ jobs:
           echo "image=ghcr.io/$(echo "${OWNER}" | tr '[:upper:]' '[:lower:]')/kiro-rs-admin" >> "$GITHUB_OUTPUT"
           echo "sha_tag=sha-$(echo "${SHA}" | cut -c1-7)" >> "$GITHUB_OUTPUT"
           echo "version_tag=${RAW_VERSION#v}" >> "$GITHUB_OUTPUT"
+
+          # 分支名 → 合法 docker tag：允许 [A-Za-z0-9_.-]，其余（含 `/`）换成 `-`；
+          # tag 不能以 `.` 或 `-` 开头，上限 128 字符。清洗后为空则回退到 sha 标签，
+          # 避免推出 `image:` 这种空 tag。
+          BRANCH_TAG=$(printf '%s' "${REF_NAME}" | tr -c 'A-Za-z0-9_.-' '-' | sed 's/^[.-]*//' | cut -c1-128)
+          if [ -z "${BRANCH_TAG}" ]; then
+            BRANCH_TAG="sha-$(echo "${SHA}" | cut -c1-7)"
+          fi
+          echo "branch_tag=${BRANCH_TAG}" >> "$GITHUB_OUTPUT"
           if [ "${IS_MASTER}" = "true" ] || [ "${WANT_LATEST}" = "true" ]; then
             echo "update_latest=true" >> "$GITHUB_OUTPUT"
           else
@@ -153,15 +180,18 @@ jobs:
         env:
           IMG: ${{ needs.prepare.outputs.image }}
           SHA_TAG: ${{ needs.prepare.outputs.sha_tag }}
+          BRANCH_TAG: ${{ needs.prepare.outputs.branch_tag }}
           VERSION_TAG: ${{ needs.prepare.outputs.version_tag }}
           UPDATE_LATEST: ${{ needs.prepare.outputs.update_latest }}
         run: |
           set -euo pipefail
 
           # 单架构源镜像统一用 sha- 标签，版本号是否存在都不影响。
+          # docker manifest create 对已存在的本地 manifest 会报错，加 --amend 以便
+          # 同一次运行里复用同一组源镜像连推多个标签。
           push_manifest() {
             local tag="$1"
-            docker manifest create "${IMG}:${tag}" \
+            docker manifest create --amend "${IMG}:${tag}" \
               "${IMG}:${SHA_TAG}-amd64" \
               "${IMG}:${SHA_TAG}-arm64"
             docker manifest push "${IMG}:${tag}"
@@ -169,6 +199,13 @@ jobs:
           }
 
           push_manifest "${SHA_TAG}"
+          # 分支名标签：始终指向该分支最新一次构建。
+          # 与 sha 标签相同时跳过，避免对同一 tag 推两次。
+          if [ "${BRANCH_TAG}" != "${SHA_TAG}" ]; then
+            push_manifest "${BRANCH_TAG}"
+          fi
+          # edge：全仓库最新一次构建，日常拉取入口。
+          push_manifest "edge"
           if [ -n "${VERSION_TAG}" ]; then
             push_manifest "${VERSION_TAG}"
           fi
@@ -179,7 +216,14 @@ jobs:
           {
             echo "### GHCR 镜像已推送"
             echo ""
+            echo "日常拉取（全仓库最新）："
             echo '```'
+            echo "docker pull ${IMG}:edge"
+            echo '```'
+            echo ""
+            echo "本分支最新 / 精确回滚："
+            echo '```'
+            echo "docker pull ${IMG}:${BRANCH_TAG}"
             echo "docker pull ${IMG}:${SHA_TAG}"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
