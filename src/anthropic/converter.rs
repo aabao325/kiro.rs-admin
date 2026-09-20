@@ -748,7 +748,10 @@ pub struct ConversionResult {
 pub enum ConversionError {
     UnsupportedModel(String),
     EmptyMessages,
-    /// Claude Code 工具无法映射到 Kiro 内置工具（如 Read.pages 无对应、内置缺 schema）。
+    /// Claude Code 工具无法映射到 Kiro 内置工具（内置名缺少硬编码 schema）。
+    ///
+    /// 只用于「声明层确实构造不出合法请求」的情况。入参层的无对应字段（如 Read.pages）
+    /// 一律丢弃而不报错——历史 tool_use 逐轮重放，硬失败会锁死整个会话。
     UnsupportedToolMapping(String),
 }
 
@@ -1379,6 +1382,10 @@ fn default_explanation(tool_name: &str) -> serde_json::Value {
 }
 
 /// 出站入参重写（Anthropic → Kiro 内置工具入参键）。Raw / 非内置直通。
+///
+/// 白名单重建：未知键一律丢弃，不失败。当前无 `Err` 路径，但保留 `Result` 签名——
+/// 调用链（`convert_assistant_message` / `merge_assistant_messages`）本就返回 `Result`，
+/// 收窄收益为零，将来若出现真正构造不出请求的入参还得改回来。
 fn map_tool_input_to_kiro(
     client_name: &str,
     input: serde_json::Value,
@@ -1410,10 +1417,17 @@ fn map_tool_input_to_kiro(
             maybe_insert(&mut out, "timeout", take_first(&obj, &["timeout"]));
         }
         ("Read", "read_file") => {
-            if obj.contains_key("pages") && !obj.get("pages").is_some_and(|v| v.is_null()) {
-                return Err(ConversionError::UnsupportedToolMapping(
-                    "Claude Code Read.pages has no Kiro read_file equivalent".to_string(),
-                ));
+            // Kiro read_file 无按页读语义。此处与其余未知键一视同仁地丢弃，而不是硬失败：
+            // 本函数只作用于历史 assistant 消息的 tool_use input，而历史 input 是自由 JSON、
+            // 上游不按声明的 inputSchema 校验它（参见 create_placeholder_tool——历史引用的
+            // 工具补一个空 properties 的占位声明即可通过）。历史会被逐轮重放，一次硬失败
+            // 会让整个会话不可恢复，代价远大于丢一个可选参数。
+            // warn 保留原值，用于确认 pages 的真实形状（字符串 / 数组 / 数字尚未实测）。
+            if let Some(pages) = obj.get("pages").filter(|v| !v.is_null()) {
+                tracing::warn!(
+                    pages = %pages,
+                    "Claude Code Read.pages 无 Kiro read_file 对应语义，已丢弃该参数"
+                );
             }
             maybe_insert(&mut out, "path", take_first(&obj, &["file_path", "path"]));
             let offset = obj.get("offset").and_then(optional_number);
@@ -3284,15 +3298,38 @@ mod tests {
         assert!(read.get("explanation").is_some(), "Read 缺省注入 explanation");
     }
 
+    /// Read.pages 与其余未知键一样被丢弃，不再让整轮请求失败。
+    /// 历史 tool_use 会被逐轮重放，硬失败会锁死整个会话。
     #[test]
-    fn cc_outbound_read_pages_errors() {
-        let err = map_tool_input_to_kiro(
+    fn cc_outbound_read_pages_dropped_not_error() {
+        let out = map_tool_input_to_kiro(
             "Read",
             serde_json::json!({"file_path": "/a", "pages": "1-3"}),
             ToolCompatibilityMode::ClaudeCode,
         )
-        .unwrap_err();
-        assert!(matches!(err, ConversionError::UnsupportedToolMapping(_)));
+        .expect("pages 不应导致转换失败");
+        assert_eq!(out["path"], serde_json::json!("/a"));
+        assert!(out.get("pages").is_none(), "pages 不应透传给 Kiro");
+    }
+
+    /// pages 的真实形状未实测，字符串 / 数组 / 数字都不能触发失败。
+    #[test]
+    fn cc_outbound_read_pages_any_shape_dropped() {
+        for pages in [
+            serde_json::json!("1-3"),
+            serde_json::json!([1, 2, 3]),
+            serde_json::json!(2),
+            serde_json::Value::Null,
+        ] {
+            let out = map_tool_input_to_kiro(
+                "Read",
+                serde_json::json!({"file_path": "/a", "pages": pages}),
+                ToolCompatibilityMode::ClaudeCode,
+            )
+            .expect("任意形状的 pages 都不应导致转换失败");
+            assert_eq!(out["path"], serde_json::json!("/a"));
+            assert!(out.get("pages").is_none());
+        }
     }
 
     #[test]
