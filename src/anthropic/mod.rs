@@ -29,6 +29,7 @@ mod openai;
 mod responses;
 pub mod cache_force;
 pub mod cache_metering;
+pub mod models_catalog;
 mod router;
 pub mod signature_sim;
 pub mod stream;

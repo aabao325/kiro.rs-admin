@@ -18,6 +18,7 @@ use crate::kiro::provider::KiroProvider;
 
 use super::cache_force::SharedCacheForceStore;
 use super::cache_metering::SharedCacheMeter;
+use super::models_catalog::ModelsCatalog;
 use super::types::ErrorResponse;
 
 /// 命中的鉴权上下文（注入到请求扩展，供 handler 记录用量）
@@ -53,6 +54,8 @@ pub struct AppState {
     pub cache_force: Option<SharedCacheForceStore>,
     /// 请求链路追踪存储（SQLite，可选）
     pub trace_store: Option<SharedTraceStore>,
+    /// `/v1/models` 的动态模型目录（后台聚合所有启用凭据 + TTL 缓存）
+    pub models_catalog: ModelsCatalog,
 }
 
 impl AppState {
@@ -72,6 +75,7 @@ impl AppState {
             cache_meter: None,
             cache_force: None,
             trace_store: None,
+            models_catalog: ModelsCatalog::new(),
         }
     }
 

@@ -152,6 +152,69 @@ impl KiroProvider {
         }
     }
 
+    /// 汇总所有启用凭据的上游可用模型（按 `modelId` 去重）。
+    ///
+    /// 供 `/v1/models` 的动态目录使用。单个凭据失败（token 失效、网络超时）
+    /// 只跳过、不影响整体结果；全部失败时返回空表，由调用方回退静态清单。
+    ///
+    /// 注意：这里会走 `prepare_request_token`，即必要时刷新该凭据的 access
+    /// token。调用方应低频、后台调用（见 `ModelsCatalog` 的 TTL）。
+    pub async fn fetch_available_models_union(
+        &self,
+    ) -> Vec<crate::kiro::model::available_models::UpstreamModel> {
+        use futures::StreamExt as _;
+
+        /// 单个凭据的查询超时：列表接口不该把整轮聚合拖死。
+        const PER_CREDENTIAL_TIMEOUT: Duration = Duration::from_secs(8);
+        /// 同时查询的凭据数，避免一次性打满上游。
+        const CONCURRENCY: usize = 6;
+
+        let ids: Vec<u64> = self
+            .token_manager
+            .snapshot()
+            .entries
+            .into_iter()
+            .filter(|e| !e.disabled)
+            .map(|e| e.id)
+            .collect();
+        if ids.is_empty() {
+            return Vec::new();
+        }
+
+        let results = futures::stream::iter(ids.into_iter().map(|id| {
+            let tm = self.token_manager.clone();
+            async move {
+                match tokio::time::timeout(PER_CREDENTIAL_TIMEOUT, tm.get_available_models_for(id))
+                    .await
+                {
+                    Ok(Ok(resp)) => resp.models,
+                    Ok(Err(e)) => {
+                        tracing::debug!(credential_id = id, error = %e, "聚合模型列表时跳过凭据");
+                        Vec::new()
+                    }
+                    Err(_) => {
+                        tracing::debug!(credential_id = id, "聚合模型列表超时，跳过凭据");
+                        Vec::new()
+                    }
+                }
+            }
+        }))
+        .buffer_unordered(CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+
+        let mut by_id: std::collections::BTreeMap<
+            String,
+            crate::kiro::model::available_models::UpstreamModel,
+        > = std::collections::BTreeMap::new();
+        for models in results {
+            for m in models {
+                by_id.entry(m.model_id.clone()).or_insert(m);
+            }
+        }
+        by_id.into_values().collect()
+    }
+
     /// 根据凭据的代理配置获取（或创建并缓存）对应的 reqwest::Client
     fn client_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Client> {
         let effective = credentials.effective_proxy(self.global_proxy.as_ref());

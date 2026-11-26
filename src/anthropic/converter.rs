@@ -3,7 +3,9 @@
 //! 负责将 Anthropic API 请求格式转换为 Kiro API 请求格式
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
+use parking_lot::RwLock;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -407,13 +409,17 @@ fn identity_injection_tokens(identity: Option<(&'static str, &'static str)>) -> 
     })
 }
 
-/// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID。
+/// 模型映射：将**对外模型名**映射到 Kiro 上游模型 ID。
+///
+/// 对外约定（客户端请求、`/v1/models`、响应体回显）Claude 系一律用横线
+/// 小版本（`claude-opus-5-5`）；上游 Kiro 实际用的是点号（`claude-opus-5.5`）。
+/// 本函数负责在发请求前完成这次转换，客户端只需认横线写法。
 ///
 /// 策略分三层：
-/// 1. **5.5 代优先精确识别**：上游 5.5 系列用横线小版本（`claude-opus-5-5` /
-///    `claude-sonnet-5-5` / `claude-haiku-5-5`）。这一层必须排在所有宽松的
-///    `*-5` 判断之前——否则 `claude-haiku-5-5` 会命中 `contains("haiku-5")`
-///    被截成 `claude-haiku-5`，上游直接返回 `INVALID_MODEL_ID`。
+/// 1. **5.5 代优先精确识别**：`*-5-5` / `*-5.5` 统一收敛到上游点号 ID。
+///    这一层必须排在所有宽松的 `*-5` 判断之前——否则 `claude-haiku-5-5`
+///    会命中 `contains("haiku-5")` 被截成 `claude-haiku-5`，上游直接返回
+///    `INVALID_MODEL_ID`。
 /// 2. **已知旧模型显式归一**：把带日期后缀、`-thinking` 变体、点/横线混写的
 ///    4.x 别名（如 `claude-opus-4-8-20260528` / `claude-opus-4.8-thinking`）
 ///    统一收敛到规范 Kiro ID（`claude-opus-4.8`），保证 effort / 上下文窗口
@@ -425,14 +431,30 @@ pub fn map_model(model: &str) -> Option<String> {
     let model_lower = model.to_lowercase();
 
     if model_lower.contains("fable") {
-        // Fable 5：与 Mythos 5 同底座；目前仅 5 代
-        Some("claude-fable-5".to_string())
+        // Fable 目前有 5 / 5.1 / 5.2 三个版本。必须逐级精确判断：
+        // 早期实现无条件返回 `claude-fable-5`，会把 5.1/5.2 吃掉。
+        if contains_any(
+            &model_lower,
+            &["fable-5-2", "fable-5.2", "fable5.2", "fable.5.2"],
+        ) {
+            Some("claude-fable-5.2".to_string())
+        } else if contains_any(
+            &model_lower,
+            &["fable-5-1", "fable-5.1", "fable5.1", "fable.5.1"],
+        ) {
+            Some("claude-fable-5.1".to_string())
+        } else if contains_any(&model_lower, &["fable-5", "fable5", "fable.5"]) {
+            Some("claude-fable-5".to_string())
+        } else {
+            // 未登记的 fable 版本：透传给上游
+            passthrough_model(&model_lower)
+        }
     } else if model_lower.contains("sonnet") {
         if contains_any(
             &model_lower,
             &["sonnet-5-5", "sonnet-5.5", "sonnet5.5", "sonnet.5.5"],
         ) {
-            Some("claude-sonnet-5-5".to_string())
+            Some("claude-sonnet-5.5".to_string())
         } else if contains_any(&model_lower, &["4-8", "4.8"]) {
             Some("claude-sonnet-4.8".to_string())
         } else if contains_any(&model_lower, &["4-6", "4.6"]) {
@@ -451,7 +473,7 @@ pub fn map_model(model: &str) -> Option<String> {
             &model_lower,
             &["opus-5-5", "opus-5.5", "opus5.5", "opus.5.5"],
         ) {
-            Some("claude-opus-5-5".to_string())
+            Some("claude-opus-5.5".to_string())
         } else if contains_any(&model_lower, &["4-8", "4.8"]) {
             Some("claude-opus-4.8".to_string())
         } else if contains_any(&model_lower, &["4-7", "4.7"]) {
@@ -471,7 +493,7 @@ pub fn map_model(model: &str) -> Option<String> {
             &model_lower,
             &["haiku-5-5", "haiku-5.5", "haiku5.5", "haiku.5.5"],
         ) {
-            Some("claude-haiku-5-5".to_string())
+            Some("claude-haiku-5.5".to_string())
         } else if contains_any(&model_lower, &["haiku-5", "haiku5", "haiku.5"]) {
             Some("claude-haiku-5".to_string())
         } else if contains_any(
@@ -500,6 +522,21 @@ pub fn map_model(model: &str) -> Option<String> {
     }
 }
 
+/// 对外展示的模型 ID：Claude 系统一改写为横线小版本。
+///
+/// 上游 Kiro 用点号（`claude-opus-5.5`），而本服务对客户端承诺横线
+/// （`claude-opus-5-5`）。`/v1/models` 与响应体回显都走这里，保证客户端
+/// 看到的 ID family 一致。非 Claude 模型（`gpt-5.6-sol` / `grok-4.7` 等）
+/// 是官方 ID，原样返回，不做替换。
+pub fn external_model_id(model: &str) -> String {
+    let trimmed = model.trim();
+    if trimmed.to_ascii_lowercase().starts_with("claude") {
+        trimmed.to_ascii_lowercase().replace('.', "-")
+    } else {
+        trimmed.to_string()
+    }
+}
+
 /// 任一子串命中即为真。用于模型别名判断，避免重复的 `|| contains(...)`。
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|n| haystack.contains(n))
@@ -520,30 +557,68 @@ fn passthrough_model(model_lower: &str) -> Option<String> {
     }
 }
 
+/// 上游 `ListAvailableModels` 下发的上下文窗口（modelId → maxInputTokens）。
+///
+/// 由 `/v1/models` 目录刷新时写入。上游给过值就以它为准——静态表只兜底，
+/// 不需要为新模型再手工维护窗口大小。
+static UPSTREAM_CONTEXT_WINDOWS: OnceLock<RwLock<HashMap<String, i32>>> = OnceLock::new();
+
+fn upstream_context_windows() -> &'static RwLock<HashMap<String, i32>> {
+    UPSTREAM_CONTEXT_WINDOWS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// 用上游下发的 `tokenLimits.maxInputTokens` 覆盖上下文窗口表。
+///
+/// 只保留正值；上游没给窗口的模型继续走静态兜底表。
+pub(crate) fn set_upstream_context_windows(
+    models: &[crate::kiro::model::available_models::UpstreamModel],
+) {
+    let mut map = upstream_context_windows().write();
+    map.clear();
+    for m in models {
+        let Some(limit) = m.token_limits.as_ref().and_then(|t| t.max_input_tokens) else {
+            continue;
+        };
+        let Ok(limit) = i32::try_from(limit) else {
+            continue;
+        };
+        if limit > 0 {
+            map.insert(m.model_id.to_lowercase(), limit);
+        }
+    }
+}
+
 /// 根据模型名称返回对应的上下文窗口大小
 ///
-/// 复用 `map_model` 的映射逻辑，确保窗口大小判断与模型映射一致。
-/// Kiro 于 2026-03-24 将 Opus 4.6 和 Sonnet 4.6 升级至 1M 上下文。
-/// 4.7 / 4.8 同 1M
+/// 取值优先级：
+/// 1. 上游 `ListAvailableModels` 下发的 `maxInputTokens`（按 modelId 缓存）；
+/// 2. 内置静态表（4.6+ / 5 系 1M、GPT-5.6 272K）；
+/// 3. 未知模型保守取 200K。
 pub fn get_context_window_size(model: &str) -> i32 {
-    match map_model(model) {
+    let Some(mapped) = map_model(model) else {
+        return 200_000;
+    };
+
+    if let Some(window) = upstream_context_windows().read().get(&mapped).copied() {
+        return window;
+    }
+
+    match mapped.as_str() {
         // GPT-5.6 family on Kiro ships a 272K context window.
-        Some(mapped) if mapped.starts_with("gpt") => 272_000,
-        Some(mapped)
-            if mapped == "claude-sonnet-4.6"
-                || mapped == "claude-sonnet-4.8"
-                || mapped == "claude-sonnet-5"
-                || mapped == "claude-sonnet-5-5"
-                || mapped == "claude-opus-4.6"
-                || mapped == "claude-opus-4.7"
-                || mapped == "claude-opus-4.8"
-                || mapped == "claude-opus-5"
-                || mapped == "claude-opus-5-5"
-                || mapped == "claude-haiku-5-5"
-                || mapped == "claude-fable-5" =>
-        {
-            1_000_000
-        }
+        m if m.starts_with("gpt") => 272_000,
+        "claude-sonnet-4.6"
+        | "claude-sonnet-4.8"
+        | "claude-sonnet-5"
+        | "claude-sonnet-5.5"
+        | "claude-opus-4.6"
+        | "claude-opus-4.7"
+        | "claude-opus-4.8"
+        | "claude-opus-5"
+        | "claude-opus-5.5"
+        | "claude-haiku-5.5"
+        | "claude-fable-5"
+        | "claude-fable-5.1"
+        | "claude-fable-5.2" => 1_000_000,
         // 未登记的透传模型（未来新模型）：无法确知窗口，保守取 200K 兜底。
         _ => 200_000,
     }
@@ -2302,6 +2377,33 @@ mod tests {
         assert_eq!(get_context_window_size("claude-fable-5"), 1_000_000);
     }
 
+    /// Fable 5.1 / 5.2 必须分别命中，不能被 `contains("fable")` 吞成 5.0。
+    #[test]
+    fn test_map_model_fable_5_minor_versions() {
+        assert_eq!(
+            map_model("claude-fable-5-2"),
+            Some("claude-fable-5.2".to_string())
+        );
+        assert_eq!(
+            map_model("claude-fable-5.2"),
+            Some("claude-fable-5.2".to_string())
+        );
+        assert_eq!(
+            map_model("claude-fable-5.2-thinking"),
+            Some("claude-fable-5.2".to_string())
+        );
+        assert_eq!(
+            map_model("claude-fable-5-1"),
+            Some("claude-fable-5.1".to_string())
+        );
+        assert_eq!(
+            map_model("claude-fable-5.1"),
+            Some("claude-fable-5.1".to_string())
+        );
+        assert_eq!(get_context_window_size("claude-fable-5-2"), 1_000_000);
+        assert_eq!(get_context_window_size("claude-fable-5-1"), 1_000_000);
+    }
+
     #[test]
     fn test_map_model_haiku() {
         assert!(
@@ -2311,54 +2413,67 @@ mod tests {
         );
     }
 
-    /// 5.5 三代必须精确命中上游横线 ID；宽松的 `*-5` 判断不能把它截断。
+    /// 5.5 三代：对外横线输入 → 上游点号输出。
     ///
     /// 回归：`claude-haiku-5-5` 曾命中 `contains("haiku-5")` 被归一成
     /// `claude-haiku-5`，上游返回 400 `INVALID_MODEL_ID`。
     #[test]
     fn test_map_model_5_5_family() {
+        // 客户端横线写法
         assert_eq!(
             map_model("claude-opus-5-5"),
-            Some("claude-opus-5-5".to_string())
-        );
-        assert_eq!(
-            map_model("claude-opus-5.5"),
-            Some("claude-opus-5-5".to_string())
+            Some("claude-opus-5.5".to_string())
         );
         assert_eq!(
             map_model("claude-opus-5-5-thinking"),
-            Some("claude-opus-5-5".to_string())
+            Some("claude-opus-5.5".to_string())
         );
-
         assert_eq!(
             map_model("claude-sonnet-5-5"),
-            Some("claude-sonnet-5-5".to_string())
-        );
-        assert_eq!(
-            map_model("claude-sonnet-5.5"),
-            Some("claude-sonnet-5-5".to_string())
+            Some("claude-sonnet-5.5".to_string())
         );
         assert_eq!(
             map_model("claude-sonnet-5-5-thinking"),
-            Some("claude-sonnet-5-5".to_string())
+            Some("claude-sonnet-5.5".to_string())
         );
-
         assert_eq!(
             map_model("claude-haiku-5-5"),
-            Some("claude-haiku-5-5".to_string())
-        );
-        assert_eq!(
-            map_model("claude-haiku-5.5"),
-            Some("claude-haiku-5-5".to_string())
+            Some("claude-haiku-5.5".to_string())
         );
         assert_eq!(
             map_model("claude-haiku-5-5-thinking"),
-            Some("claude-haiku-5-5".to_string())
+            Some("claude-haiku-5.5".to_string())
+        );
+
+        // 点号写法也接受，结果一致
+        assert_eq!(
+            map_model("claude-opus-5.5"),
+            Some("claude-opus-5.5".to_string())
+        );
+        assert_eq!(
+            map_model("claude-sonnet-5.5"),
+            Some("claude-sonnet-5.5".to_string())
+        );
+        assert_eq!(
+            map_model("claude-haiku-5.5"),
+            Some("claude-haiku-5.5".to_string())
         );
 
         assert_eq!(get_context_window_size("claude-opus-5-5"), 1_000_000);
         assert_eq!(get_context_window_size("claude-sonnet-5-5"), 1_000_000);
         assert_eq!(get_context_window_size("claude-haiku-5-5"), 1_000_000);
+    }
+
+    /// 对外展示 ID：Claude 点号转横线，非 Claude 原样。
+    #[test]
+    fn test_external_model_id_dashes_for_claude_only() {
+        assert_eq!(external_model_id("claude-opus-5.5"), "claude-opus-5-5");
+        assert_eq!(external_model_id("claude-haiku-4.5"), "claude-haiku-4-5");
+        assert_eq!(external_model_id("Claude-Sonnet-5.5"), "claude-sonnet-5-5");
+        assert_eq!(external_model_id("claude-opus-5-5"), "claude-opus-5-5");
+        // 非 Claude：官方 ID 原样保留（gpt / grok 本身就带点）
+        assert_eq!(external_model_id("gpt-5.6-sol"), "gpt-5.6-sol");
+        assert_eq!(external_model_id("grok-4.7"), "grok-4.7");
     }
 
     /// 5.0 仍独立识别，不被 5.5 规则吞掉。

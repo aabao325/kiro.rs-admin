@@ -526,7 +526,7 @@ pub(super) fn parse_anthropic_message(anthropic: &Value, model: &str) -> ParsedR
     let cache_read_tokens = usage_i64("cache_read_input_tokens");
 
     ParsedResponse {
-        model: model.to_string(),
+        model: super::converter::external_model_id(model),
         text,
         tool_calls,
         finish_reason,

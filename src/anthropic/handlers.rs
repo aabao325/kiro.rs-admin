@@ -8,6 +8,7 @@ use crate::admin::usage_stats::{SharedAggregator, SharedRecorder, UsageRecord};
 use crate::admin::trace_db::{
     SharedTraceStore, TraceAttempt, TraceKeySource, TraceRecord, TraceSink, outcome,
 };
+use crate::kiro::model::available_models::UpstreamModel;
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
@@ -481,6 +482,42 @@ fn available_models() -> Vec<Model> {
             max_tokens: 64000,
         },
         Model {
+            id: "claude-fable-5-2".to_string(),
+            object: "model".to_string(),
+            created: 1795000000, // Nov 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Fable 5.2".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "claude-fable-5-2-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1795000000, // Nov 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Fable 5.2 (Thinking)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "claude-fable-5-1".to_string(),
+            object: "model".to_string(),
+            created: 1795000000, // Nov 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Fable 5.1".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "claude-fable-5-1-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1795000000, // Nov 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Fable 5.1 (Thinking)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
             id: "claude-opus-5-5".to_string(),
             object: "model".to_string(),
             created: 1795000000, // Nov 2026
@@ -681,13 +718,86 @@ fn available_models() -> Vec<Model> {
     ]
 }
 
+/// 把上游 `ListAvailableModels` 的并集转成对外 `/v1/models` 结构。
+///
+/// 上游 Claude 用点号（`claude-opus-5.5`），对外统一暴露横线
+/// （`claude-opus-5-5`）；非 Claude 模型是官方 ID，原样保留。
+/// Claude 系另外补 `-thinking` 变体：上游不单列，但本服务支持该后缀。
+fn build_models_from_upstream(upstream: &[UpstreamModel]) -> Vec<Model> {
+    let now = Utc::now().timestamp();
+    let mut out: Vec<Model> = Vec::new();
+
+    for m in upstream {
+        let raw_id = m.model_id.trim();
+        if raw_id.is_empty() {
+            continue;
+        }
+
+        let id = super::converter::external_model_id(raw_id);
+        let display = m
+            .model_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(raw_id)
+            .to_string();
+
+        out.push(Model {
+            id: id.clone(),
+            object: "model".to_string(),
+            created: now,
+            owned_by: model_owner(&id).to_string(),
+            display_name: display.clone(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        });
+
+        if id.starts_with("claude-") {
+            out.push(Model {
+                id: format!("{id}-thinking"),
+                object: "model".to_string(),
+                created: now,
+                owned_by: "anthropic".to_string(),
+                display_name: format!("{display} (Thinking)"),
+                model_type: "chat".to_string(),
+                max_tokens: 64000,
+            });
+        }
+    }
+
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out.dedup_by(|a, b| a.id == b.id);
+    out
+}
+
+/// 按模型 ID 前缀归类 `owned_by`。
+fn model_owner(id: &str) -> &'static str {
+    if id.starts_with("gpt") {
+        "openai"
+    } else if id.starts_with("grok") {
+        "xai"
+    } else {
+        "anthropic"
+    }
+}
+
 /// GET /v1/models
 ///
-/// 返回可用的模型列表
-pub async fn get_models() -> impl IntoResponse {
+/// 返回当前所有启用凭据真实可用的模型并集；目录尚未就绪时回退静态清单。
+pub async fn get_models(State(state): State<AppState>) -> impl IntoResponse {
     tracing::info!("Received GET /v1/models request");
 
-    let models = available_models();
+    let models = match &state.kiro_provider {
+        Some(provider) => {
+            let upstream = state.models_catalog.snapshot_or_refresh(provider);
+            if upstream.is_empty() {
+                available_models()
+            } else {
+                build_models_from_upstream(&upstream)
+            }
+        }
+        None => available_models(),
+    };
 
     Json(ModelsResponse {
         object: "list".to_string(),
@@ -1474,7 +1584,7 @@ async fn handle_non_stream_request(
     // 构建 Anthropic 响应（字段顺序对齐官方真实样例；serde_json 开启
     // preserve_order 后 json! 字面量顺序即为序列化顺序）
     let mut response_body = json!({
-        "model": model,
+        "model": super::converter::external_model_id(model),
         "id": super::signature_sim::generate_message_id(),
         "type": "message",
         "role": "assistant",
@@ -2312,5 +2422,85 @@ mod tests {
         assert!(ids.contains(&"claude-opus-4-8-thinking"));
         assert!(ids.contains(&"claude-sonnet-4-8"));
         assert!(ids.contains(&"claude-sonnet-4-8-thinking"));
+    }
+
+    /// 静态兜底清单也要覆盖 5.5 与 fable 5.1/5.2，避免目录未就绪时客户端看不到。
+    #[test]
+    fn available_models_include_5_5_and_fable_5_x() {
+        let models = available_models();
+        let ids: Vec<&str> = models.iter().map(|model| model.id.as_str()).collect();
+
+        assert!(ids.contains(&"claude-opus-5-5"));
+        assert!(ids.contains(&"claude-sonnet-5-5"));
+        assert!(ids.contains(&"claude-haiku-5-5"));
+        assert!(ids.contains(&"claude-opus-5-5-thinking"));
+        assert!(ids.contains(&"claude-fable-5-2"));
+        assert!(ids.contains(&"claude-fable-5-1"));
+    }
+
+    /// 上游点号 ID 转对外横线，并补 thinking 变体；非 Claude 原样。
+    #[test]
+    fn build_models_from_upstream_normalizes_claude_ids() {
+        use crate::kiro::model::available_models::UpstreamModel;
+
+        let upstream = vec![
+            UpstreamModel {
+                model_id: "claude-opus-5.5".into(),
+                model_name: Some("Claude Opus 5.5".into()),
+                description: None,
+                token_limits: None,
+            },
+            UpstreamModel {
+                model_id: "gpt-5.6-sol".into(),
+                model_name: None,
+                description: None,
+                token_limits: None,
+            },
+            UpstreamModel {
+                model_id: "  ".into(),
+                model_name: None,
+                description: None,
+                token_limits: None,
+            },
+        ];
+
+        let models = build_models_from_upstream(&upstream);
+        let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+
+        assert!(ids.contains(&"claude-opus-5-5"), "点号应转横线");
+        assert!(ids.contains(&"claude-opus-5-5-thinking"));
+        assert!(ids.contains(&"gpt-5.6-sol"), "非 Claude 应原样");
+        assert!(!ids.iter().any(|id| id.trim().is_empty()), "空 id 应丢弃");
+
+        let opus = models.iter().find(|m| m.id == "claude-opus-5-5").unwrap();
+        assert_eq!(opus.owned_by, "anthropic");
+        assert_eq!(opus.display_name, "Claude Opus 5.5");
+        let gpt = models.iter().find(|m| m.id == "gpt-5.6-sol").unwrap();
+        assert_eq!(gpt.owned_by, "openai");
+    }
+
+    /// 多个凭据返回同一模型时只保留一条。
+    #[test]
+    fn build_models_from_upstream_dedups_by_id() {
+        use crate::kiro::model::available_models::UpstreamModel;
+
+        let upstream = vec![
+            UpstreamModel {
+                model_id: "claude-opus-5.5".into(),
+                model_name: None,
+                description: None,
+                token_limits: None,
+            },
+            UpstreamModel {
+                model_id: "claude-opus-5.5".into(),
+                model_name: None,
+                description: None,
+                token_limits: None,
+            },
+        ];
+
+        let models = build_models_from_upstream(&upstream);
+        let count = models.iter().filter(|m| m.id == "claude-opus-5-5").count();
+        assert_eq!(count, 1, "重复 id 应去重");
     }
 }

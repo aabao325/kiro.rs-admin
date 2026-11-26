@@ -1491,6 +1491,8 @@ impl StreamContext {
         known_tool_names: std::collections::HashSet<String>,
     ) -> Self {
         let model = model.into();
+        // 对外一律回显横线写法（Claude 点号 → 横线），与 /v1/models 保持一致。
+        let model = super::converter::external_model_id(&model);
         Self {
             state_manager: SseStateManager::new(),
             message_id: super::signature_sim::generate_message_id(),

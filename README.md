@@ -553,6 +553,8 @@ KIRO_API_KEY=ksk_xxx ./kiro-rs
 - `gpt-5.6-sol`
 - `gpt-5.6-terra`
 - `gpt-5.6-luna`
+- `claude-fable-5-2` / `claude-fable-5-2-thinking`
+- `claude-fable-5-1` / `claude-fable-5-1-thinking`
 - `claude-fable-5` / `claude-fable-5-thinking`
 - `claude-opus-5-5` / `claude-opus-5-5-thinking`
 - `claude-sonnet-5-5` / `claude-sonnet-5-5-thinking`
@@ -572,10 +574,12 @@ KIRO_API_KEY=ksk_xxx ./kiro-rs
 | 请求模型关键词 | 上游模型 |
 |---|---|
 | 以 `gpt-5` 开头 | 原样透传，例如 `gpt-5.6-sol` |
-| `fable`（任意） | `claude-fable-5` |
-| `sonnet` + `5-5` / `5.5` | `claude-sonnet-5-5` |
-| `opus` + `5-5` / `5.5` | `claude-opus-5-5` |
-| `haiku` + `5-5` / `5.5` | `claude-haiku-5-5` |
+| `fable` + `5-2` / `5.2` | `claude-fable-5.2` |
+| `fable` + `5-1` / `5.1` | `claude-fable-5.1` |
+| `fable` + `5` | `claude-fable-5` |
+| `sonnet` + `5-5` / `5.5` | `claude-sonnet-5.5` |
+| `opus` + `5-5` / `5.5` | `claude-opus-5.5` |
+| `haiku` + `5-5` / `5.5` | `claude-haiku-5.5` |
 | `sonnet` + `5`（`sonnet-5` / `sonnet5` / `sonnet.5`） | `claude-sonnet-5` |
 | `sonnet` + `4-8` / `4.8` | `claude-sonnet-4.8` |
 | `sonnet` + `4-6` / `4.6` | `claude-sonnet-4.6` |
@@ -587,13 +591,21 @@ KIRO_API_KEY=ksk_xxx ./kiro-rs
 | `haiku` + `4.x` / `3.x`（含 legacy `claude-3-5-haiku`） | `claude-haiku-4.5` |
 | 其它未登记写法 | 去掉 `-thinking` 后原样透传给上游，由上游判定 |
 
-5.5 系列在上游使用横线小版本（`claude-opus-5-5`），与 4.x 的点号形式（`claude-opus-4.5`）不同。未命中的模型不再在本层拒绝——上游上线新模型时无需改代码重新编译。
+**对外横线、上游点号**：Claude 系在客户端侧（请求模型名、`/v1/models`、响应体回显）
+统一用横线小版本（`claude-opus-5-5`），而真正发给 Kiro 上游时由本服务转成点号
+（`claude-opus-5.5`）。非 Claude 模型（`gpt-5.6-sol`、`grok-4.7` 等）是官方模型 ID，
+不做改写。未命中的 Claude 写法不再在本层拒绝——上游上线新模型时无需改代码重新编译。
+
+`/v1/models` 返回的是**当前所有启用凭据真实可用的模型并集**（后台聚合上游
+`ListAvailableModels`，5 分钟缓存）；目录尚未就绪时才回退到上面的静态清单。
 
 上下文窗口估算：
 
-- `gpt-5.*`：`272_000`（GPT-5.6 静态模型声明最大输出为 `64_000`）
-- `claude-sonnet-4.6`、`claude-sonnet-4.8`、`claude-sonnet-5`、`claude-sonnet-5-5`、`claude-opus-4.6`、`claude-opus-4.7`、`claude-opus-4.8`、`claude-opus-5`、`claude-opus-5-5`、`claude-haiku-5-5`、`claude-fable-5`：`1_000_000`
-- 其它模型：`200_000`
+- 优先采用上游 `ListAvailableModels` 下发的 `tokenLimits.maxInputTokens`（按 modelId 缓存）
+- 上游未提供时的静态兜底：
+  - `gpt-5.*`：`272_000`（GPT-5.6 静态模型声明最大输出为 `64_000`）
+  - `claude-sonnet-4.6`、`claude-sonnet-4.8`、`claude-sonnet-5`、`claude-sonnet-5.5`、`claude-opus-4.6`、`claude-opus-4.7`、`claude-opus-4.8`、`claude-opus-5`、`claude-opus-5.5`、`claude-haiku-5.5`、`claude-fable-5`、`claude-fable-5.1`、`claude-fable-5.2`：`1_000_000`
+  - 其它模型：`200_000`
 
 <a id="thinking-tools-websearch"></a>
 ## Thinking、工具与 WebSearch
