@@ -1124,6 +1124,12 @@ pub struct MultiTokenManager {
     account_rpm_limit_enabled: AtomicBool,
     /// 单账号每分钟请求上限（运行时可修改，0 = 不限）
     account_rpm_limit: AtomicU32,
+    /// 单个账号的最大尝试次数（含首次，运行时可修改）
+    max_attempts_per_credential: AtomicU32,
+    /// 单次请求的最大尝试次数硬上限（含首次，运行时可修改）
+    max_total_attempts: AtomicU32,
+    /// 是否对上游 429 做本地重试（运行时可修改）
+    retry_on_429: AtomicBool,
     /// 自定义错误规则表（运行时可修改 + 持久化）
     error_rules: Arc<crate::kiro::error_rules::ErrorRuleStore>,
     /// 凭据自愈总开关（运行时可修改）
@@ -1324,6 +1330,9 @@ impl MultiTokenManager {
         let self_heal_max_consecutive_rounds = config.self_heal_max_consecutive_rounds;
         let rpm_limit_enabled = config.account_rpm_limit_enabled;
         let rpm_limit = config.account_rpm_limit;
+        let max_attempts_per_credential = config.max_attempts_per_credential;
+        let max_total_attempts = config.max_total_attempts;
+        let retry_on_429 = config.retry_on_429;
         let error_rules = Arc::new(crate::kiro::error_rules::ErrorRuleStore::new(
             config.error_rules.clone(),
             config.config_path().map(|p| p.to_path_buf()),
@@ -1343,6 +1352,9 @@ impl MultiTokenManager {
             account_throttle_cooldown_secs: AtomicU64::new(throttle_cooldown_secs),
             account_rpm_limit_enabled: AtomicBool::new(rpm_limit_enabled),
             account_rpm_limit: AtomicU32::new(rpm_limit),
+            max_attempts_per_credential: AtomicU32::new(max_attempts_per_credential),
+            max_total_attempts: AtomicU32::new(max_total_attempts),
+            retry_on_429: AtomicBool::new(retry_on_429),
             error_rules,
             self_heal_enabled: AtomicBool::new(self_heal_enabled),
             self_heal_min_interval_secs: AtomicU64::new(self_heal_min_interval_secs),
@@ -3708,6 +3720,96 @@ impl MultiTokenManager {
     /// 获取账号级风控冷却时长秒数（Admin API）
     pub fn get_account_throttle_cooldown_secs(&self) -> u64 {
         self.account_throttle_cooldown_secs.load(Ordering::Relaxed)
+    }
+
+    /// 单个账号的最大尝试次数（含首次，Admin API / provider 读取）
+    pub fn max_attempts_per_credential(&self) -> u32 {
+        self.max_attempts_per_credential.load(Ordering::Relaxed)
+    }
+
+    /// 单次请求的最大尝试次数硬上限（含首次）
+    pub fn max_total_attempts(&self) -> u32 {
+        self.max_total_attempts.load(Ordering::Relaxed)
+    }
+
+    /// 是否对上游 429 做本地重试
+    pub fn retry_on_429(&self) -> bool {
+        self.retry_on_429.load(Ordering::Relaxed)
+    }
+
+    /// 更新重试策略：改运行时原子值 + 持久化到 config.json。
+    ///
+    /// 任一字段缺省表示不修改。校验失败或写盘失败时保持原值不变，
+    /// 避免「面板显示已改、实际没生效」的静默不一致。
+    pub fn set_retry_config(
+        &self,
+        max_attempts_per_credential: Option<u32>,
+        max_total_attempts: Option<u32>,
+        retry_on_429: Option<bool>,
+    ) -> anyhow::Result<()> {
+        validate_retry_config(max_attempts_per_credential, max_total_attempts)?;
+
+        let prev_per = self.max_attempts_per_credential();
+        let prev_total = self.max_total_attempts();
+        let prev_retry = self.retry_on_429();
+
+        let new_per = max_attempts_per_credential.unwrap_or(prev_per);
+        let new_total = max_total_attempts.unwrap_or(prev_total);
+        let new_retry = retry_on_429.unwrap_or(prev_retry);
+
+        if new_per == prev_per && new_total == prev_total && new_retry == prev_retry {
+            return Ok(());
+        }
+
+        self.max_attempts_per_credential
+            .store(new_per, Ordering::Relaxed);
+        self.max_total_attempts.store(new_total, Ordering::Relaxed);
+        self.retry_on_429.store(new_retry, Ordering::Relaxed);
+
+        if let Err(err) = self.persist_retry_config(new_per, new_total, new_retry) {
+            // 回滚内存值，保持「面板看到的 == 实际生效的」
+            self.max_attempts_per_credential
+                .store(prev_per, Ordering::Relaxed);
+            self.max_total_attempts.store(prev_total, Ordering::Relaxed);
+            self.retry_on_429.store(prev_retry, Ordering::Relaxed);
+            return Err(err);
+        }
+
+        tracing::info!(
+            "重试策略已更新: maxAttemptsPerCredential={}, maxTotalAttempts={}, retryOn429={}",
+            new_per,
+            new_total,
+            new_retry
+        );
+        Ok(())
+    }
+
+    fn persist_retry_config(
+        &self,
+        max_attempts_per_credential: u32,
+        max_total_attempts: u32,
+        retry_on_429: bool,
+    ) -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        let config_path = match self.config.config_path() {
+            Some(path) => path.to_path_buf(),
+            None => {
+                tracing::warn!("配置文件路径未知，重试策略仅在当前进程生效");
+                return Ok(());
+            }
+        };
+
+        let mut config = Config::load(&config_path)
+            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
+        config.max_attempts_per_credential = max_attempts_per_credential;
+        config.max_total_attempts = max_total_attempts;
+        config.retry_on_429 = retry_on_429;
+        config
+            .save()
+            .with_context(|| format!("持久化重试策略失败: {}", config_path.display()))?;
+
+        Ok(())
     }
 
     /// 设置账号级风控故障转移配置（Admin API）
@@ -6165,5 +6267,76 @@ mod tests {
 
         // 但 g2 仍可用
         assert!(manager.acquire_context(None, Some("g2")).await.is_ok());
+    }
+}
+
+/// 重试配置的合法范围：每凭据 1..=10、总上限 1..=20，均为「含首次」的尝试次数。
+///
+/// 上限故意收得很低：单次请求反复打同一个上游只会放大限流，
+/// 真正的故障转移应该发生在凭据之间，而不是在一个请求里死磕。
+pub(crate) const MIN_ATTEMPTS: u32 = 1;
+pub(crate) const MAX_ATTEMPTS_PER_CREDENTIAL: u32 = 10;
+pub(crate) const MAX_TOTAL_ATTEMPTS: u32 = 20;
+
+/// 校验重试配置；`None` 表示该字段不修改，不参与校验。
+pub(crate) fn validate_retry_config(
+    max_attempts_per_credential: Option<u32>,
+    max_total_attempts: Option<u32>,
+) -> anyhow::Result<()> {
+    if let Some(v) = max_attempts_per_credential {
+        if !(MIN_ATTEMPTS..=MAX_ATTEMPTS_PER_CREDENTIAL).contains(&v) {
+            anyhow::bail!(
+                "maxAttemptsPerCredential 必须在 {}..={} 内（含首次尝试）: {}",
+                MIN_ATTEMPTS,
+                MAX_ATTEMPTS_PER_CREDENTIAL,
+                v
+            );
+        }
+    }
+    if let Some(v) = max_total_attempts {
+        if !(MIN_ATTEMPTS..=MAX_TOTAL_ATTEMPTS).contains(&v) {
+            anyhow::bail!(
+                "maxTotalAttempts 必须在 {}..={} 内（含首次尝试）: {}",
+                MIN_ATTEMPTS,
+                MAX_TOTAL_ATTEMPTS,
+                v
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod retry_config_validation_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_inclusive_boundaries() {
+        assert!(validate_retry_config(Some(1), Some(1)).is_ok());
+        assert!(validate_retry_config(
+            Some(MAX_ATTEMPTS_PER_CREDENTIAL),
+            Some(MAX_TOTAL_ATTEMPTS)
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn omitted_fields_are_not_validated() {
+        assert!(validate_retry_config(None, None).is_ok());
+        assert!(validate_retry_config(Some(3), None).is_ok());
+        assert!(validate_retry_config(None, Some(4)).is_ok());
+    }
+
+    /// 0 次尝试没有意义：连第一次都不发就失败了。
+    #[test]
+    fn rejects_zero_attempts() {
+        assert!(validate_retry_config(Some(0), None).is_err());
+        assert!(validate_retry_config(None, Some(0)).is_err());
+    }
+
+    #[test]
+    fn rejects_values_above_caps() {
+        assert!(validate_retry_config(Some(MAX_ATTEMPTS_PER_CREDENTIAL + 1), None).is_err());
+        assert!(validate_retry_config(None, Some(MAX_TOTAL_ATTEMPTS + 1)).is_err());
     }
 }

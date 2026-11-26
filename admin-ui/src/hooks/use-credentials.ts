@@ -24,6 +24,8 @@ import {
   setAccountRpmConfig,
   getLogGovernanceConfig,
   setLogGovernanceConfig,
+  getRetryConfig,
+  setRetryConfig,
   resetSuccessCount,
   resetAllSuccessCount,
 } from '@/api/credentials'
@@ -298,6 +300,26 @@ export function useSetLogGovernanceConfig() {
     mutationFn: setLogGovernanceConfig,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['logGovernanceConfig'] })
+    },
+  })
+}
+
+// 获取重试策略配置
+export function useRetryConfig() {
+  return useQuery({
+    queryKey: ['retryConfig'],
+    queryFn: getRetryConfig,
+  })
+}
+
+// 更新重试策略配置
+export function useSetRetryConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setRetryConfig,
+    onSuccess: (data) => {
+      // 服务端返回生效后的完整状态，直接覆盖避免多一次往返
+      queryClient.setQueryData(['retryConfig'], data)
     },
   })
 }

@@ -21,15 +21,19 @@ use crate::kiro::token_manager::MultiTokenManager;
 use crate::model::config::TlsBackend;
 use parking_lot::Mutex;
 
-/// 每个凭据的最大重试次数
-const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
-
-/// 总重试次数硬上限（避免无限重试）
+/// 计算单次请求的最大尝试次数（含首次）。
 ///
-/// 注：上游 429 多为账号级速率配额（SERVICE_REQUEST_RATE_EXCEEDED），高峰期
-/// 多账号同时触顶时，过多重试会在账号间连环撞墙、放大限流。故上限取较小值，
-/// 配合 429 专用长退避（见 retry_delay_throttle），被限时尽早返回而非耗尽配额。
-const MAX_TOTAL_RETRIES: usize = 4;
+/// 公式：`min(作用域内凭据数 × 每凭据上限, 总上限)`，两个上限都至少按 1 处理。
+/// 因此把 `max_total_attempts` 配成 1 就等价于完全关闭重试。
+pub(crate) fn resolve_max_attempts(
+    total_credentials: usize,
+    max_attempts_per_credential: u32,
+    max_total_attempts: u32,
+) -> usize {
+    let per = max_attempts_per_credential.max(1) as usize;
+    let cap = max_total_attempts.max(1) as usize;
+    total_credentials.max(1).saturating_mul(per).min(cap)
+}
 
 /// HTTP Client 缓存容量上限（不含常驻的全局代理 client）。
 /// 代理池条目较多时，避免每个不同代理都常驻一个 reqwest::Client 导致内存无界增长。
@@ -337,7 +341,12 @@ impl KiroProvider {
         group: Option<&str>,
     ) -> anyhow::Result<reqwest::Response> {
         let total_credentials = self.token_manager.total_count_in_group(group).max(1);
-        let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
+        let max_retries = resolve_max_attempts(
+            total_credentials,
+            self.token_manager.max_attempts_per_credential(),
+            self.token_manager.max_total_attempts(),
+        );
+        let retry_on_429 = self.token_manager.retry_on_429();
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
 
@@ -504,6 +513,13 @@ impl KiroProvider {
                     status,
                     body
                 );
+                // 面板关闭了 429 本地重试：直接透传，保留 Retry-After 交给客户端自行退避
+                if status.as_u16() == 429 && !retry_on_429 {
+                    tracing::warn!("MCP 请求失败（429 本地重试已关闭，直接返回）: {}", body);
+                    return Err(rate_limit_error
+                        .expect("429 响应一定构造了类型化限流错误")
+                        .into());
+                }
                 last_error = if let Some(rate_limit) = rate_limit_error {
                     if !rate_limit.should_retry_locally() {
                         return Err(rate_limit.into());
@@ -543,10 +559,11 @@ impl KiroProvider {
 
     /// 内部方法：带重试逻辑的 API 调用
     ///
-    /// 重试策略：
-    /// - 每个凭据最多重试 MAX_RETRIES_PER_CREDENTIAL 次
-    /// - 总重试次数 = min(凭据数量 × 每凭据重试次数, MAX_TOTAL_RETRIES)
-    /// - 硬上限 9 次，避免无限重试
+    /// 重试策略（可在面板「重试策略」中调整，运行时生效）：
+    /// - 每个凭据最多尝试 `max_attempts_per_credential` 次（含首次）
+    /// - 总尝试次数 = min(作用域内凭据数 × 每凭据上限, `max_total_attempts`)
+    /// - `max_total_attempts` 配成 1 即完全关闭重试
+    /// - `retry_on_429` 关闭时，429 不再本地退避重试，直接透传给客户端
     async fn call_api_with_retry(
         &self,
         request_body: &str,
@@ -556,7 +573,12 @@ impl KiroProvider {
     ) -> anyhow::Result<KiroCallResult> {
         // 重试预算按当前请求所属分组的账号数计算，避免小分组按全局账号数获得过多无效重试
         let total_credentials = self.token_manager.total_count_in_group(group).max(1);
-        let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
+        let max_retries = resolve_max_attempts(
+            total_credentials,
+            self.token_manager.max_attempts_per_credential(),
+            self.token_manager.max_total_attempts(),
+        );
+        let retry_on_429 = self.token_manager.retry_on_429();
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
         let api_type = if is_stream { "流式" } else { "非流式" };
@@ -932,6 +954,13 @@ impl KiroProvider {
                     sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()),
                     outcome::TRANSIENT, Some(&body), attempt_start,
                 );
+                // 面板关闭了 429 本地重试：直接透传，保留 Retry-After 交给客户端自行退避
+                if status.as_u16() == 429 && !retry_on_429 {
+                    tracing::warn!("API 请求失败（429 本地重试已关闭，直接返回）: {}", body);
+                    return Err(rate_limit_error
+                        .expect("429 响应一定构造了类型化限流错误")
+                        .into());
+                }
                 last_error = if let Some(rate_limit) = rate_limit_error {
                     if !rate_limit.should_retry_locally() {
                         return Err(rate_limit.into());
@@ -1197,5 +1226,42 @@ mod rate_limit_tests {
     fn current_acquire_rate_limit_is_detected_before_outer_retry() {
         let error = anyhow::Error::new(UpstreamRateLimitError::new(Some("30".to_string())));
         assert!(is_rate_limit_error(&error));
+    }
+}
+
+#[cfg(test)]
+mod retry_budget_tests {
+    use super::*;
+
+    /// 默认配置（每凭据 3、总上限 4）必须与 0.7.2 的硬编码行为完全一致。
+    #[test]
+    fn default_limits_reproduce_previous_behaviour() {
+        assert_eq!(resolve_max_attempts(1, 3, 4), 3);
+        assert_eq!(resolve_max_attempts(2, 3, 4), 4);
+        assert_eq!(resolve_max_attempts(3, 3, 4), 4);
+        assert_eq!(resolve_max_attempts(50, 3, 4), 4);
+    }
+
+    /// 总上限设成 1 = 只打一次上游，等价于关闭重试。
+    #[test]
+    fn total_cap_of_one_disables_retries() {
+        assert_eq!(resolve_max_attempts(1, 3, 1), 1);
+        assert_eq!(resolve_max_attempts(20, 10, 1), 1);
+    }
+
+    /// 面板传 0 时不能让请求「零次尝试」——那等于必然失败且不发上游。
+    #[test]
+    fn zero_values_are_clamped_to_one_attempt() {
+        assert_eq!(resolve_max_attempts(0, 3, 4), 3);
+        assert_eq!(resolve_max_attempts(2, 0, 4), 2);
+        assert_eq!(resolve_max_attempts(2, 3, 0), 1);
+    }
+
+    /// 调大上限后应按凭据数放大，而不是永远被默认值挡住。
+    #[test]
+    fn larger_limits_are_honoured() {
+        assert_eq!(resolve_max_attempts(5, 2, 20), 10);
+        assert_eq!(resolve_max_attempts(5, 1, 20), 5);
+        assert_eq!(resolve_max_attempts(30, 1, 20), 20);
     }
 }

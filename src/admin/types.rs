@@ -548,6 +548,33 @@ pub struct SetLogGovernanceConfigRequest {
     pub usage_log_retention_days: Option<u32>,
 }
 
+/// 重试策略配置响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetryConfigResponse {
+    /// 单个账号的最大尝试次数（含首次）
+    pub max_attempts_per_credential: u32,
+    /// 单次请求的最大尝试次数硬上限（含首次）
+    pub max_total_attempts: u32,
+    /// 是否对上游 429 做本地重试
+    pub retry_on_429: bool,
+}
+
+/// 更新重试策略（字段缺省表示不修改）
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetRetryConfigRequest {
+    /// 每凭据尝试次数，1..=10（含首次）
+    #[serde(default)]
+    pub max_attempts_per_credential: Option<u32>,
+    /// 单请求总尝试次数硬上限，1..=20（含首次）
+    #[serde(default)]
+    pub max_total_attempts: Option<u32>,
+    /// 是否对上游 429 做本地重试
+    #[serde(default)]
+    pub retry_on_429: Option<bool>,
+}
+
 // ============ 代理池 ============
 
 /// 代理池条目

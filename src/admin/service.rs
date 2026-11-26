@@ -32,6 +32,7 @@ use super::types::{
     ProxyCheckAllResponse, ProxyCheckResponse, ProxyPoolEntry, ProxyPoolResponse,
     QuotaExceededResult, SelfHealConfigResponse, SetAccountThrottleConfigRequest,
     SetLoadBalancingModeRequest, SetSelfHealConfigRequest,
+    RetryConfigResponse, SetRetryConfigRequest,
     SetLogGovernanceConfigRequest, SetUpdateConfigRequest, StartIdcLoginRequest,
     StartIdcLoginResponse, StartSocialLoginRequest, StartSocialLoginResponse, UpdateCheckInfo,
     UpdateConfigResponse, UpdateCredentialRequest, UpdateRefreshTokenRequest,
@@ -2071,6 +2072,42 @@ impl AdminService {
             .save()
             .with_context(|| format!("持久化日志治理配置失败: {}", config_path.display()))?;
         Ok(())
+    }
+
+    /// 读取重试策略配置
+    pub fn get_retry_config(&self) -> RetryConfigResponse {
+        RetryConfigResponse {
+            max_attempts_per_credential: self.token_manager.max_attempts_per_credential(),
+            max_total_attempts: self.token_manager.max_total_attempts(),
+            retry_on_429: self.token_manager.retry_on_429(),
+        }
+    }
+
+    /// 更新重试策略：改运行时原子值 + 持久化到 config.json。
+    /// 任一字段缺省表示不修改。
+    pub fn set_retry_config(
+        &self,
+        req: SetRetryConfigRequest,
+    ) -> Result<RetryConfigResponse, AdminServiceError> {
+        if req.max_attempts_per_credential.is_none()
+            && req.max_total_attempts.is_none()
+            && req.retry_on_429.is_none()
+        {
+            return Err(AdminServiceError::InvalidCredential(
+                "至少提供 maxAttemptsPerCredential、maxTotalAttempts 或 retryOn429 一个字段"
+                    .to_string(),
+            ));
+        }
+
+        self.token_manager
+            .set_retry_config(
+                req.max_attempts_per_credential,
+                req.max_total_attempts,
+                req.retry_on_429,
+            )
+            .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
+
+        Ok(self.get_retry_config())
     }
 
     /// 更新指定凭据的 refreshToken（仅限已禁用凭据）

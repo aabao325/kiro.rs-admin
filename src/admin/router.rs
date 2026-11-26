@@ -18,6 +18,7 @@ use super::{
         get_account_throttle_config, get_error_rules,
         get_all_credentials, get_cache_force_config, get_credential_balance, get_credential_models,
         get_global_proxy, get_load_balancing_mode, get_log_governance_config, get_proxy_pool,
+        get_retry_config,
         get_self_heal_config, get_update_config, list_client_keys, list_groups, list_traces,
         trace_failure_stats,
         poll_idc_login, poll_idc_relogin, poll_social_login,
@@ -27,6 +28,7 @@ use super::{
         set_client_key_disabled, set_self_heal_config, set_error_rules,
         set_credential_disabled, set_credential_overage, set_credential_priority,
         set_global_proxy, set_load_balancing_mode, set_log_governance_config, set_proxy_enabled,
+        set_retry_config,
         set_update_config, start_idc_login, start_idc_relogin, start_social_login,
         start_social_relogin, stats_by_credential, stats_by_model, stats_overview,
         stats_timeseries, update_admin_key, update_client_key, update_credential, update_group,
@@ -62,6 +64,10 @@ const MAX_ADMIN_BODY_SIZE: usize = 50 * 1024 * 1024;
 /// - `PUT /config/error-rules` - 整表替换自定义错误规则
 /// - `GET /config/account-rpm-limit` - 获取单账号 RPM 限流配置
 /// - `PUT /config/account-rpm-limit` - 设置单账号 RPM 限流配置
+/// - `GET /config/log-governance` - 获取日志治理配置
+/// - `PUT /config/log-governance` - 设置日志治理配置
+/// - `GET /config/retry` - 获取重试策略（尝试次数 / 429 是否本地重试）
+/// - `PUT /config/retry` - 设置重试策略
 ///
 /// # 认证
 /// 需要登录API密钥认证，支持：
@@ -130,6 +136,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route(
             "/config/log-governance",
             get(get_log_governance_config).put(set_log_governance_config),
+        )
+        .route(
+            "/config/retry",
+            get(get_retry_config).put(set_retry_config),
         )
         .route(
             "/config/global-proxy",

@@ -217,6 +217,26 @@ pub struct Config {
     #[serde(default = "default_usage_log_retention_days")]
     pub usage_log_retention_days: u32,
 
+    /// 单个账号的最大尝试次数（含首次，默认 3）。
+    ///
+    /// 与 `max_total_attempts` 共同决定单次请求最多打几次上游：
+    /// `min(作用域内凭据数 × 本值, max_total_attempts)`。
+    #[serde(default = "default_max_attempts_per_credential")]
+    pub max_attempts_per_credential: u32,
+
+    /// 单次请求的最大尝试次数硬上限（含首次，默认 4）。
+    ///
+    /// 设为 `1` 等价于关闭重试：第一次打不通立即返回。
+    #[serde(default = "default_max_total_attempts")]
+    pub max_total_attempts: u32,
+
+    /// 是否对上游 429 做本地重试（默认 true）。
+    ///
+    /// 关闭后：429 直接透传给客户端（保留 Retry-After），不再本地退避重试。
+    /// 适合「上游已明确限流、本地重试只会把确定失败推迟几秒」的场景。
+    #[serde(default = "default_retry_on_429")]
+    pub retry_on_429: bool,
+
     /// 端点特定的配置
     ///
     /// 键为端点名（如 "ide" / "cli"），值为该端点自由定义的参数对象。
@@ -321,6 +341,18 @@ fn default_usage_log_retention_days() -> u32 {
     31
 }
 
+fn default_max_attempts_per_credential() -> u32 {
+    3
+}
+
+fn default_max_total_attempts() -> u32 {
+    4
+}
+
+fn default_retry_on_429() -> bool {
+    true
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -362,6 +394,9 @@ impl Default for Config {
             trace_enabled: default_trace_enabled(),
             trace_retention_days: default_trace_retention_days(),
             usage_log_retention_days: default_usage_log_retention_days(),
+            max_attempts_per_credential: default_max_attempts_per_credential(),
+            max_total_attempts: default_max_total_attempts(),
+            retry_on_429: default_retry_on_429(),
             endpoints: HashMap::new(),
             config_path: None,
         }
@@ -426,5 +461,48 @@ impl Config {
         fs::write(path, content)
             .with_context(|| format!("写入配置文件失败: {}", path.display()))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod retry_config_tests {
+    use super::*;
+
+    /// 老 config.json 没有这三个字段，升级后必须保持原有重试行为。
+    #[test]
+    fn retry_fields_fall_back_to_previous_defaults() {
+        let cfg: Config = serde_json::from_str("{}").expect("空对象应可反序列化出默认配置");
+
+        assert_eq!(cfg.max_attempts_per_credential, 3);
+        assert_eq!(cfg.max_total_attempts, 4);
+        assert!(cfg.retry_on_429);
+    }
+
+    /// 三个字段按 camelCase 落盘，与面板 / API 的命名一致。
+    #[test]
+    fn retry_fields_serialize_as_camel_case() {
+        let cfg = Config {
+            max_attempts_per_credential: 2,
+            max_total_attempts: 6,
+            retry_on_429: false,
+            ..Config::default()
+        };
+
+        let json = serde_json::to_value(&cfg).expect("配置应可序列化");
+
+        assert_eq!(json["maxAttemptsPerCredential"], 2);
+        assert_eq!(json["maxTotalAttempts"], 6);
+        assert_eq!(json["retryOn429"], false);
+    }
+
+    /// 缓存多个配置实例不会互相影响（原子值改的是 token_manager，不是本结构）。
+    #[test]
+    fn default_config_is_independent_per_call() {
+        let a = Config::default();
+        let mut b = Config::default();
+        b.max_total_attempts = 1;
+
+        assert_eq!(a.max_total_attempts, 4);
+        assert_eq!(b.max_total_attempts, 1);
     }
 }

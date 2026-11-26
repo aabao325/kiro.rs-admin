@@ -541,6 +541,29 @@ export async function setLogGovernanceConfig(
   return data
 }
 
+export interface RetryConfig {
+  /** 单个账号的最大尝试次数（含首次） */
+  maxAttemptsPerCredential: number
+  /** 单次请求的最大尝试次数硬上限（含首次） */
+  maxTotalAttempts: number
+  /** 是否对上游 429 做本地重试 */
+  retryOn429: boolean
+}
+
+export type RetryConfigPatch = Partial<RetryConfig>
+
+// 获取重试策略配置
+export async function getRetryConfig(): Promise<RetryConfig> {
+  const { data } = await api.get<RetryConfig>('/config/retry')
+  return data
+}
+
+// 更新重试策略配置
+export async function setRetryConfig(patch: RetryConfigPatch): Promise<RetryConfig> {
+  const { data } = await api.put<RetryConfig>('/config/retry', patch)
+  return data
+}
+
 // 发起 IdC 设备授权登录
 export async function startIdcLogin(
   req: StartIdcLoginRequest

@@ -26,6 +26,7 @@ use super::{
         SetAccountThrottleConfigRequest, SetDisabledRequest, SetGlobalProxyRequest,
         SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetPriorityRequest,
         SetSelfHealConfigRequest, SetErrorRulesRequest, SetAccountRpmConfigRequest,
+        SetRetryConfigRequest,
         SetUpdateConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
         UpdateAdminKeyRequest, UpdateClientKeyRequest, UpdateCredentialRequest,
         UpdateRefreshTokenRequest,
@@ -610,6 +611,24 @@ pub async fn set_log_governance_config(
     Json(payload): Json<SetLogGovernanceConfigRequest>,
 ) -> impl IntoResponse {
     match state.service.set_log_governance_config(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/retry
+/// 读取重试策略配置（每凭据尝试次数 / 总尝试上限 / 429 是否本地重试）
+pub async fn get_retry_config(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_retry_config())
+}
+
+/// PUT /api/admin/config/retry
+/// 更新重试策略配置（运行时生效 + 持久化 config.json）
+pub async fn set_retry_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetRetryConfigRequest>,
+) -> impl IntoResponse {
+    match state.service.set_retry_config(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
