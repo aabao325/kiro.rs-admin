@@ -554,6 +554,9 @@ KIRO_API_KEY=ksk_xxx ./kiro-rs
 - `gpt-5.6-terra`
 - `gpt-5.6-luna`
 - `claude-fable-5` / `claude-fable-5-thinking`
+- `claude-opus-5-5` / `claude-opus-5-5-thinking`
+- `claude-sonnet-5-5` / `claude-sonnet-5-5-thinking`
+- `claude-haiku-5-5` / `claude-haiku-5-5-thinking`
 - `claude-sonnet-5` / `claude-sonnet-5-thinking`
 - `claude-opus-4-8` / `claude-opus-4-8-thinking`
 - `claude-sonnet-4-8` / `claude-sonnet-4-8-thinking`
@@ -570,6 +573,9 @@ KIRO_API_KEY=ksk_xxx ./kiro-rs
 |---|---|
 | 以 `gpt-5` 开头 | 原样透传，例如 `gpt-5.6-sol` |
 | `fable`（任意） | `claude-fable-5` |
+| `sonnet` + `5-5` / `5.5` | `claude-sonnet-5-5` |
+| `opus` + `5-5` / `5.5` | `claude-opus-5-5` |
+| `haiku` + `5-5` / `5.5` | `claude-haiku-5-5` |
 | `sonnet` + `5`（`sonnet-5` / `sonnet5` / `sonnet.5`） | `claude-sonnet-5` |
 | `sonnet` + `4-8` / `4.8` | `claude-sonnet-4.8` |
 | `sonnet` + `4-6` / `4.6` | `claude-sonnet-4.6` |
@@ -578,14 +584,15 @@ KIRO_API_KEY=ksk_xxx ./kiro-rs
 | `opus` + `4-7` / `4.7` | `claude-opus-4.7` |
 | `opus` + `4-6` / `4.6` | `claude-opus-4.6` |
 | `opus` + `4-5` / `4.5` | `claude-opus-4.5` |
-| 任意 `haiku` | `claude-haiku-4.5` |
+| `haiku` + `4.x` / `3.x`（含 legacy `claude-3-5-haiku`） | `claude-haiku-4.5` |
+| 其它未登记写法 | 去掉 `-thinking` 后原样透传给上游，由上游判定 |
 
-没有命中上述规则的模型会作为不支持模型处理。
+5.5 系列在上游使用横线小版本（`claude-opus-5-5`），与 4.x 的点号形式（`claude-opus-4.5`）不同。未命中的模型不再在本层拒绝——上游上线新模型时无需改代码重新编译。
 
 上下文窗口估算：
 
 - `gpt-5.*`：`272_000`（GPT-5.6 静态模型声明最大输出为 `64_000`）
-- `claude-sonnet-4.6`、`claude-sonnet-4.8`、`claude-sonnet-5`、`claude-opus-4.6`、`claude-opus-4.7`、`claude-opus-4.8`、`claude-fable-5`：`1_000_000`
+- `claude-sonnet-4.6`、`claude-sonnet-4.8`、`claude-sonnet-5`、`claude-sonnet-5-5`、`claude-opus-4.6`、`claude-opus-4.7`、`claude-opus-4.8`、`claude-opus-5`、`claude-opus-5-5`、`claude-haiku-5-5`、`claude-fable-5`：`1_000_000`
 - 其它模型：`200_000`
 
 <a id="thinking-tools-websearch"></a>

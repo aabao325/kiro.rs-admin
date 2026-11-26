@@ -409,14 +409,18 @@ fn identity_injection_tokens(identity: Option<(&'static str, &'static str)>) -> 
 
 /// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID。
 ///
-/// 策略分两层：
-/// 1. **已知模型显式归一**：把带日期后缀、`-thinking` 变体、点/横线混写的别名
-///    （如 `claude-opus-4-8-20260528` / `claude-opus-4.8-thinking`）统一收敛到
-///    规范 Kiro ID（`claude-opus-4.8`），保证 effort / 上下文窗口等按模型判定一致。
-/// 2. **未知模型透传**：任何本层未登记的模型名，都去掉 `-thinking` 后缀、原样
-///    （小写、trim）透传给上游，由 Kiro 上游当权威判断支不支持——这样上游一上线
-///    新模型，本中转层无需改代码重新编译即可直接使用。仅空字符串返回 `None`
-///    （真正无法处理），其余一律放行。
+/// 策略分三层：
+/// 1. **5.5 代优先精确识别**：上游 5.5 系列用横线小版本（`claude-opus-5-5` /
+///    `claude-sonnet-5-5` / `claude-haiku-5-5`）。这一层必须排在所有宽松的
+///    `*-5` 判断之前——否则 `claude-haiku-5-5` 会命中 `contains("haiku-5")`
+///    被截成 `claude-haiku-5`，上游直接返回 `INVALID_MODEL_ID`。
+/// 2. **已知旧模型显式归一**：把带日期后缀、`-thinking` 变体、点/横线混写的
+///    4.x 别名（如 `claude-opus-4-8-20260528` / `claude-opus-4.8-thinking`）
+///    统一收敛到规范 Kiro ID（`claude-opus-4.8`），保证 effort / 上下文窗口
+///    等按模型判定一致。3.x 及 4.0 的 haiku 作为 legacy 别名收敛到 `4.5`。
+/// 3. **未知模型透传**：本层未登记的写法一律去掉 `-thinking` 后缀、原样
+///    （小写、trim）透传给上游，由 Kiro 当权威判断支不支持——上游一上线新
+///    模型，本中转层无需改代码重新编译即可直接使用。仅空字符串返回 `None`。
 pub fn map_model(model: &str) -> Option<String> {
     let model_lower = model.to_lowercase();
 
@@ -424,16 +428,18 @@ pub fn map_model(model: &str) -> Option<String> {
         // Fable 5：与 Mythos 5 同底座；目前仅 5 代
         Some("claude-fable-5".to_string())
     } else if model_lower.contains("sonnet") {
-        if model_lower.contains("4-8") || model_lower.contains("4.8") {
+        if contains_any(
+            &model_lower,
+            &["sonnet-5-5", "sonnet-5.5", "sonnet5.5", "sonnet.5.5"],
+        ) {
+            Some("claude-sonnet-5-5".to_string())
+        } else if contains_any(&model_lower, &["4-8", "4.8"]) {
             Some("claude-sonnet-4.8".to_string())
-        } else if model_lower.contains("4-6") || model_lower.contains("4.6") {
+        } else if contains_any(&model_lower, &["4-6", "4.6"]) {
             Some("claude-sonnet-4.6".to_string())
-        } else if model_lower.contains("4-5") || model_lower.contains("4.5") {
+        } else if contains_any(&model_lower, &["4-5", "4.5"]) {
             Some("claude-sonnet-4.5".to_string())
-        } else if model_lower.contains("sonnet-5")
-            || model_lower.contains("sonnet5")
-            || model_lower.contains("sonnet.5")
-        {
+        } else if contains_any(&model_lower, &["sonnet-5", "sonnet5", "sonnet.5"]) {
             // 精确匹配 5 代，避免命中 legacy claude-3-5-sonnet
             Some("claude-sonnet-5".to_string())
         } else {
@@ -441,40 +447,62 @@ pub fn map_model(model: &str) -> Option<String> {
             passthrough_model(&model_lower)
         }
     } else if model_lower.contains("opus") {
-        if model_lower.contains("4-8") || model_lower.contains("4.8") {
+        if contains_any(
+            &model_lower,
+            &["opus-5-5", "opus-5.5", "opus5.5", "opus.5.5"],
+        ) {
+            Some("claude-opus-5-5".to_string())
+        } else if contains_any(&model_lower, &["4-8", "4.8"]) {
             Some("claude-opus-4.8".to_string())
-        } else if model_lower.contains("4-7") || model_lower.contains("4.7") {
+        } else if contains_any(&model_lower, &["4-7", "4.7"]) {
             Some("claude-opus-4.7".to_string())
-        } else if model_lower.contains("4-5") || model_lower.contains("4.5") {
-            Some("claude-opus-4.5".to_string())
-        } else if model_lower.contains("4-6") || model_lower.contains("4.6") {
+        } else if contains_any(&model_lower, &["4-6", "4.6"]) {
             Some("claude-opus-4.6".to_string())
-        } else if model_lower.contains("opus-5")
-            || model_lower.contains("opus5")
-            || model_lower.contains("opus.5")
-        {
+        } else if contains_any(&model_lower, &["4-5", "4.5"]) {
+            Some("claude-opus-4.5".to_string())
+        } else if contains_any(&model_lower, &["opus-5", "opus5", "opus.5"]) {
             Some("claude-opus-5".to_string())
         } else {
             // 未登记的 opus 版本：透传给上游
             passthrough_model(&model_lower)
         }
     } else if model_lower.contains("haiku") {
-        if model_lower.contains("haiku-5")
-            || model_lower.contains("haiku5")
-            || model_lower.contains("haiku.5")
-        {
-            // 未来的 haiku 5 代：透传给上游
+        if contains_any(
+            &model_lower,
+            &["haiku-5-5", "haiku-5.5", "haiku5.5", "haiku.5.5"],
+        ) {
+            Some("claude-haiku-5-5".to_string())
+        } else if contains_any(&model_lower, &["haiku-5", "haiku5", "haiku.5"]) {
             Some("claude-haiku-5".to_string())
-        } else {
-            // haiku 目前上游只有 4.5；含 legacy 别名（claude-3-5-haiku 等）
-            // 一律收敛到 4.5，保持既有行为不变。
+        } else if contains_any(
+            &model_lower,
+            &[
+                "haiku-4",
+                "haiku.4",
+                "haiku-3",
+                "3-haiku",
+                "3-5-haiku",
+                "3.5-haiku",
+            ],
+        ) {
+            // 上游 haiku 只有 4.5；含 legacy 别名（claude-3 / claude-3-5 /
+            // claude-haiku-4）一律收敛到 4.5，保持既有行为不变。
             Some("claude-haiku-4.5".to_string())
+        } else {
+            // 未登记的 haiku 代次（如未来的 6 代）：透传给上游判断，
+            // 不再像以前那样无条件写死成 4.5。
+            passthrough_model(&model_lower)
         }
     } else {
         // 其余全部透传（含 gpt-*、以及未来任意新模型/新系列）：
         // 由上游 Kiro 当权威判断支不支持，本层不再用白名单拦截。
         passthrough_model(&model_lower)
     }
+}
+
+/// 任一子串命中即为真。用于模型别名判断，避免重复的 `|| contains(...)`。
+fn contains_any(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|n| haystack.contains(n))
 }
 
 /// 透传兜底：把未登记的模型名交给上游前做最小规整——去掉本层用于路由的
@@ -505,10 +533,13 @@ pub fn get_context_window_size(model: &str) -> i32 {
             if mapped == "claude-sonnet-4.6"
                 || mapped == "claude-sonnet-4.8"
                 || mapped == "claude-sonnet-5"
+                || mapped == "claude-sonnet-5-5"
                 || mapped == "claude-opus-4.6"
                 || mapped == "claude-opus-4.7"
                 || mapped == "claude-opus-4.8"
                 || mapped == "claude-opus-5"
+                || mapped == "claude-opus-5-5"
+                || mapped == "claude-haiku-5-5"
                 || mapped == "claude-fable-5" =>
         {
             1_000_000
@@ -2277,6 +2308,101 @@ mod tests {
             map_model("claude-haiku-4-20250514")
                 .unwrap()
                 .contains("haiku")
+        );
+    }
+
+    /// 5.5 三代必须精确命中上游横线 ID；宽松的 `*-5` 判断不能把它截断。
+    ///
+    /// 回归：`claude-haiku-5-5` 曾命中 `contains("haiku-5")` 被归一成
+    /// `claude-haiku-5`，上游返回 400 `INVALID_MODEL_ID`。
+    #[test]
+    fn test_map_model_5_5_family() {
+        assert_eq!(
+            map_model("claude-opus-5-5"),
+            Some("claude-opus-5-5".to_string())
+        );
+        assert_eq!(
+            map_model("claude-opus-5.5"),
+            Some("claude-opus-5-5".to_string())
+        );
+        assert_eq!(
+            map_model("claude-opus-5-5-thinking"),
+            Some("claude-opus-5-5".to_string())
+        );
+
+        assert_eq!(
+            map_model("claude-sonnet-5-5"),
+            Some("claude-sonnet-5-5".to_string())
+        );
+        assert_eq!(
+            map_model("claude-sonnet-5.5"),
+            Some("claude-sonnet-5-5".to_string())
+        );
+        assert_eq!(
+            map_model("claude-sonnet-5-5-thinking"),
+            Some("claude-sonnet-5-5".to_string())
+        );
+
+        assert_eq!(
+            map_model("claude-haiku-5-5"),
+            Some("claude-haiku-5-5".to_string())
+        );
+        assert_eq!(
+            map_model("claude-haiku-5.5"),
+            Some("claude-haiku-5-5".to_string())
+        );
+        assert_eq!(
+            map_model("claude-haiku-5-5-thinking"),
+            Some("claude-haiku-5-5".to_string())
+        );
+
+        assert_eq!(get_context_window_size("claude-opus-5-5"), 1_000_000);
+        assert_eq!(get_context_window_size("claude-sonnet-5-5"), 1_000_000);
+        assert_eq!(get_context_window_size("claude-haiku-5-5"), 1_000_000);
+    }
+
+    /// 5.0 仍独立识别，不被 5.5 规则吞掉。
+    #[test]
+    fn test_map_model_5_0_not_hijacked_by_5_5() {
+        assert_eq!(map_model("claude-opus-5"), Some("claude-opus-5".to_string()));
+        assert_eq!(
+            map_model("claude-sonnet-5"),
+            Some("claude-sonnet-5".to_string())
+        );
+        assert_eq!(map_model("claude-haiku-5"), Some("claude-haiku-5".to_string()));
+    }
+
+    /// 未登记的 haiku 代次改为透传，不再被写死成 4.5。
+    #[test]
+    fn test_map_model_unknown_haiku_passthrough() {
+        assert_eq!(
+            map_model("claude-haiku-6-0"),
+            Some("claude-haiku-6-0".to_string())
+        );
+        assert_eq!(
+            map_model("claude-haiku-6-0-thinking"),
+            Some("claude-haiku-6-0".to_string())
+        );
+    }
+
+    /// legacy 3.x / 4.0 haiku 仍收敛到 4.5（既有行为不变）。
+    #[test]
+    fn test_map_model_haiku_legacy_collapses_to_4_5() {
+        assert_eq!(
+            map_model("claude-3-haiku-20240307"),
+            Some("claude-haiku-4.5".to_string())
+        );
+        assert_eq!(
+            map_model("claude-3-5-haiku-20241022"),
+            Some("claude-haiku-4.5".to_string())
+        );
+        assert_eq!(
+            map_model("claude-haiku-4-20250514"),
+            Some("claude-haiku-4.5".to_string())
+        );
+        assert_eq!(
+            map_model("claude-haiku-4-5-20251001"),
+            Some("claude-haiku-4.5".to_string())
         );
     }
 

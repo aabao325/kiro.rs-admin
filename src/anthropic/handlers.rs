@@ -481,6 +481,60 @@ fn available_models() -> Vec<Model> {
             max_tokens: 64000,
         },
         Model {
+            id: "claude-opus-5-5".to_string(),
+            object: "model".to_string(),
+            created: 1795000000, // Nov 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 5.5".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "claude-opus-5-5-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1795000000, // Nov 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 5.5 (Thinking)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "claude-sonnet-5-5".to_string(),
+            object: "model".to_string(),
+            created: 1795000000, // Nov 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Sonnet 5.5".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "claude-sonnet-5-5-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1795000000, // Nov 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Sonnet 5.5 (Thinking)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "claude-haiku-5-5".to_string(),
+            object: "model".to_string(),
+            created: 1795000000, // Nov 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Haiku 5.5".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "claude-haiku-5-5-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1795000000, // Nov 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Haiku 5.5 (Thinking)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
             id: "claude-opus-4-8".to_string(),
             object: "model".to_string(),
             created: 1779897600, // May 28, 2026
